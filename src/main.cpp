@@ -86,6 +86,16 @@ int main(int argc, char* argv[]) {
         .nargs(1)
         .action([](const std::string& value) { return std::stoi(value); });
 
+    program.add_argument("--record-temp-dir")
+        .help("Recording temporary directory for files being recorded")
+        .default_value(std::string(""))
+        .nargs(1);
+
+    program.add_argument("--record-filename-template")
+        .help("Recording filename template (e.g., \"{stream_id}_{start_datetime}_seg{segment_index}_{duration}.mp4\")")
+        .default_value(std::string(""))
+        .nargs(1);
+
     // 添加自动清理配置参数
     program.add_argument("--autoclean-max-age")
         .help("Maximum age of files to keep (hours)")
@@ -212,6 +222,26 @@ int main(int argc, char* argv[]) {
         // 没有指定分段时长
     }
 
+    try {
+        std::string temp_dir = program.get<std::string>("--record-temp-dir");
+        if (!temp_dir.empty()) {
+            config.record.temp_dir = temp_dir;
+            std::cout << "Record temporary directory set from command line: " << temp_dir << std::endl;
+        }
+    } catch (...) {
+        // 没有指定临时目录
+    }
+
+    try {
+        std::string filename_template = program.get<std::string>("--record-filename-template");
+        if (!filename_template.empty()) {
+            config.record.filename_template = filename_template;
+            std::cout << "Record filename template set from command line: " << filename_template << std::endl;
+        }
+    } catch (...) {
+        // 没有指定文件名模板
+    }
+
     // 1.7. 检查命令行指定的自动清理配置
     try {
         int max_age = program.get<int>("--autoclean-max-age");
@@ -291,8 +321,10 @@ int main(int argc, char* argv[]) {
 
     spdlog::info("=== NVR starting ===");
     spdlog::info("Output directory: {}", config.record.output_dir);
+    spdlog::info("Temporary directory: {}", config.record.temp_dir);
     spdlog::info("Recording configuration:");
     spdlog::info("  Segment duration: {} seconds", config.record.segment_duration_seconds);
+    spdlog::info("  Filename template: {}", config.record.filename_template);
     spdlog::info("Configured {} stream(s)", config.streams.size());
 
     for (size_t i = 0; i < config.streams.size(); i++) {

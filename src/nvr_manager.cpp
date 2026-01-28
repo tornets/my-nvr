@@ -15,12 +15,17 @@ NVRManager::NVRManager(const Config& config)
     , m_running(false)
 {
     fs::create_directories(m_config.record.output_dir);
+    fs::create_directories(m_config.record.temp_dir);
     m_logger = spdlog::get("manager");
     if (!m_logger) {
         m_logger = spdlog::default_logger()->clone("manager");
     }
 
     m_logger->info("NVRManager initialized with output_dir: {}", m_config.record.output_dir);
+    m_logger->info("NVRManager initialized with temp_dir: {}", m_config.record.temp_dir);
+
+    // 清理可能残留的临时文件（例如程序异常退出后）
+    cleanTempFiles();
 }
 
 NVRManager::~NVRManager() {
@@ -35,7 +40,11 @@ bool NVRManager::addStream(const std::string& stream_id, const std::string& stre
         return false;
     }
 
-    auto recorder = std::make_unique<IPCRecorder>(stream_url, m_config.record.output_dir, m_config.record.segment_duration_seconds);
+    auto recorder = std::make_unique<IPCRecorder>(stream_id, stream_url,
+                                                      m_config.record.output_dir,
+                                                      m_config.record.temp_dir,
+                                                      m_config.record.segment_duration_seconds,
+                                                      m_config.record.filename_template);
     recorder->start();
 
     m_recorders[stream_id] = std::move(recorder);
@@ -164,16 +173,49 @@ void NVRManager::scanAndUploadNewFiles() {
 
     std::lock_guard<std::mutex> lock(m_uploaded_files_mutex);
 
-    for (const auto& entry : fs::directory_iterator(m_config.record.output_dir)) {
+    // 获取临时目录的规范路径，用于比较
+    fs::path temp_dir_path;
+    try {
+        temp_dir_path = fs::canonical(m_config.record.temp_dir);
+    } catch (...) {
+        temp_dir_path = m_config.record.temp_dir;
+    }
+
+    // 使用递归扫描，因为文件名模板可能包含多级目录
+    for (const auto& entry : fs::recursive_directory_iterator(m_config.record.output_dir)) {
         if (!entry.is_regular_file() || entry.path().extension() != ".mp4") {
             continue;
         }
 
-        std::string file_path = entry.path().string();
+        // 检查文件是否在临时目录中
+        fs::path file_path = entry.path();
+        fs::path file_parent = file_path.parent_path();
+
+        // 如果文件的父目录是临时目录（或临时目录的子目录），跳过
+        try {
+            fs::path file_parent_canonical = fs::canonical(file_parent);
+            if (file_parent_canonical == temp_dir_path ||
+                file_parent_canonical.string().find(temp_dir_path.string()) == 0) {
+                m_logger->debug("Skipping temp file: {}", entry.path().string());
+                continue;
+            }
+        } catch (...) {
+            // 如果无法获取规范路径，使用字符串比较
+            if (file_parent.string().find(m_config.record.temp_dir) != std::string::npos) {
+                m_logger->debug("Skipping temp file (by path): {}", entry.path().string());
+                continue;
+            }
+        }
+
+        // 使用相对路径作为唯一标识（支持多级目录）
+        fs::path relative_path = fs::relative(entry.path(), m_config.record.output_dir);
+        std::string relative_key = relative_path.string();
+
+        std::string file_path_str = entry.path().string();
         std::string filename = entry.path().filename().string();
 
-        // 检查是否已上传
-        if (m_uploaded_files.find(filename) != m_uploaded_files.end()) {
+        // 检查是否已上传（使用相对路径作为key）
+        if (m_uploaded_files.find(relative_key) != m_uploaded_files.end()) {
             continue;
         }
 
@@ -198,15 +240,15 @@ void NVRManager::scanAndUploadNewFiles() {
 
         // 创建上传任务
         UploadTask task;
-        task.file_path = file_path;
+        task.file_path = file_path_str;
         task.stream_id = stream_id;
         task.recording_time = time_str;
 
-        m_logger->info("Found new file to upload: {} (stream: {})", filename, stream_id);
+        m_logger->info("Found new file to upload: {} (stream: {})", relative_key, stream_id);
         m_uploader->enqueue(task);
 
-        // 标记为已加入上传队列
-        m_uploaded_files.insert(filename);
+        // 标记为已加入上传队列（使用相对路径）
+        m_uploaded_files.insert(relative_key);
     }
 }
 
@@ -215,20 +257,44 @@ bool NVRManager::cleanOldFiles() {
     auto now = fs::file_time_type::clock::now();
     int deleted_count = 0;
 
-    for (const auto& entry : fs::directory_iterator(m_config.record.output_dir)) {
-        if (entry.is_regular_file() && entry.path().extension() == ".mp4") {
-            auto ftime = entry.last_write_time();
-            auto age = std::chrono::duration_cast<std::chrono::seconds>(now - ftime).count();
+    // 获取临时目录的规范路径，用于比较
+    fs::path temp_dir_path;
+    try {
+        temp_dir_path = fs::canonical(m_config.record.temp_dir);
+    } catch (...) {
+        temp_dir_path = m_config.record.temp_dir;
+    }
 
-            if (age > max_age_seconds) {
-                std::error_code ec;
-                if (fs::remove(entry.path(), ec)) {
-                    m_logger->info("Deleted old file: {} (age: {}h)", entry.path().filename().string(),
-                                  age / 3600.0);
-                    deleted_count++;
-                } else {
-                    m_logger->error("Failed to delete {}: {}", entry.path().string(), ec.message());
-                }
+    for (const auto& entry : fs::recursive_directory_iterator(m_config.record.output_dir)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".mp4") {
+            continue;
+        }
+
+        // 跳过临时目录中的文件
+        fs::path file_parent = entry.path().parent_path();
+        try {
+            fs::path file_parent_canonical = fs::canonical(file_parent);
+            if (file_parent_canonical == temp_dir_path ||
+                file_parent_canonical.string().find(temp_dir_path.string()) == 0) {
+                continue;  // 跳过临时文件
+            }
+        } catch (...) {
+            if (file_parent.string().find(m_config.record.temp_dir) != std::string::npos) {
+                continue;  // 跳过临时文件
+            }
+        }
+
+        auto ftime = entry.last_write_time();
+        auto age = std::chrono::duration_cast<std::chrono::seconds>(now - ftime).count();
+
+        if (age > max_age_seconds) {
+            std::error_code ec;
+            if (fs::remove(entry.path(), ec)) {
+                m_logger->info("Deleted old file: {} (age: {}h)", entry.path().string(),
+                              age / 3600.0);
+                deleted_count++;
+            } else {
+                m_logger->error("Failed to delete {}: {}", entry.path().string(), ec.message());
             }
         }
     }
@@ -247,11 +313,37 @@ bool NVRManager::checkDiskUsage() {
 
     std::uintmax_t total_size = 0;
 
+    // 获取临时目录的规范路径，用于排除
+    fs::path temp_dir_path;
     try {
+        temp_dir_path = fs::canonical(m_config.record.temp_dir);
+    } catch (...) {
+        temp_dir_path = m_config.record.temp_dir;
+    }
+
+    try {
+        // 递归遍历，但排除临时目录
         for (const auto& entry : fs::recursive_directory_iterator(m_config.record.output_dir)) {
-            if (entry.is_regular_file()) {
-                total_size += entry.file_size();
+            if (!entry.is_regular_file()) {
+                continue;
             }
+
+            // 跳过临时目录中的文件
+            fs::path file_path = entry.path();
+            fs::path file_parent = file_path.parent_path();
+            try {
+                fs::path file_parent_canonical = fs::canonical(file_parent);
+                if (file_parent_canonical == temp_dir_path ||
+                    file_parent_canonical.string().find(temp_dir_path.string()) == 0) {
+                    continue;  // 跳过临时文件
+                }
+            } catch (...) {
+                if (file_parent.string().find(m_config.record.temp_dir) != std::string::npos) {
+                    continue;  // 跳过临时文件
+                }
+            }
+
+            total_size += entry.file_size();
         }
     } catch (const std::exception& e) {
         m_logger->error("Error calculating disk usage: {}", e.what());
@@ -266,6 +358,20 @@ bool NVRManager::checkDiskUsage() {
         std::vector<fs::path> files;
         for (const auto& entry : fs::directory_iterator(m_config.record.output_dir)) {
             if (entry.is_regular_file() && entry.path().extension() == ".mp4") {
+                // 跳过临时目录中的文件
+                fs::path file_parent = entry.path().parent_path();
+                try {
+                    fs::path file_parent_canonical = fs::canonical(file_parent);
+                    if (file_parent_canonical == temp_dir_path ||
+                        file_parent_canonical.string().find(temp_dir_path.string()) == 0) {
+                        continue;
+                    }
+                } catch (...) {
+                    if (file_parent.string().find(m_config.record.temp_dir) != std::string::npos) {
+                        continue;
+                    }
+                }
+
                 files.push_back(entry.path());
             }
         }
@@ -288,6 +394,38 @@ bool NVRManager::checkDiskUsage() {
         }
 
         m_logger->info("Deleted {} files to reduce disk usage", deleted);
+    }
+
+    return true;
+}
+
+bool NVRManager::cleanTempFiles() {
+    // 清理临时目录中可能残留的文件
+    int deleted_count = 0;
+
+    try {
+        if (!fs::exists(m_config.record.temp_dir)) {
+            return true;
+        }
+
+        for (const auto& entry : fs::directory_iterator(m_config.record.temp_dir)) {
+            if (entry.is_regular_file()) {
+                std::error_code ec;
+                if (fs::remove(entry.path(), ec)) {
+                    m_logger->info("Cleaned up temp file: {}", entry.path().filename().string());
+                    deleted_count++;
+                } else {
+                    m_logger->warn("Failed to remove temp file {}: {}", entry.path().string(), ec.message());
+                }
+            }
+        }
+
+        if (deleted_count > 0) {
+            m_logger->info("Cleaned up {} residual temp file(s) from previous session", deleted_count);
+        }
+    } catch (const std::exception& e) {
+        m_logger->error("Error cleaning temp directory: {}", e.what());
+        return false;
     }
 
     return true;

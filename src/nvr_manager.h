@@ -39,6 +39,7 @@ private:
     bool cleanOldFiles();
     bool checkDiskUsage();
     void scanAndUploadNewFiles();
+    bool cleanTempFiles();  // 清理临时目录中残留的文件
 
     Config m_config;
 

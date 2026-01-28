@@ -8,12 +8,31 @@
 #include <iomanip>
 #include <sstream>
 #include <filesystem>
+#include <random>
+#include <algorithm>
+#include <map>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
-IPCRecorder::IPCRecorder(const std::string& stream_url, const std::string& output_dir, int segment_duration)
-    : m_stream_url(stream_url)
+// 静态成员初始化
+std::atomic<uint64_t> IPCRecorder::m_global_sequence{1};
+std::mutex IPCRecorder::m_global_mutex;
+
+IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream_url,
+                         const std::string& output_dir, const std::string& temp_dir,
+                         int segment_duration,
+                         const std::string& filename_template)
+    : m_stream_id(stream_id)
+    , m_stream_url(stream_url)
     , m_output_dir(output_dir)
+    , m_temp_dir(temp_dir)
+    , m_filename_template(filename_template)
     , m_running(false)
     , m_input_ctx(nullptr)
     , m_output_ctx(nullptr)
@@ -28,11 +47,15 @@ IPCRecorder::IPCRecorder(const std::string& stream_url, const std::string& outpu
     , m_segment_start_pts(0)
     , m_audio_start_pts(0)
     , m_segment_duration(segment_duration)
+    , m_segment_index(0)
+    , m_segment_start_time(0)
     , m_video_time_base{1, 90000}
     , m_current_dts(0)
     , m_pts_offset(0)
 {
+    // 创建输出目录和临时目录
     fs::create_directories(m_output_dir);
+    fs::create_directories(m_temp_dir);
     m_logger = spdlog::get("recorder");
     if (!m_logger) {
         m_logger = spdlog::default_logger()->clone("recorder");
@@ -133,28 +156,38 @@ void IPCRecorder::recordingLoop() {
                 closeOutput();
             }
 
-            m_logger->debug("Writing packet: original_pts={}, original_dts={}, ts={}",
-                            packet->pts, packet->dts, ts);
+            //m_logger->debug("Writing packet: original_pts={}, original_dts={}, ts={}",
+            //                packet->pts, packet->dts, ts);
         }
 
         if (packet->stream_index == m_video_stream_idx) {
             if (!m_output_ctx) {
-                std::time_t rawtime;
-                std::time(&rawtime);
-                // Convert to local time structure
-                std::tm* timeinfo = std::localtime(&rawtime);
+                // 增加分段序号
+                m_segment_index++;
 
-                char buf[80];
-                // Format time into "YYYY-MM-DD HH:MM:SS"
-                std::strftime(buf, sizeof(buf), "stream_%Y%m%d_%H%M%S.mp4", timeinfo);
-                std::string filename = buf;
-                m_logger->info("Opening output file: {}", filename);
+                // 记录开始时间
+                std::time(&m_segment_start_time);
+
+                // 生成临时文件名（使用随机字符串）
+                static const char charset[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+                static std::random_device rd;
+                static std::mt19937 gen(rd());
+                static std::uniform_int_distribution<> dis(0, sizeof(charset) - 2);
+
+                std::string random_str;
+                random_str.reserve(16);
+                for (int i = 0; i < 16; i++) {
+                    random_str += charset[dis(gen)];
+                }
+                std::string filename = "temp_" + random_str + ".mp4";
+
+                m_logger->info("Opening temp file: {}", filename);
                 if (!openOutput(filename)) {
-                    m_logger->error("Failed to open output file: {}", filename);
+                    m_logger->error("Failed to open temp file: {}", filename);
                     av_packet_unref(packet);
                     continue;
                 }
-                m_logger->info("Output file opened successfully");
+                m_logger->info("Temp file opened successfully");
 
                 if (packet->pts > 0)
                     m_segment_start_pts = packet->pts;
@@ -241,7 +274,9 @@ bool IPCRecorder::openInput() {
 }
 
 bool IPCRecorder::openOutput(const std::string& filename) {
-    std::string full_path = (fs::path(m_output_dir) / filename).string();
+    m_current_filename = filename;
+    // 使用临时目录存放正在录制的文件
+    std::string full_path = (fs::path(m_temp_dir) / filename).string();
 
     int ret = avformat_alloc_output_context2(&m_output_ctx, nullptr, "mp4", full_path.c_str());
     if (ret < 0) {
@@ -320,6 +355,43 @@ void IPCRecorder::closeOutput() {
         avio_closep(&m_output_ctx->pb);
         avformat_free_context(m_output_ctx);
         m_output_ctx = nullptr;
+
+        // 移动文件从临时目录到最终目录，并重命名添加完整信息
+        if (!m_current_filename.empty()) {
+            // 计算实际录制时长
+            std::time_t end_time;
+            std::time(&end_time);
+            int64_t duration_seconds = end_time - m_segment_start_time;
+
+            // 生成新的文件名（包含结束时间和时长）
+            std::string new_filename = generateFilenameFromTemplate(m_segment_start_pts, 0, duration_seconds);
+
+            // 如果文件名包含路径，创建最终目录
+            fs::path new_filepath(new_filename);
+            if (new_filepath.has_parent_path()) {
+                fs::path full_final_dir = m_output_dir / new_filepath.parent_path();
+                fs::create_directories(full_final_dir);
+            }
+
+            fs::path temp_path = fs::path(m_temp_dir) / m_current_filename;
+            fs::path final_path = fs::path(m_output_dir) / new_filename;
+
+            // 移动文件
+            std::error_code ec;
+            if (fs::exists(temp_path)) {
+                fs::rename(temp_path, final_path, ec);
+                if (!ec) {
+                    m_logger->info("Moved recording: {} -> {}", m_current_filename, new_filename);
+                } else {
+                    m_logger->error("Failed to move recording {} to {}: {}",
+                                   m_current_filename, new_filename, ec.message().c_str());
+                }
+            } else {
+                m_logger->warn("Temp file not found: {}", temp_path.string());
+            }
+
+            m_current_filename.clear();
+        }
     }
 }
 
@@ -625,4 +697,144 @@ bool IPCRecorder::transcodeAudio(AVPacket* packet) {
 
     av_frame_free(&frame);
     return true;
+}
+
+std::string IPCRecorder::formatDate(std::time_t time, const std::string& format) {
+    std::tm tm = *std::localtime(&time);
+    std::ostringstream ss;
+    ss << std::put_time(&tm, format.c_str());
+    return ss.str();
+}
+
+std::string IPCRecorder::formatDuration(int64_t seconds) {
+    int hours = seconds / 3600;
+    int minutes = (seconds % 3600) / 60;
+    int secs = seconds % 60;
+    std::ostringstream ss;
+    ss << std::setfill('0') << std::setw(2) << hours
+       << std::setfill('0') << std::setw(2) << minutes
+       << std::setfill('0') << std::setw(2) << secs;
+    return ss.str();
+}
+
+std::string IPCRecorder::getVideoCodecName() {
+    if (m_video_stream_idx < 0 || !m_input_ctx) {
+        return "unknown";
+    }
+    AVCodecParameters* codec_par = m_input_ctx->streams[m_video_stream_idx]->codecpar;
+    const AVCodec* codec = avcodec_find_decoder(codec_par->codec_id);
+    if (codec) {
+        std::string name = codec->name;
+        // 转换为大写
+        std::transform(name.begin(), name.end(), name.begin(), ::toupper);
+        return name;
+    }
+    return "UNKNOWN";
+}
+
+int IPCRecorder::getVideoWidth() {
+    if (m_video_stream_idx < 0 || !m_input_ctx) {
+        return 0;
+    }
+    return m_input_ctx->streams[m_video_stream_idx]->codecpar->width;
+}
+
+int IPCRecorder::getVideoHeight() {
+    if (m_video_stream_idx < 0 || !m_input_ctx) {
+        return 0;
+    }
+    return m_input_ctx->streams[m_video_stream_idx]->codecpar->height;
+}
+
+double IPCRecorder::getVideoFPS() {
+    if (m_video_stream_idx < 0 || !m_input_ctx) {
+        return 0.0;
+    }
+    AVRational frame_rate = m_input_ctx->streams[m_video_stream_idx]->avg_frame_rate;
+    if (frame_rate.den > 0) {
+        return static_cast<double>(frame_rate.num) / frame_rate.den;
+    }
+    return 0.0;
+}
+
+std::string IPCRecorder::generateUUID() {
+    // 生成短格式的 UUID（8个字符）
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<> dis(0, 15);
+
+    std::ostringstream ss;
+    ss << std::hex;
+    for (int i = 0; i < 8; i++) {
+        ss << dis(gen);
+    }
+    return ss.str();
+}
+
+std::string IPCRecorder::generateFilenameFromTemplate(int64_t start_pts, int64_t end_pts, int64_t duration_seconds) {
+    std::string result = m_filename_template;
+
+    // 获取全局序列号
+    uint64_t sequence = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_global_mutex);
+        sequence = m_global_sequence++;
+    }
+
+    // 计算变量值
+    std::map<std::string, std::string> vars;
+
+    // 流相关
+    vars["{stream_id}"] = m_stream_id;
+
+    // 时间相关
+    vars["{start_date}"] = formatDate(m_segment_start_time, "%Y-%m-%d");
+    vars["{start_time}"] = formatDate(m_segment_start_time, "%H%M%S");
+    vars["{start_datetime}"] = formatDate(m_segment_start_time, "%Y%m%d_%H%M%S");
+
+    std::time_t end_time = m_segment_start_time + duration_seconds;
+    vars["{end_time}"] = formatDate(end_time, "%H%M%S");
+    vars["{end_datetime}"] = formatDate(end_time, "%Y%m%d_%H%M%S");
+
+    // 时长相关
+    vars["{duration_seconds}"] = std::to_string(duration_seconds);
+    vars["{duration}"] = formatDuration(duration_seconds);
+
+    // 分段相关
+    vars["{segment_index}"] = std::to_string(m_segment_index);
+    vars["{segment_global_index}"] = std::to_string(sequence);
+
+    // 视频信息
+    vars["{width}"] = std::to_string(getVideoWidth());
+    vars["{height}"] = std::to_string(getVideoHeight());
+    vars["{codec}"] = getVideoCodecName();
+
+    std::ostringstream fps_ss;
+    fps_ss << std::fixed << std::setprecision(2) << getVideoFPS();
+    vars["{fps}"] = fps_ss.str();
+
+    // 其他
+    vars["{sequence}"] = std::to_string(sequence);
+    vars["{uuid}"] = generateUUID();
+
+    // 主机名
+    char hostname[256] = {0};
+#ifdef _WIN32
+    DWORD size = sizeof(hostname);
+    GetComputerNameA(hostname, &size);
+#else
+    gethostname(hostname, sizeof(hostname));
+#endif
+    vars["{hostname}"] = hostname;
+
+    // 替换所有变量
+    for (const auto& var : vars) {
+        size_t pos = 0;
+        while ((pos = result.find(var.first, pos)) != std::string::npos) {
+            result.replace(pos, var.first.length(), var.second);
+            pos += var.second.length();
+        }
+    }
+
+    return result;
 }

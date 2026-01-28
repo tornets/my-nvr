@@ -34,7 +34,9 @@ struct UploadTask {
 
 struct RecordConfig {
     std::string output_dir;       // 录制文件保存目录
+    std::string temp_dir;         // 录制过程中的临时文件目录
     int segment_duration_seconds; // 录制分段时长（秒）
+    std::string filename_template; // 文件名模板，支持变量: {stream_id}, {start_datetime}, {segment_index} 等
 };
 
 struct Config {

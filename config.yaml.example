@@ -28,9 +28,48 @@ record:
   # 输出目录（所有流的录制文件将保存在此目录下）
   output_dir: "./recordings"
 
+  # 临时文件目录（正在录制中的文件存放位置）
+  # 录制完成后文件会自动移动到 output_dir
+  # 建议使用隐藏目录以避免用户访问未完成的文件
+  temp_dir: "./recordings/.temp"
+
   # 录制分段时长（秒）
   # 每个录制文件的最大时长，超过此时长后会在关键帧处创建新文件
   segment_duration_seconds: 600  # 10分钟 = 600秒
+
+  # 文件名模板
+  # 支持的变量：
+  #   {stream_id} - 流ID
+  #   {start_date} - 开始日期 (YYYY-MM-DD)
+  #   {start_time} - 开始时间 (HHMMSS)
+  #   {start_datetime} - 开始日期时间 (YYYYMMDD_HHMMSS)
+  #   {end_time} - 结束时间 (HHMMSS)
+  #   {end_datetime} - 结束日期时间 (YYYYMMDD_HHMMSS)
+  #   {duration_seconds} - 录制时长（秒）
+  #   {duration} - 格式化时长 (HHMMSS)
+  #   {segment_index} - 分段序号（从1开始，每个流独立）
+  #   {segment_global_index} - 全局分段序号（所有流统一计数）
+  #   {width} - 视频宽度
+  #   {height} - 视频高度
+  #   {codec} - 视频编码名称 (H264/H265等)
+  #   {fps} - 帧率
+  #   {hostname} - 主机名
+  #   {uuid} - 唯一标识符（短格式）
+  #   {sequence} - 全局递增序列号
+  #
+  # 常用模板示例：
+  #   - "{stream_id}_{start_datetime}_seg{segment_index}_{duration}.mp4"
+  #     结果: camera1_20260129_143052_seg01_000510.mp4
+  #
+  #   - "{start_date}/{stream_id}/{start_time}_seg{segment_index}.mp4"
+  #     结果: 2026-01-29/camera1/143052_seg01.mp4
+  #
+  #   - "{stream_id}_{width}x{height}_{start_datetime}_{duration_seconds}s.mp4"
+  #     结果: camera1_1920x1080_20260129_143052_600s.mp4
+  #
+  #   - "{codec}/{stream_id}/{start_datetime}_seq{sequence}.mp4"
+  #     结果: H265/camera1/20260129_143052_seq1.mp4
+  filename_template: "{stream_id}_{start_datetime}_seg{segment_index}_{duration}.mp4"
 
 # 视频上传配置
 upload:

@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <chrono>
 #include <thread>
+#include <algorithm>
 
 VideoUploader::VideoUploader(const UploadConfig& config)
     : config_(config), running_(false), stopped_(false) {
@@ -134,91 +135,52 @@ bool VideoUploader::uploadToServer(const std::string& file_path,
         size_t file_size = std::filesystem::file_size(file_path);
         spdlog::debug("Uploading file: {} (size: {} bytes)", file_path, file_size);
 
-        // 读取文件内容
-        std::ifstream file(file_path, std::ios::binary);
-        if (!file.is_open()) {
-            spdlog::error("Failed to open file: {}", file_path);
+        // 解析 URL
+        std::string scheme_host_port = config_.url;
+        std::string path = "/upload";
+
+        // 查找路径起始位置
+        size_t path_pos = config_.url.find('/', config_.url.find("://") + 3);
+        if (path_pos != std::string::npos) {
+            scheme_host_port = config_.url.substr(0, path_pos);
+            path = config_.url.substr(path_pos);
+        }
+
+        spdlog::debug("Connecting to: {}, path: {}", scheme_host_port, path);
+
+        // 标准化文件名为 Linux 路径格式
+        std::string filename = std::filesystem::path(file_path).filename().string();
+        std::string file_path_normalized = file_path;
+        // 将所有反斜杠替换为正斜杠（Windows 路径转 Linux 路径）
+        std::replace(file_path_normalized.begin(), file_path_normalized.end(), '\\', '/');
+
+        spdlog::debug("Upload file (normalized path): {}", file_path_normalized);
+
+        // 二进制读取文件
+        std::ifstream ifs(file_path_normalized, std::ios::binary);
+        if (!ifs) {
+            spdlog::error("open file failed: {}",
+                          file_path);
             return false;
         }
 
-        std::string file_content;
-        file.seekg(0, std::ios::end);
-        file_content.resize(file.tellg());
-        file.seekg(0, std::ios::beg);
-        file.read(&file_content[0], file_content.size());
-        file.close();
+        std::vector<char> buffer(
+                (std::istreambuf_iterator<char>(ifs)),
+                std::istreambuf_iterator<char>()
+        );
 
-        // 解析 URL
-        std::string host = config_.url;
-        std::string path = "/upload";
+        // 构建 multipart/form-data 请求（直接传文件路径，不读取到内存）
+        httplib::UploadFormDataItems items = {
+            {"files", std::string(buffer.begin(), buffer.end()), filename, "video/mp4"},
+        };
 
-        // 移除协议前缀
-        size_t protocol_pos = host.find("://");
-        if (protocol_pos != std::string::npos) {
-            host = host.substr(protocol_pos + 3);
-        }
+        // httplib::Client 自动处理 HTTP 和 HTTPS
+        httplib::Client cli(scheme_host_port);
+        cli.set_connection_timeout(config_.timeout_seconds);
+        cli.set_read_timeout(config_.timeout_seconds);
+        cli.set_write_timeout(config_.timeout_seconds);
 
-        // 分离主机和路径
-        size_t path_pos = host.find('/');
-        if (path_pos != std::string::npos) {
-            path = host.substr(path_pos);
-            host = host.substr(0, path_pos);
-        }
-
-        // 提取端口（如果有的话）
-        int port = 80;
-        size_t port_pos = host.find(':');
-        if (port_pos != std::string::npos) {
-            port = std::stoi(host.substr(port_pos + 1));
-            host = host.substr(0, port_pos);
-        }
-
-        // 使用 HTTPS 如果 URL 以 https 开头
-        bool use_https = config_.url.find("https://") == 0;
-        if (use_https && port == 80) {
-            port = 443;
-        }
-
-        spdlog::debug("Connecting to: {}:{}{}", host, port, path);
-
-        // 发送 POST 请求
-        httplib::Result res;
-
-        if (use_https) {
-            // HTTPS 客户端
-            httplib::SSLClient cli(host, port);
-            cli.set_connection_timeout(config_.timeout_seconds);
-            cli.set_read_timeout(config_.timeout_seconds);
-            cli.set_write_timeout(config_.timeout_seconds);
-
-            std::string filename = std::filesystem::path(file_path).filename().string();
-
-            // 构建 multipart/form-data 请求
-            httplib::UploadFormDataItems items = {
-                {"file", file_content, filename, "video/mp4"},
-                {"stream_id", stream_id},
-                {"recording_time", recording_time}
-            };
-
-            res = cli.Post(path, items);
-        } else {
-            // HTTP 客户端
-            httplib::Client cli(host, port);
-            cli.set_connection_timeout(config_.timeout_seconds);
-            cli.set_read_timeout(config_.timeout_seconds);
-            cli.set_write_timeout(config_.timeout_seconds);
-
-            std::string filename = std::filesystem::path(file_path).filename().string();
-
-            // 构建 multipart/form-data 请求
-            httplib::UploadFormDataItems items = {
-                {"file", file_content, filename, "video/mp4"},
-                {"stream_id", stream_id},
-                {"recording_time", recording_time}
-            };
-
-            res = cli.Post(path, items);
-        }
+        httplib::Result res = cli.Post(path, items);
 
         if (res) {
             if (res->status == 200 || res->status == 201) {

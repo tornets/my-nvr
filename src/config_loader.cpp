@@ -20,7 +20,9 @@ Config Config::getDefault() {
 
     // 录制默认配置
     config.record.output_dir = "./recordings";
+    config.record.temp_dir = "./recordings/.temp";  // 临时目录
     config.record.segment_duration_seconds = 600;  // 10分钟
+    config.record.filename_template = "{stream_id}_{start_datetime}_seg{segment_index}_{duration}.mp4";
 
     // 自动清理默认配置
     config.autoclean.enabled = true;                 // 默认启用
@@ -132,8 +134,14 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
             if (record["output_dir"]) {
                 config.record.output_dir = record["output_dir"].as<std::string>();
             }
+            if (record["temp_dir"]) {
+                config.record.temp_dir = record["temp_dir"].as<std::string>();
+            }
             if (record["segment_duration_seconds"]) {
                 config.record.segment_duration_seconds = record["segment_duration_seconds"].as<int>();
+            }
+            if (record["filename_template"]) {
+                config.record.filename_template = record["filename_template"].as<std::string>();
             }
         }
 

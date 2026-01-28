@@ -17,11 +17,13 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
+#include <libavutil/audio_fifo.h>
+#include <libswresample/swresample.h>
 }
 
 class IPCRecorder {
 public:
-    IPCRecorder(const std::string& stream_url, const std::string& output_dir);
+    IPCRecorder(const std::string& stream_url, const std::string& output_dir, int segment_duration = 600);
     ~IPCRecorder();
 
     void start();
@@ -54,7 +56,14 @@ private:
     AVCodecContext* m_audio_decoder_ctx;
     AVCodecContext* m_audio_encoder_ctx;
 
+    // 音频转码相关
+    AVAudioFifo* m_audio_fifo;
+    SwrContext* m_swr_ctx;
+    int m_audio_fifo_initialized;
+    int64_t m_audio_frame_count;  // 用于计算音频输出 PTS
+
     int64_t m_segment_start_pts;
+    int64_t m_audio_start_pts;  // 音频流起始 PTS
     int64_t m_segment_duration;
     AVRational m_video_time_base;
     int64_t m_current_dts;

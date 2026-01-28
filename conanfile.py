@@ -10,6 +10,9 @@ class CompressorRecipe(ConanFile):
         self.requires("ffmpeg/8.0.1")
         self.requires("spdlog/1.15.1")
         self.requires("zlib/1.3.1")
+        self.requires("yaml-cpp/0.8.0")
+        self.requires("argparse/2.9")
+        self.requires("cpp-httplib/0.30.1", options={"with_openssl": True})
 
     def build_requirements(self):
         self.tool_requires("gsoap/2.8.139")

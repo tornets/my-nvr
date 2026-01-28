@@ -1,0 +1,68 @@
+# NVR Configuration File
+# 复制此文件为 config.yaml 或 config.yml 并根据您的需求修改
+
+# 流配置列表
+streams:
+  - id: camera1
+    url: rtsp://192.168.1.100:554/stream1
+    # 可选：额外参数
+    params:
+      timeout: 30
+      reconnect: auto
+
+  - id: camera2
+    url: rtsp://192.168.1.101:554/stream1
+
+  # 您可以添加更多流
+  # - id: camera3
+  #   url: rtsp://192.168.1.102:554/stream1
+  #   params:
+  #     timeout: 60
+
+# 日志级别
+# 可选值: trace, debug, info, warn, error, critical
+log_level: "debug"
+
+# 录制配置
+record:
+  # 输出目录（所有流的录制文件将保存在此目录下）
+  output_dir: "./recordings"
+
+  # 录制分段时长（秒）
+  # 每个录制文件的最大时长，超过此时长后会在关键帧处创建新文件
+  segment_duration_seconds: 600  # 10分钟 = 600秒
+
+# 视频上传配置
+upload:
+  # 是否启用上传功能（需要同时配置 url 才能生效）
+  enabled: false
+
+  # 上传服务器 URL（留空则禁用上传功能）
+  # 示例: http://example.com/api/upload 或 https://example.com/api/upload
+  url: ""
+
+  # 上传超时时间（秒）
+  timeout_seconds: 300
+
+  # 最大重试次数
+  max_retries: 3
+
+  # 重试延迟（秒）
+  retry_delay_seconds: 5
+
+# 自动清理配置
+autoclean:
+  # 是否启用自动清理功能
+  enabled: true
+
+  # 最大文件保留时间（小时）
+  # 超过此时长的录制文件将被自动删除
+  max_age_hours: 168        # 7天 = 168小时
+
+  # 最大磁盘使用量（GB）
+  # 当磁盘使用量超过此值时，将删除最旧的文件
+  max_disk_usage_gb: 100
+
+  # 清理检查间隔（秒）
+  # 系统将定期检查并清理旧文件
+  check_interval_seconds: 3

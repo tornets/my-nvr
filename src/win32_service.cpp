@@ -26,7 +26,7 @@ Win32Service::~Win32Service() {
     }
 }
 
-bool Win32Service::install(const std::string& binaryPath, const std::string& extraArgs) {
+bool Win32Service::install(const std::string& binaryPath, const std::vector<std::string>& extraArgs) {
     // Get full path to executable
     char szPath[MAX_PATH];
     if (!GetModuleFileNameA(NULL, szPath, MAX_PATH)) {
@@ -35,9 +35,16 @@ bool Win32Service::install(const std::string& binaryPath, const std::string& ext
     }
 
     // Build command line: "binary_path" svr -- extra_args
+    // Quote each argument if it contains spaces
     std::string cmdLine = "\"" + std::string(szPath) + "\" svr";
-    if (!extraArgs.empty()) {
-        cmdLine += " " + extraArgs;
+    for (const auto& arg : extraArgs) {
+        cmdLine += " ";
+        // Check if argument contains spaces or is empty
+        if (arg.empty() || arg.find(' ') != std::string::npos) {
+            cmdLine += "\"" + arg + "\"";
+        } else {
+            cmdLine += arg;
+        }
     }
 
     // Open Service Control Manager

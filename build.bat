@@ -19,16 +19,17 @@ if /i "%1"=="debug" (
 )
 
 if not exist build mkdir build
+if not exist build\conan mkdir build\conan
 
 echo Installing dependencies...
-conan install . -of=build -s build_type=%BUILD_TYPE% -s compiler.cppstd=17 --build=missing
+conan install . -of=build/conan -s build_type=%BUILD_TYPE% -s compiler.cppstd=17 --build=missing
 if errorlevel 1 (
     echo Error: conan install failed
     exit /b 1
 )
 
 echo Configuring CMake...
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE=build/conan/conan_toolchain.cmake
 if errorlevel 1 (
     echo Error: cmake configure failed
     exit /b 1

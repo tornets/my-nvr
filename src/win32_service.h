@@ -2,6 +2,7 @@
 #define NVR_WIN32_SERVICE_H
 
 #include <string>
+#include <vector>
 #include <functional>
 #include <atomic>
 #include <windows.h>
@@ -17,7 +18,7 @@ public:
     ~Win32Service();
 
     // Service installation and management
-    bool install(const std::string& binaryPath, const std::string& extraArgs = "");
+    bool install(const std::string& binaryPath, const std::vector<std::string>& extraArgs = {});
     bool uninstall();
     bool start();
     bool stop();

@@ -1,0 +1,24 @@
+#ifndef NVR_VERSION_H
+#define NVR_VERSION_H
+
+#include <string>
+
+namespace NVR {
+    // Version information (generated at build time)
+    constexpr const char* const VERSION_MAJOR = "@PROJECT_VERSION_MAJOR@";
+    constexpr const char* const VERSION_MINOR = "@PROJECT_VERSION_MINOR@";
+    constexpr const char* const VERSION_PATCH = "@PROJECT_VERSION_PATCH@";
+    constexpr const char* const VERSION_STRING = "@PROJECT_VERSION@";
+    constexpr const char* const BUILD_DATE = "@BUILD_DATE@";
+    constexpr const char* const GIT_COMMIT_HASH = "@GIT_COMMIT_HASH@";
+    constexpr const char* const GIT_BRANCH = "@GIT_BRANCH@";
+    constexpr const char* const BUILD_TYPE = "@CMAKE_BUILD_TYPE@";
+
+    // Get full version string
+    std::string getFullVersionString();
+    std::string getDetailedVersionString();
+    std::string getBuildDateString();
+    std::string getBuildTypeString();
+}
+
+#endif // NVR_VERSION_H

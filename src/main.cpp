@@ -16,6 +16,7 @@ extern "C" {
 #include "config_loader.h"
 #include "video_uploader.h"
 #include "cmdline_parser.h"
+#include "version.h"
 #include <spdlog/spdlog.h>
 
 // Forward declarations
@@ -28,6 +29,12 @@ int runServiceMode(int argc, char* argv[]);
 int runConsoleMode(int argc, char* argv[]);
 
 int main(int argc, char* argv[]) {
+    // Check for --version flag
+    if (argc > 1 && (std::string(argv[1]) == "--version" || std::string(argv[1]) == "-v")) {
+        std::cout << NVR::getDetailedVersionString() << std::endl;
+        return 0;
+    }
+
     // Check if first argument is a subcommand
     if (argc > 1) {
         std::string arg1 = argv[1];
@@ -73,18 +80,14 @@ int main(int argc, char* argv[]) {
 
 int handleServiceInstall(const std::vector<std::string>& args) {
 #ifdef _WIN32
-    Win32Service service("NVRService", "NVR Video Recorder Service");
+    Win32Service service("nvr", "NVR Video Recorder Service");
 
-    // Build extra args string (everything after "install")
-    std::string extraArgs;
-    for (size_t i = 0; i < args.size(); i++) {
-        if (args[i] == "--") {
-            continue;
+    // Build extra args vector, skip "--" separator
+    std::vector<std::string> extraArgs;
+    for (const auto& arg : args) {
+        if (arg != "--") {
+            extraArgs.push_back(arg);
         }
-        if (!extraArgs.empty()) {
-            extraArgs += " ";
-        }
-        extraArgs += args[i];
     }
 
     if (service.install("", extraArgs)) {
@@ -102,7 +105,7 @@ int handleServiceInstall(const std::vector<std::string>& args) {
 
 int handleServiceUninstall() {
 #ifdef _WIN32
-    Win32Service service("NVRService", "NVR Video Recorder Service");
+    Win32Service service("nvr", "NVR Video Recorder Service");
     if (service.uninstall()) {
         std::cout << "Service uninstalled successfully" << std::endl;
         return 0;
@@ -118,7 +121,7 @@ int handleServiceUninstall() {
 
 int handleServiceStart() {
 #ifdef _WIN32
-    Win32Service service("NVRService", "NVR Video Recorder Service");
+    Win32Service service("nvr", "NVR Video Recorder Service");
     if (service.start()) {
         std::cout << "Service started successfully" << std::endl;
         return 0;
@@ -134,7 +137,7 @@ int handleServiceStart() {
 
 int handleServiceStop() {
 #ifdef _WIN32
-    Win32Service service("NVRService", "NVR Video Recorder Service");
+    Win32Service service("nvr", "NVR Video Recorder Service");
     if (service.stop()) {
         std::cout << "Service stopped successfully" << std::endl;
         return 0;
@@ -150,7 +153,7 @@ int handleServiceStop() {
 
 int handleServiceRestart() {
 #ifdef _WIN32
-    Win32Service service("NVRService", "NVR Video Recorder Service");
+    Win32Service service("nvr", "NVR Video Recorder Service");
     if (service.restart()) {
         std::cout << "Service restarted successfully" << std::endl;
         return 0;
@@ -177,6 +180,7 @@ int runServiceMode(int argc, char* argv[]) {
     Application::initializeLogging("debug");
 
     try {
+        spdlog::info("{}", NVR::getDetailedVersionString());
         spdlog::info("Service mode starting with {} arguments", svcArgv.size());
         for (size_t i = 0; i < svcArgv.size(); i++) {
             spdlog::info("  Arg[{}]: {}", i, svcArgv[i]);
@@ -241,6 +245,10 @@ int runConsoleMode(int argc, char* argv[]) {
         }
 
         Application::initializeLogging(config.log_level);
+
+        spdlog::info("Version: {}", NVR::getDetailedVersionString());
+        spdlog::info("Built: {}", NVR::getBuildDateString());
+        spdlog::info("Build type: {}", NVR::getBuildTypeString());
 
         ApplicationState state;
         Application::setupSignalHandlers(state);

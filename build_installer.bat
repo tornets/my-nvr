@@ -2,18 +2,18 @@
 setlocal enabledelayedexpansion
 
 REM ========================================
-REM  NVR Service 安装包构建脚本
-REM  版本: 2.0
+REM  NVR Service Installer Builder v3.0
+REM  Supports WiX 4.x and Inno Setup
 REM ========================================
 
-REM 启用 ANSI 颜色支持 (Windows 10+)
+REM Enable ANSI color support (Windows 10+)
 for /F "tokens=4 delims=." %%a in ('ver') do set "WIN_MINOR=%%a"
 set "MIN_WIN10=15063"
 if %WIN_MINOR% GEQ %MIN_WIN10% (
     reg add HKCU\Console /v VirtualTerminalLevel /t REG_DWORD /d 1 /f >nul 2>&1
 )
 
-REM 设置颜色代码 (ESC = ASCII 27)
+REM Setup color codes (ESC = ASCII 27)
 for /f %%E in ('echo prompt $E ^| cmd') do set "ESC=%%E"
 set "GREEN=%ESC%[92m"
 set "RED=%ESC%[91m"
@@ -22,18 +22,19 @@ set "BLUE=%ESC%[94m"
 set "CYAN=%ESC%[96m"
 set "RESET=%ESC%[0m"
 
-REM 设置默认值
+REM Default values
 set "VERSION=1.0.0"
 set "CONFIG_DIR=installer_output"
 set "EXE_NAME=nvr.exe"
 set "INSTALLER_NAME=nvr-service-setup"
-set "INNO_SETUP_PATH=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+set "BUILD_SYSTEM=wix"
 
-REM 解析命令行参数
+REM Parse command line arguments
 set "CLEAN=0"
 set "SKIP_BUILD=0"
 set "SIGN=0"
 set "VERSION="
+set "BUILD_SYSTEM="
 
 :parse_args
 if "%~1"=="" goto args_done
@@ -44,6 +45,8 @@ if /i "%~1"=="--version" (
     shift
     if not "%~1"=="" set "VERSION=%~1"
 )
+if /i "%~1"=="--wix" set "BUILD_SYSTEM=wix"
+if /i "%~1"=="--innosetup" set "BUILD_SYSTEM=innosetup"
 shift
 goto parse_args
 
@@ -51,176 +54,187 @@ goto parse_args
 
 echo.
 echo %GREEN%========================================
-echo   NVR Service 安装包构建工具 v2.0
+echo   NVR Service Installer Builder v3.0
 echo========================================%RESET%
 echo.
 
-REM 检查构建目录
-if not exist "build" (
-    echo %RED%错误: build 目录不存在%RESET%
-    echo.
-    echo 请先运行以下命令创建构建目录:
-    echo   build.bat debug
-    echo.
-    pause
-    exit /b 1
-)
+REM Default to WiX
+if "%BUILD_SYSTEM%"=="" set "BUILD_SYSTEM=wix"
 
-REM 显示配置
-echo %CYAN%构建配置:%RESET%
-echo   - 版本号: %VERSION%
-echo   - 输出目录: %CONFIG_DIR%
-echo   - 清理旧文件: %CLEAN%
-echo   - 跳过构建: %SKIP_BUILD%
-echo   - 数字签名: %SIGN%
+echo Build Options:
+echo   - Version: %VERSION%
+echo   - Build System: %BUILD_SYSTEM%
+echo   - Clean Files: %CLEAN%
+echo   - Skip Build: %SKIP_BUILD%
+echo   - Code Signing: %SIGN%
 echo.
 
 REM ========================================
-REM 步骤 1: 清理
+REM Step 1: Clean
 REM ========================================
 if "%CLEAN%"=="1" (
-    echo [%CYAN%1/4%RESET%] 清理旧文件...
+    echo [%CYAN%1/4%RESET%] Cleaning old files...
     if exist %CONFIG_DIR% (
         rd /s /q %CONFIG_DIR% 2>nul
-        echo     已删除: %CONFIG_DIR%
-    ) else (
-        echo     跳过清理（目录不存在）
+        echo     Deleted: %CONFIG_DIR%
+    )
+    if exist build (
+        rd /s /q build 2>nul
+        echo     Deleted: build
     )
     echo.
 ) else (
-    echo [%CYAN%1/4%RESET%] 保留旧文件...
+    echo [%CYAN%1/4%RESET%] Checking files...
     if exist %CONFIG_DIR% (
-        echo     保留: %CONFIG_DIR%
+        echo     Found: %CONFIG_DIR%
     )
     echo.
 )
 
 REM ========================================
-REM 步骤 2: 构建
+REM Step 2: Build
 REM ========================================
 if "%SKIP_BUILD%"=="0" (
-    echo [%CYAN%2/4%RESET%] 构建 Release 版本...
-    echo     正在编译项目...
+    echo [%CYAN%2/4%RESET%] Building Release version...
+    echo     Building project...
     call build.bat release >nul 2>&1
 
     if errorlevel 1 (
-        echo %RED%     ? 构建失败！%RESET%
+        echo     %RED%X Build failed%RESET%
         pause
         exit /b 1
     )
 
-    echo     ? 构建成功
+    echo     √ Build successful
     echo.
 ) else (
-    echo [%CYAN%2/4%RESET%] 跳过构建（使用现有文件）...
+    echo [%CYAN%2/4%RESET%] Skipping build, using existing files...
     echo.
 )
 
 REM ========================================
-REM 步骤 3: 准备文件
+REM Step 3: Build Installer
 REM ========================================
-echo [%CYAN%3/4%RESET%] 准备安装包文件...
+echo [%CYAN%3/4%RESET%] Building installer...
+echo     Using: %BUILD_SYSTEM%
 
-REM 确保输出目录存在
-if not exist %CONFIG_DIR% (
-    mkdir %CONFIG_DIR%
+if /i "%BUILD_SYSTEM%"=="wix" (
+    echo     Checking for WiX Toolset...
+
+    REM Check if wix.exe is in PATH
+    where wix >nul 2>&1
+    if errorlevel 1 (
+        echo     %YELLOW%X WiX Toolset not found in PATH%RESET%
+        echo.
+        echo     Please install WiX Toolset v4.x:
+        echo     https://wixtoolset.org/releases/
+        echo.
+        echo     Or use: winget install WiX.Toolset
+        echo.
+        echo     To use Inno Setup instead, run:
+        echo     build_installer.bat --innosetup
+        echo.
+        pause
+        exit /b 1
+    )
+
+    echo     √ WiX Toolset found
+
+    REM Configure and build with CMake
+    echo     Configuring CMake...
+    if not exist build mkdir build
+    if not exist build\conan mkdir build\conan
+
+    cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
+        -DCMAKE_TOOLCHAIN_FILE=build/conan/conan_toolchain.cmake >nul 2>&1
+
+    if errorlevel 1 (
+        echo     %RED%X CMake configuration failed%RESET%
+        echo.
+        echo     Try running manually:
+        echo     cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        echo.
+        pause
+        exit /b 1
+    )
+
+    echo     √ CMake configured
+    echo     Building MSI installer...
+
+    REM Build the package target
+    cmake --build build --config Release --target package >nul 2>&1
+
+    if errorlevel 1 (
+        echo     %RED%X Package build failed%RESET%
+        echo.
+        echo     Try running manually:
+        echo     cd build
+        echo     cpack -G WIX
+        echo.
+        pause
+        exit /b 1
+    )
+
+    echo     √ MSI installer created
+
+) else if /i "%BUILD_SYSTEM%"=="innosetup" (
+    echo     Checking for Inno Setup...
+    where iscc >nul 2>&1
+    if errorlevel 1 (
+        echo     %YELLOW%X Inno Setup not found%RESET%
+        echo.
+        echo     Please install Inno Setup:
+        echo     https://jrsoftware.org/isdl.php
+        echo.
+        echo     Or use Scoop:
+        echo     scoop install innosetup
+        echo.
+        echo     To use WiX instead, run:
+        echo     build_installer.bat --wix
+        echo.
+        pause
+        exit /b 1
+    )
+
+    echo     √ Inno Setup found
+    echo     Building installer...
+
+    iscc installer.iss >nul 2>&1
+
+    if errorlevel 1 (
+        echo     %RED%X Installer build failed%RESET%
+        pause
+        exit /b 1
+    )
+
+    echo     √ Installer created
 )
 
-REM 复制主程序
-echo     - 复制主程序...
-copy /Y build\src\Release\%EXE_NAME% %CONFIG_DIR%\ >nul 2>&1
-if errorlevel 1 (
-    echo     %RED%? 文件不存在: build\src\Release\%EXE_NAME%%RESET%
-    pause
-    exit /b 1
-)
-
-REM 复制配置文件
-if exist "config.yaml.example" (
-    echo     - 复制配置示例...
-    copy /Y config.yaml.example %CONFIG_DIR%\ >nul 2>&1
-)
-
-REM 复制文档文件
-if exist "INSTALL.md" (
-    echo     - 复制安装文档...
-    copy /Y INSTALL.md %CONFIG_DIR%\ >nul 2>&1
-)
-
-if exist "README.md" (
-    echo     - 复制 README...
-    copy /Y README.md %CONFIG_DIR%\ >nul 2>&1
-)
-
-if exist "LICENSE" (
-    echo     - 复制许可证...
-    copy /Y LICENSE %CONFIG_DIR%\ >nul 2>&1
-)
-
-echo     ? 文件准备完成
 echo.
 
 REM ========================================
-REM 步骤 4: 生成安装包
+REM Summary
 REM ========================================
-echo [%CYAN%4/4%RESET%] 生成安装包...
-echo     检查 Inno Setup...
-
-REM 检查 Inno Setup 是否安装
-where iscc >nul 2>&1
-if errorlevel 1 (
-    echo     %YELLOW%  ? Inno Setup 未找到%RESET%
-    echo.
-    echo     请下载安装 Inno Setup:
-    echo     https://jrsoftware.org/isdl.php
-    echo.
-    echo     或使用 Scoop 安装:
-    echo     scoop install innosetup
-    echo.
-    echo     当前状态: 文件已准备好到 %CONFIG_DIR%
-    echo.
-    echo     安装 Inno Setup 后, 手动运行:
-    echo       iscc installer.iss
-    echo.
-    goto :skip_compile
-)
-
-echo     ? Inno Setup 已找到
-echo     正在编译安装脚本...
-
-REM 生成安装包
-iscc installer.iss >nul 2>&1
-
-if errorlevel 1 (
-    echo     %RED%     ? 安装包生成失败！%RESET%
-    pause
-    exit /b 1
-)
-
-echo     ? 安装包生成成功
-echo.
-
-REM ========================================
-REM 完成
-REM ========================================
-:skip_compile
 echo ========================================
-echo   %GREEN%? 构建完成！%RESET%
+echo   %GREEN%√ All Complete%RESET%
 echo ========================================
 echo.
-echo %CYAN%输出文件:%RESET%
-echo   - 可执行文件: build\src\Release\%EXE_NAME%
-echo   - 安装包: %CONFIG_DIR%\%INSTALLER_NAME%-%VERSION%.exe
-echo.
-echo %CYAN%文件信息:%RESET%
-dir "%CONFIG_DIR%\%INSTALLER_NAME%-%VERSION%.exe" 2>nul | findstr /C:"nvr-service-setup"
+
+echo %CYAN%Output Files:%RESET%
+if /i "%BUILD_SYSTEM%"=="wix" (
+    echo   - Executable: build\src\Release\%EXE_NAME%
+    echo   - Installer: build\*.msi
+) else (
+    echo   - Executable: build\src\Release\%EXE_NAME%
+    echo   - Installer: %CONFIG_DIR%\%INSTALLER_NAME%-%VERSION%.exe
+)
 
 echo.
-echo %YELLOW%下一步:%RESET%
-echo   1. 测试安装程序: %CONFIG_DIR%\%INSTALLER_NAME%-%VERSION%.exe
-echo   2. 在虚拟机中测试完整安装流程
-echo   3. 数字签名（可选）
-echo   4. 上传到 GitHub Release
+echo %CYAN%Next Steps:%RESET%
+echo   1. Test the installer
+echo   2. Verify service installation
+echo   3. Optional: Sign the installer
+echo   4. Upload to GitHub Release
 echo.
 
 pause

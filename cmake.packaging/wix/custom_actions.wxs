@@ -1,0 +1,48 @@
+<CPackWiXPatch>
+  <!--  Fragment ID is from: <your build dir>/_CPack_Packages/win64/WIX/files.wxs -->
+  <CPackWiXFragment Id="#PRODUCT">
+      <CustomAction Id="InstallService"
+                    FileKey="CM_FP_bin.nvr.exe"
+                    ExeCommand='service install -- --config "[INSTALLFOLDER]config.yaml"'
+                    Execute="deferred"
+                    Impersonate="no"
+                    Return="check"
+                    />
+
+      <!-- Uninstall Service Custom Action (immediate) -->
+      <CustomAction Id="UninstallService"
+                    FileKey="CM_FP_bin.nvr.exe"
+                    ExeCommand="service uninstall"
+                    Execute="deferred"
+                    Impersonate="no"
+                    Return="ignore"
+                    />
+
+      <!-- Stop Service Custom Action (before uninstall) -->
+      <CustomAction Id="StopService"
+                    FileKey="CM_FP_bin.nvr.exe"
+                    ExeCommand="service stop"
+                    Execute="deferred"
+                    Impersonate="no"
+                    Return="ignore"
+                    />
+
+        <!-- Schedule custom actions in install sequence -->
+        <InstallExecuteSequence>
+          <!-- Install service after files are copied -->
+          <Custom Action="InstallService" After="InstallFiles">
+            NOT Installed AND NOT REMOVE
+          </Custom>
+
+          <!-- Stop service before uninstall -->
+          <Custom Action="StopService" Before="RemoveFiles">
+            REMOVE="ALL"
+          </Custom>
+
+          <!-- Uninstall service -->
+          <Custom Action="UninstallService" After="StopService">
+            REMOVE="ALL"
+          </Custom>
+        </InstallExecuteSequence>
+  </CPackWiXFragment>
+</CPackWiXPatch>

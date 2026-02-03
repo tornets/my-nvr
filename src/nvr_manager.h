@@ -27,6 +27,9 @@ public:
     ~NVRManager();
 
     bool addStream(const std::string& stream_id, const std::string& stream_url);
+    bool addStreamWithConfig(const std::string& stream_id, const std::string& stream_url,
+                             bool auto_reconnect, int reconnect_interval_seconds,
+                             int max_reconnect_attempts, int timeout_seconds);
     bool removeStream(const std::string& stream_id);
     void stopAll();
 

@@ -231,11 +231,20 @@ int Application::run(const Config& config, ApplicationState& state) {
 
     // Add all streams
     for (const auto& stream : config.streams) {
-        if (!state.manager->addStream(stream.id, stream.url)) {
+        if (!state.manager->addStreamWithConfig(stream.id, stream.url,
+                                                  stream.auto_reconnect,
+                                                  stream.reconnect_interval_seconds,
+                                                  stream.max_reconnect_attempts,
+                                                  stream.timeout_seconds)) {
             spdlog::error("Failed to add stream: {} ({})", stream.id, stream.url);
             return 1;
         }
         spdlog::info("Added stream: {} -> {}", stream.id, stream.url);
+        spdlog::info("  Auto reconnect: {}", stream.auto_reconnect ? "enabled" : "disabled");
+        spdlog::info("  Reconnect interval: {}s", stream.reconnect_interval_seconds);
+        spdlog::info("  Max reconnect attempts: {}",
+                    stream.max_reconnect_attempts == -1 ? "unlimited" : std::to_string(stream.max_reconnect_attempts));
+        spdlog::info("  Stream timeout: {}s", stream.timeout_seconds);
     }
 
     // Start uploader

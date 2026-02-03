@@ -14,16 +14,25 @@ streams:
   # 摄像头 1
   - id: camera1
     url: rtsp://admin:password@192.168.1.100:554/stream1
-    # 可选参数
+
+    # 自动重连配置
+    auto_reconnect: true            # 是否自动重连（默认: true）
+    reconnect_interval_seconds: 5   # 重连间隔，秒（默认: 5）
+    max_reconnect_attempts: -1      # 最大重连次数，-1表示无限重连（默认: -1）
+    timeout_seconds: 30             # 流超时时间，秒（默认: 30）
+
+    # 可选的额外参数
     params:
-      timeout: 30           # 连接超时（秒）
-      reconnect: auto       # 自动重连
+      # timeout: 30                  # 连接超时（秒）- 已废弃，使用 timeout_seconds
+      # reconnect: auto              # 自动重连 - 已废弃，使用 auto_reconnect
 
   # 摄像头 2（示例）
   # - id: camera2
   #   url: rtsp://192.168.1.101:554/stream1
-  #   params:
-  #     timeout: 60
+  #   auto_reconnect: true
+  #   reconnect_interval_seconds: 10
+  #   max_reconnect_attempts: 3     # 最多重连3次，超过后停止
+  #   timeout_seconds: 60
 
 # ============================================
 # 录制配置

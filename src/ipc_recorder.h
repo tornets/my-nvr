@@ -21,17 +21,41 @@ extern "C" {
 #include <libswresample/swresample.h>
 }
 
+// 前向声明
+class IPCRecorder;
+
+// 中断回调函数（用于超时检测）
+int interrupt_callback(void* ctx);
+
 class IPCRecorder {
+    friend int ::interrupt_callback(void* ctx);
+
 public:
     IPCRecorder(const std::string& stream_id, const std::string& stream_url,
                 const std::string& output_dir, const std::string& temp_dir,
                 int segment_duration = 600,
                 const std::string& filename_template = "{stream_id}_{start_datetime}_seg{segment_index}_{duration}.mp4",
-                bool enable_audio = true);
+                bool enable_audio = true,
+                bool auto_reconnect = true,
+                int reconnect_interval_seconds = 5,
+                int max_reconnect_attempts = -1,
+                int timeout_seconds = 30);
     ~IPCRecorder();
 
     void start();
     void stop();
+
+    // 连接并录制（内部使用）
+    bool connectAndRecord();
+
+    // 获取录制状态信息
+    struct StatusInfo {
+        bool is_recording;
+        int reconnect_count;
+        std::string last_error;
+        int64_t last_packet_time;
+    };
+    StatusInfo getStatus() const;
 
 private:
     void recordingLoop();
@@ -62,6 +86,19 @@ private:
     std::string m_filename_template;
     std::string m_current_filename;  // 当前录制的文件名
     bool m_enable_audio;             // 是否启用音频录制
+
+    // 重连配置
+    bool m_auto_reconnect;           // 是否自动重连
+    int m_reconnect_interval_seconds; // 重连间隔（秒）
+    int m_max_reconnect_attempts;    // 最大重连尝试次数
+    int m_timeout_seconds;           // 超时时间（秒）
+
+    // 重连状态
+    std::atomic<int> m_reconnect_count;      // 当前重连次数
+    std::atomic<int64_t> m_last_packet_time; // 最后一个包的时间戳
+    std::string m_last_error;                // 最后一次错误信息
+    std::atomic<int64_t> m_last_read_time;   // 最后一次读取时间（用于中断回调）
+
     std::atomic<bool> m_running;
     std::thread m_thread;
     std::mutex m_mutex;
@@ -85,7 +122,8 @@ private:
     int64_t m_audio_start_pts;  // 音频流起始 PTS
     int64_t m_segment_duration;
     int m_segment_index;         // 当前分段序号（每个流独立）
-    std::time_t m_segment_start_time; // 分段开始时间
+    std::time_t m_segment_start_time; // 分段开始时间（系统时间）
+    int64_t m_last_video_pts;   // 最后一个视频包的 PTS（用于计算实际时长）
     AVRational m_video_time_base;
     int64_t m_current_dts;
     int64_t m_pts_offset;

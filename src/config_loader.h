@@ -9,6 +9,10 @@ struct StreamConfig {
     std::string id;
     std::string url;
     std::map<std::string, std::string> extra_params;  // 额外参数，如 timeout=30
+    bool auto_reconnect;           // 是否自动重连
+    int reconnect_interval_seconds; // 重连间隔（秒）
+    int max_reconnect_attempts;     // 最大重连尝试次数（-1表示无限重连）
+    int timeout_seconds;            // 流超时时间（秒），无数据超过此时长视为离线
 };
 
 struct AutoCleanConfig {

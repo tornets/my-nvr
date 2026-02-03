@@ -24,17 +24,49 @@ namespace fs = std::filesystem;
 std::atomic<uint64_t> IPCRecorder::m_global_sequence{1};
 std::mutex IPCRecorder::m_global_mutex;
 
+// 中断回调函数（用于超时检测）
+static int interrupt_callback(void* ctx) {
+    IPCRecorder* recorder = static_cast<IPCRecorder*>(ctx);
+    if (!recorder) {
+        return 0;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    auto last_read = std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(
+        recorder->m_last_read_time.load()));
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_read).count();
+
+    // 如果超过超时时间，返回 1 中断操作
+    int timeout_ms = recorder->m_timeout_seconds * 1000;
+    if (elapsed > timeout_ms) {
+        return 1;  // 中断
+    }
+
+    return 0;  // 继续
+}
+
 IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream_url,
                          const std::string& output_dir, const std::string& temp_dir,
                          int segment_duration,
                          const std::string& filename_template,
-                         bool enable_audio)
+                         bool enable_audio,
+                         bool auto_reconnect,
+                         int reconnect_interval_seconds,
+                         int max_reconnect_attempts,
+                         int timeout_seconds)
     : m_stream_id(stream_id)
     , m_stream_url(stream_url)
     , m_output_dir(output_dir)
     , m_temp_dir(temp_dir)
     , m_filename_template(filename_template)
     , m_enable_audio(enable_audio)
+    , m_auto_reconnect(auto_reconnect)
+    , m_reconnect_interval_seconds(reconnect_interval_seconds)
+    , m_max_reconnect_attempts(max_reconnect_attempts)
+    , m_timeout_seconds(timeout_seconds)
+    , m_reconnect_count(0)
+    , m_last_packet_time(0)
+    , m_last_read_time(0)
     , m_running(false)
     , m_input_ctx(nullptr)
     , m_output_ctx(nullptr)
@@ -51,6 +83,7 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
     , m_segment_duration(segment_duration)
     , m_segment_index(0)
     , m_segment_start_time(0)
+    , m_last_video_pts(0)
     , m_video_time_base{1, 90000}
     , m_current_dts(0)
     , m_pts_offset(0)
@@ -120,34 +153,126 @@ void IPCRecorder::stop() {
 
 void IPCRecorder::recordingLoop() {
     m_logger->info("Starting recording: {}", m_stream_url);
+    m_logger->info("Auto reconnect: {}, Interval: {}s, Max attempts: {}, Timeout: {}s",
+                   m_auto_reconnect, m_reconnect_interval_seconds,
+                   m_max_reconnect_attempts == -1 ? "unlimited" : std::to_string(m_max_reconnect_attempts),
+                   m_timeout_seconds);
 
+    while (m_running) {
+        // 尝试连接并录制
+        if (!connectAndRecord()) {
+            // 连接或录制失败
+            if (!m_auto_reconnect) {
+                m_logger->warn("Auto reconnect disabled, stopping recording");
+                break;
+            }
+
+            // 检查是否达到最大重连次数
+            if (m_max_reconnect_attempts != -1 && m_reconnect_count >= m_max_reconnect_attempts) {
+                m_logger->error("Max reconnect attempts ({}) reached, stopping recording", m_max_reconnect_attempts);
+                break;
+            }
+
+            // 等待后重连
+            m_logger->info("Reconnecting in {} seconds...", m_reconnect_interval_seconds);
+            for (int i = 0; i < m_reconnect_interval_seconds && m_running; i++) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        }
+    }
+
+    m_logger->info("Recording loop ended: {} (reconnect count: {})", m_stream_url, m_reconnect_count.load());
+}
+
+bool IPCRecorder::connectAndRecord() {
+    // 清理之前的连接
+    if (m_input_ctx) {
+        avformat_close_input(&m_input_ctx);
+        m_input_ctx = nullptr;
+    }
+    if (m_output_ctx) {
+        closeOutput();
+    }
+
+    // 重置状态
+    m_video_stream_idx = -1;
+    m_audio_stream_idx = -1;
+    m_segment_index = 0;
+    m_pts_offset = 0;
+
+    // 尝试打开输入
     if (!openInput()) {
-        m_logger->error("Failed to open input stream");
-        return;
+        m_last_error = "Failed to open input";
+        return false;
     }
 
+    // 设置流
     if (!setupStreams()) {
-        m_logger->error("Failed to setup streams");
-        return;
+        m_last_error = "Failed to setup streams";
+        return false;
     }
 
+    // 设置音频转码
     if (m_audio_stream_idx != -1 && !setupAudioTranscoding()) {
         m_logger->warn("Failed to setup audio transcoding, will record video only");
         m_audio_stream_idx = -1;
     }
 
+    m_logger->info("Connection established, starting recording loop");
+
     AVPacket* packet = av_packet_alloc();
+    auto last_activity_time = std::chrono::steady_clock::now();
+    int consecutive_errors = 0;
+    const int MAX_CONSECUTIVE_ERRORS = 10;
+    const int READ_TIMEOUT_MS = 5000;  // 每次读取的超时时间（毫秒）
 
     while (m_running) {
+        // 检查超时
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_activity_time).count();
+        if (elapsed > m_timeout_seconds) {
+            m_last_error = "Stream timeout - no data received";
+            m_logger->error("Stream timeout: no data for {} seconds, reconnecting...", elapsed);
+            m_reconnect_count++;
+            av_packet_free(&packet);
+            return false;
+        }
+
+        // 更新最后读取时间（用于中断回调）
+        m_last_read_time = now.time_since_epoch().count();
+
         int ret = av_read_frame(m_input_ctx, packet);
         if (ret < 0) {
-            if (ret == AVERROR_EOF) {
-                m_logger->info("End of stream");
+            consecutive_errors++;
+
+            // 检查是否是超时中断
+            if (ret == AVERROR_EXIT) {
+                m_logger->warn("Read interrupted by timeout (error count: {})", consecutive_errors);
+            } else if (ret == AVERROR_EOF) {
+                m_logger->warn("End of stream (error count: {})", consecutive_errors);
             } else {
-                m_logger->error("Error reading frame: {}", av_err2str(ret));
+                m_logger->error("Error reading frame: {} (error count: {})", av_err2str(ret), consecutive_errors);
             }
-            break;
+
+            // 连续错误过多，认为连接已断开
+            if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
+                m_last_error = "Too many consecutive read errors";
+                m_logger->error("Too many consecutive errors ({}), reconnecting...", MAX_CONSECUTIVE_ERRORS);
+                m_reconnect_count++;
+                av_packet_free(&packet);
+                return false;
+            }
+
+            // 短暂等待后继续
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
         }
+
+        // 成功读取帧，重置错误计数
+        consecutive_errors = 0;
+        last_activity_time = std::chrono::steady_clock::now();
+        m_last_packet_time = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
 
         if (packet->pts < 0 || (m_output_ctx == nullptr && !(packet->flags & AV_PKT_FLAG_KEY)))
             continue;
@@ -203,12 +328,18 @@ void IPCRecorder::recordingLoop() {
                 // 重置音频起始 PTS 和帧计数
                 m_audio_start_pts = 0;
                 m_audio_frame_count = 0;
+                m_last_video_pts = 0;  // 重置最后一个视频PTS
             }
 
             int stream_index = packet->stream_index;
 
             if (packet->flags & AV_PKT_FLAG_KEY) {
                 m_logger->debug("this packet contain key frame");
+            }
+
+            // 保存最后一个视频包的原始PTS（用于计算实际录制时长）
+            if (packet->pts > 0) {
+                m_last_video_pts = packet->pts;
             }
 
             packet->pts -= m_segment_start_pts;
@@ -263,20 +394,56 @@ void IPCRecorder::recordingLoop() {
     closeOutput();
 
     m_logger->info("Recording stopped: {}", m_stream_url);
+    return true;  // 正常结束
 }
 
 bool IPCRecorder::openInput() {
+    // 分配输入上下文
+    m_input_ctx = avformat_alloc_context();
+    if (!m_input_ctx) {
+        m_logger->error("Cannot allocate input context");
+        return false;
+    }
+
+    // 初始化最后读取时间
+    auto now = std::chrono::steady_clock::now();
+    m_last_read_time = now.time_since_epoch().count();
+
+    // 设置中断回调
+    m_input_ctx->interrupt_callback.callback = interrupt_callback;
+    m_input_ctx->interrupt_callback.opaque = this;
+
+    // 设置超时选项（微秒单位）
+    // 分析超时：5秒
+    m_input_ctx->probesize = 5 * 1024 * 1024;  // 5MB
+    m_input_ctx->max_analyze_duration = 5 * AV_TIME_BASE;
+
+    // 设置低延迟模式
+    m_input_ctx->flags |= AVFMT_FLAG_NOBUFFER;  // 减少缓冲
+
+    m_logger->info("Opening stream: {} (timeout: {}s)", m_stream_url, m_timeout_seconds);
+
     int ret = avformat_open_input(&m_input_ctx, m_stream_url.c_str(), nullptr, nullptr);
     if (ret < 0) {
-        m_logger->error("Cannot open input: {}", av_err2str(ret));
+        if (ret == AVERROR_EXIT) {
+            m_logger->error("Cannot open input: timeout after {}s", m_timeout_seconds);
+        } else {
+            m_logger->error("Cannot open input: {}", av_err2str(ret));
+        }
+        m_input_ctx = nullptr;
         return false;
     }
 
     ret = avformat_find_stream_info(m_input_ctx, nullptr);
     if (ret < 0) {
         m_logger->error("Cannot find stream info: {}", av_err2str(ret));
+        avformat_close_input(&m_input_ctx);
+        m_input_ctx = nullptr;
         return false;
     }
+
+    // 打印流信息用于调试
+    av_dump_format(m_input_ctx, 0, m_stream_url.c_str(), 0);
 
     return true;
 }
@@ -366,10 +533,24 @@ void IPCRecorder::closeOutput() {
 
         // 移动文件从临时目录到最终目录，并重命名添加完整信息
         if (!m_current_filename.empty()) {
-            // 计算实际录制时长
-            std::time_t end_time;
-            std::time(&end_time);
-            int64_t duration_seconds = end_time - m_segment_start_time;
+            // 计算实际录制时长（基于视频PTS，而不是系统时间）
+            int64_t duration_seconds = 0;
+
+            if (m_last_video_pts > 0 && m_video_stream_idx >= 0) {
+                // 使用视频流的 time_base 将 PTS 转换为秒
+                AVRational tb = m_video_time_base;
+                duration_seconds = av_rescale_q(m_last_video_pts, tb, AVRational{1, 1});
+                m_logger->debug("Video duration calculation: last_pts={}, tb={}/{}, duration={}s",
+                               m_last_video_pts, tb.num, tb.den, duration_seconds);
+            }
+
+            // 如果视频PTS计算失败（或为0），回退到系统时间计算
+            if (duration_seconds <= 0) {
+                std::time_t end_time;
+                std::time(&end_time);
+                duration_seconds = end_time - m_segment_start_time;
+                m_logger->warn("Video PTS not available, using system time for duration: {}s", duration_seconds);
+            }
 
             // 生成新的文件名（包含结束时间和时长）
             std::string new_filename = generateFilenameFromTemplate(m_segment_start_pts, 0, duration_seconds);
@@ -849,4 +1030,13 @@ std::string IPCRecorder::generateFilenameFromTemplate(int64_t start_pts, int64_t
     }
 
     return result;
+}
+
+IPCRecorder::StatusInfo IPCRecorder::getStatus() const {
+    StatusInfo info;
+    info.is_recording = m_running.load() && m_output_ctx != nullptr;
+    info.reconnect_count = m_reconnect_count.load();
+    info.last_error = m_last_error;
+    info.last_packet_time = m_last_packet_time.load();
+    return info;
 }

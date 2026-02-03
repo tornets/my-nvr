@@ -18,6 +18,9 @@ Config Config::getDefault() {
     config.streams.clear();
     config.log_level = "debug";
 
+    // 设置流配置的默认值（当添加新流时使用）
+    // 这些值会在 parseStreamArgument 和 mergeStream 中使用
+
     // 录制默认配置
     config.record.output_dir = "./recordings";
     config.record.temp_dir = "./recordings/.temp";  // 临时目录
@@ -102,6 +105,12 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
                 for (const auto& stream : streams_node) {
                     StreamConfig stream_config;
 
+                    // 设置默认值
+                    stream_config.auto_reconnect = true;
+                    stream_config.reconnect_interval_seconds = 5;
+                    stream_config.max_reconnect_attempts = -1;  // 无限重连
+                    stream_config.timeout_seconds = 30;
+
                     if (stream["id"]) {
                         stream_config.id = stream["id"].as<std::string>();
                     } else {
@@ -114,6 +123,20 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
                     } else {
                         std::cerr << "Warning: stream '" << stream_config.id << "' missing 'url', skipping" << std::endl;
                         continue;
+                    }
+
+                    // 解析重连配置
+                    if (stream["auto_reconnect"]) {
+                        stream_config.auto_reconnect = stream["auto_reconnect"].as<bool>();
+                    }
+                    if (stream["reconnect_interval_seconds"]) {
+                        stream_config.reconnect_interval_seconds = stream["reconnect_interval_seconds"].as<int>();
+                    }
+                    if (stream["max_reconnect_attempts"]) {
+                        stream_config.max_reconnect_attempts = stream["max_reconnect_attempts"].as<int>();
+                    }
+                    if (stream["timeout_seconds"]) {
+                        stream_config.timeout_seconds = stream["timeout_seconds"].as<int>();
                     }
 
                     // 解析额外参数
@@ -212,6 +235,12 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
 
 std::optional<StreamConfig> Config::parseStreamArgument(const std::string& arg) {
     StreamConfig config;
+
+    // 设置默认值
+    config.auto_reconnect = true;
+    config.reconnect_interval_seconds = 5;
+    config.max_reconnect_attempts = -1;  // 无限重连
+    config.timeout_seconds = 30;
 
     // 检查是否包含 url=（向后兼容纯URL的情况）
     if (arg.find("url=") == std::string::npos) {

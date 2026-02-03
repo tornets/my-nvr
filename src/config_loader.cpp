@@ -23,6 +23,7 @@ Config Config::getDefault() {
     config.record.temp_dir = "./recordings/.temp";  // 临时目录
     config.record.segment_duration_seconds = 600;  // 10分钟
     config.record.filename_template = "{stream_id}_{start_datetime}_seg{segment_index}_{duration}.mp4";
+    config.record.enable_audio = true;  // 默认启用音频录制
 
     // 自动清理默认配置
     config.autoclean.enabled = true;                 // 默认启用
@@ -36,6 +37,9 @@ Config Config::getDefault() {
     config.upload.timeout_seconds = 300;
     config.upload.max_retries = 3;
     config.upload.retry_delay_seconds = 5;
+
+    // 店铺默认配置
+    config.shop.id = 0;                              // 默认店铺ID为0
 
     return config;
 }
@@ -143,6 +147,9 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
             if (record["filename_template"]) {
                 config.record.filename_template = record["filename_template"].as<std::string>();
             }
+            if (record["enable_audio"]) {
+                config.record.enable_audio = record["enable_audio"].as<bool>();
+            }
         }
 
         // 解析自动清理配置
@@ -184,6 +191,14 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
             }
             if (upload["retry_delay_seconds"]) {
                 config.upload.retry_delay_seconds = upload["retry_delay_seconds"].as<int>();
+            }
+        }
+
+        // 解析店铺配置
+        if (yaml["shop"]) {
+            const auto& shop = yaml["shop"];
+            if (shop["id"]) {
+                config.shop.id = shop["id"].as<int>();
             }
         }
 

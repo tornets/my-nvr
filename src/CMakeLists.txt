@@ -63,6 +63,7 @@ target_link_libraries(nvr PRIVATE
     yaml-cpp::yaml-cpp
     argparse::argparse
     httplib::httplib
+    nlohmann_json::nlohmann_json
 )
 
 # Install rules for packaging

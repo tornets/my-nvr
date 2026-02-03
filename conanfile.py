@@ -13,6 +13,7 @@ class CompressorRecipe(ConanFile):
         self.requires("yaml-cpp/0.8.0")
         self.requires("argparse/2.9")
         self.requires("cpp-httplib/0.30.1", options={"with_openssl": True})
+        self.requires("nlohmann_json/3.11.3")
 
     def build_requirements(self):
         self.tool_requires("gsoap/2.8.139")

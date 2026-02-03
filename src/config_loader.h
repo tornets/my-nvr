@@ -26,6 +26,10 @@ struct UploadConfig {
     int retry_delay_seconds;      // 重试延迟
 };
 
+struct ShopConfig {
+    int id;                       // 店铺ID
+};
+
 struct UploadTask {
     std::string file_path;
     std::string stream_id;
@@ -37,6 +41,7 @@ struct RecordConfig {
     std::string temp_dir;         // 录制过程中的临时文件目录
     int segment_duration_seconds; // 录制分段时长（秒）
     std::string filename_template; // 文件名模板，支持变量: {stream_id}, {start_datetime}, {segment_index} 等
+    bool enable_audio;            // 是否启用音频录制
 };
 
 struct Config {
@@ -45,6 +50,7 @@ struct Config {
     AutoCleanConfig autoclean;     // 自动清理配置
     UploadConfig upload;           // 上传配置
     RecordConfig record;           // 录制配置
+    ShopConfig shop;               // 店铺配置
 
     // 获取默认配置
     static Config getDefault();

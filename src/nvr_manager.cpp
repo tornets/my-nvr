@@ -44,7 +44,8 @@ bool NVRManager::addStream(const std::string& stream_id, const std::string& stre
                                                       m_config.record.output_dir,
                                                       m_config.record.temp_dir,
                                                       m_config.record.segment_duration_seconds,
-                                                      m_config.record.filename_template);
+                                                      m_config.record.filename_template,
+                                                      m_config.record.enable_audio);
     recorder->start();
 
     m_recorders[stream_id] = std::move(recorder);

@@ -27,12 +27,14 @@ std::mutex IPCRecorder::m_global_mutex;
 IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream_url,
                          const std::string& output_dir, const std::string& temp_dir,
                          int segment_duration,
-                         const std::string& filename_template)
+                         const std::string& filename_template,
+                         bool enable_audio)
     : m_stream_id(stream_id)
     , m_stream_url(stream_url)
     , m_output_dir(output_dir)
     , m_temp_dir(temp_dir)
     , m_filename_template(filename_template)
+    , m_enable_audio(enable_audio)
     , m_running(false)
     , m_input_ctx(nullptr)
     , m_output_ctx(nullptr)
@@ -150,6 +152,7 @@ void IPCRecorder::recordingLoop() {
         if (packet->pts < 0 || (m_output_ctx == nullptr && !(packet->flags & AV_PKT_FLAG_KEY)))
             continue;
 
+        /*
         if (m_output_ctx) {
             auto ts = (double)av_rescale_q(packet->pts - m_segment_start_pts, m_output_ctx->streams[0]->time_base, AV_TIME_BASE_Q)/ AV_TIME_BASE;
             if (ts > 10 && packet->flags & AV_PKT_FLAG_KEY) {
@@ -158,6 +161,11 @@ void IPCRecorder::recordingLoop() {
 
             //m_logger->debug("Writing packet: original_pts={}, original_dts={}, ts={}",
             //                packet->pts, packet->dts, ts);
+        }
+        */
+
+        if (shouldSwitchSegment(packet)) {
+            closeOutput();
         }
 
         if (packet->stream_index == m_video_stream_idx) {
@@ -399,7 +407,7 @@ bool IPCRecorder::setupStreams() {
     for (unsigned i = 0; i < m_input_ctx->nb_streams; i++) {
         if (m_input_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             m_video_stream_idx = i;
-        } else if (m_input_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+        } else if (m_input_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && m_enable_audio) {
             m_audio_stream_idx = i;
         }
     }
@@ -407,6 +415,10 @@ bool IPCRecorder::setupStreams() {
     if (m_video_stream_idx == -1) {
         m_logger->error("No video stream found");
         return false;
+    }
+
+    if (!m_enable_audio) {
+        m_logger->info("Audio recording disabled by configuration");
     }
 
     return true;

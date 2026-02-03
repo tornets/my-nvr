@@ -26,7 +26,8 @@ public:
     IPCRecorder(const std::string& stream_id, const std::string& stream_url,
                 const std::string& output_dir, const std::string& temp_dir,
                 int segment_duration = 600,
-                const std::string& filename_template = "{stream_id}_{start_datetime}_seg{segment_index}_{duration}.mp4");
+                const std::string& filename_template = "{stream_id}_{start_datetime}_seg{segment_index}_{duration}.mp4",
+                bool enable_audio = true);
     ~IPCRecorder();
 
     void start();
@@ -60,6 +61,7 @@ private:
     std::string m_temp_dir;          // 临时文件目录
     std::string m_filename_template;
     std::string m_current_filename;  // 当前录制的文件名
+    bool m_enable_audio;             // 是否启用音频录制
     std::atomic<bool> m_running;
     std::thread m_thread;
     std::mutex m_mutex;

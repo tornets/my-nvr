@@ -137,14 +137,7 @@ bool VideoUploader::uploadToServer(const std::string& file_path,
 
         // 解析 URL
         std::string scheme_host_port = config_.url;
-        std::string path = "/upload";
-
-        // 查找路径起始位置
-        size_t path_pos = config_.url.find('/', config_.url.find("://") + 3);
-        if (path_pos != std::string::npos) {
-            scheme_host_port = config_.url.substr(0, path_pos);
-            path = config_.url.substr(path_pos);
-        }
+        std::string path = "/api/upload-batch";
 
         spdlog::debug("Connecting to: {}, path: {}", scheme_host_port, path);
 
@@ -184,8 +177,8 @@ bool VideoUploader::uploadToServer(const std::string& file_path,
 
         if (res) {
             if (res->status == 200 || res->status == 201) {
-                spdlog::debug("Upload successful: {} - Status: {}",
-                             file_path, res->status);
+                spdlog::debug("Upload successful: {} - Status: {}, Body: {}",
+                             file_path, res->status, res->body);
                 return true;
             } else {
                 spdlog::error("Upload failed: {} - Status: {}, Body: {}",
@@ -193,7 +186,7 @@ bool VideoUploader::uploadToServer(const std::string& file_path,
                 return false;
             }
         } else {
-            spdlog::error("Upload failed: {} - Error: {}", file_path, static_cast<int>(res.error()));
+            spdlog::error("Upload failed: {} - Error: {}", file_path, httplib::to_string(res.error()));
             return false;
         }
 

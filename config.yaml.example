@@ -2,6 +2,12 @@
 # 复制此文件为 config.yaml 并根据您的需求修改
 
 # ============================================
+# 店铺配置
+# ============================================
+shop:
+  id: 1  # 店铺ID
+
+# ============================================
 # 流配置列表
 # ============================================
 streams:
@@ -33,7 +39,20 @@ record:
   segment_duration_seconds: 600  # 10分钟
 
   # 文件名模板
+  # 支持的变量:
+  #   {stream_id}       - 流ID（如：camera1）
+  #   {start_date}      - 录制开始日期（如：20260203_143000）
+  #   {start_time}      - 录制开始时间（如：143000）
+  #   {start_datetime}  - 录制开始时间（如：20260203_143000）
+  #   {end_time}        - 结束时间（HHMMSS 格式）
+  #   {end_datetime}    - 结束时间（yyyymmdd_HHMMSS 格式）
+  #   {segment_index}   - 分段序号（该流的第N个分段）
+  #   {duration}        - 该段时长（秒）
   filename_template: "{stream_id}_{start_datetime}_seg{segment_index}_{duration}.mp4"
+  # 示例输出: camera1_2026-02-03_14-30-00_seg1_600.mp4
+
+  # 是否启用音频录制
+  enable_audio: true  # true: 启用音频, false: 仅视频
 
 # ============================================
 # 日志配置

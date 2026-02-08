@@ -56,7 +56,8 @@ record:
   #   {end_time}        - 结束时间（HHMMSS 格式）
   #   {end_datetime}    - 结束时间（yyyymmdd_HHMMSS 格式）
   #   {segment_index}   - 分段序号（该流的第N个分段）
-  #   {duration}        - 该段时长（秒）
+  #   {duration}        - 该段时长
+  #   {duration_seconds} - 该段时长（秒）
   filename_template: "{stream_id}_{start_datetime}_seg{segment_index}_{duration}.mp4"
   # 示例输出: camera1_2026-02-03_14-30-00_seg1_600.mp4
 

@@ -1,11 +1,25 @@
 #include "cmdline_parser.h"
 #include <argparse/argparse.hpp>
 #include <iostream>
+#include <filesystem>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
+namespace fs = std::filesystem;
 
 Config parseCommandLine(int argc, char* argv[]) {
     argparse::ArgumentParser program("nvr", "1.0");
 
     // Add all arguments
+    program.add_argument("--work-dir")
+        .help("Working directory (change to this directory before starting)")
+        .default_value(std::string(""))
+        .nargs(1);
+
     program.add_argument("-c", "--config")
         .help("Configuration file path (YAML)")
         .default_value(std::string(""))
@@ -80,6 +94,39 @@ Config parseCommandLine(int argc, char* argv[]) {
 
     try {
         program.parse_args(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        throw;
+    }
+
+    // 处理工作目录切换（必须在加载配置文件之前执行）
+    try {
+        std::string work_dir = program.get<std::string>("--work-dir");
+        if (!work_dir.empty()) {
+            // 验证目录存在
+            if (!fs::exists(work_dir)) {
+                std::cerr << "Error: Working directory does not exist: " << work_dir << std::endl;
+                throw std::runtime_error("Working directory not found: " + work_dir);
+            }
+
+            // 切换工作目录
+            std::error_code ec;
+#ifdef _WIN32
+            if (SetCurrentDirectoryA(work_dir.c_str())) {
+                std::cout << "Changed working directory to: " << work_dir << std::endl;
+            } else {
+                std::cerr << "Error: Failed to change working directory to: " << work_dir << std::endl;
+                throw std::runtime_error("Failed to change working directory");
+            }
+#else
+            if (chdir(work_dir.c_str()) == 0) {
+                std::cout << "Changed working directory to: " << work_dir << std::endl;
+            } else {
+                std::cerr << "Error: Failed to change working directory to: " << work_dir << std::endl;
+                throw std::runtime_error("Failed to change working directory");
+            }
+#endif
+        }
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
         throw;

@@ -3,7 +3,7 @@
   <CPackWiXFragment Id="#PRODUCT">
       <CustomAction Id="InstallService"
                     FileKey="CM_FP_bin.nvr.exe"
-                    ExeCommand='service install -- --config "[INSTALLFOLDER]config.yaml"'
+                    ExeCommand='service install -- --work-dir "[INSTALL_ROOT]" --config "[INSTALL_ROOT]config.yaml"'
                     Execute="deferred"
                     Impersonate="no"
                     Return="check"

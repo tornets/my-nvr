@@ -238,6 +238,11 @@ int runConsoleMode(int argc, char* argv[]) {
             std::cerr << "Usage:" << std::endl;
             std::cerr << "  " << argv[0] << " [options] stream1,url=rtsp://host/path" << std::endl;
             std::cerr << std::endl;
+            std::cerr << "Options:" << std::endl;
+            std::cerr << "  --work-dir DIR          Working directory (change before starting)" << std::endl;
+            std::cerr << "  -c, --config FILE        Configuration file path (YAML)" << std::endl;
+            std::cerr << "  -l, --log-level LEVEL    Log level (trace/debug/info/warn/error/critical)" << std::endl;
+            std::cerr << std::endl;
             std::cerr << "Service Management:" << std::endl;
             std::cerr << "  " << argv[0] << " service install -- --config C:\\nvr\\config.yaml" << std::endl;
             std::cerr << "  " << argv[0] << " service start" << std::endl;

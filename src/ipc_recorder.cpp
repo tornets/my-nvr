@@ -241,6 +241,9 @@ bool IPCRecorder::connectAndRecord() {
         // 更新最后读取时间（用于中断回调）
         m_last_read_time = now.time_since_epoch().count();
 
+        // 清空包数据以确保干净的状态
+        av_packet_unref(packet);
+
         int ret = av_read_frame(m_input_ctx, packet);
         if (ret < 0) {
             consecutive_errors++;
@@ -274,8 +277,22 @@ bool IPCRecorder::connectAndRecord() {
         m_last_packet_time = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
 
-        if (packet->pts < 0 || (m_output_ctx == nullptr && !(packet->flags & AV_PKT_FLAG_KEY)))
+        // 验证时间戳有效性
+        if (packet->pts < 0 || packet->dts < 0) {
+            m_logger->debug("Skipping packet with invalid pts/dts: pts={}, dts={}",
+                           packet->pts, packet->dts);
             continue;
+        }
+
+        // 如果输出文件还未打开，必须等待关键帧
+        // 这确保录制从完整画面开始，避免花屏
+        if (m_output_ctx == nullptr) {
+            if (!(packet->flags & AV_PKT_FLAG_KEY)) {
+                m_logger->debug("Waiting for key frame before starting recording...");
+                continue;
+            }
+            m_logger->info("Key frame received, starting new segment");
+        }
 
         /*
         if (m_output_ctx) {
@@ -334,7 +351,7 @@ bool IPCRecorder::connectAndRecord() {
             int stream_index = packet->stream_index;
 
             if (packet->flags & AV_PKT_FLAG_KEY) {
-                m_logger->debug("this packet contain key frame");
+                m_logger->debug("Key frame received at pts={}", packet->pts);
             }
 
             // 保存最后一个视频包的原始PTS（用于计算实际录制时长）
@@ -342,10 +359,23 @@ bool IPCRecorder::connectAndRecord() {
                 m_last_video_pts = packet->pts;
             }
 
+            // 计算相对时间戳并转换到输出时间基准
+            AVStream* in_stream = m_input_ctx->streams[stream_index];
+            AVStream* out_stream = m_output_ctx->streams[0];  // 视频流在输出的第一个位置
+
+            // 先减去起始PTS
+            int64_t original_pts = packet->pts;
+            int64_t original_dts = packet->dts;
             packet->pts -= m_segment_start_pts;
             packet->dts -= m_segment_start_pts;
-            //av_packet_rescale_ts(packet, m_input_ctx->streams[stream_index]->time_base,
-            //                    m_output_ctx->streams[0]->time_base);
+
+            // 确保时间戳非负
+            if (packet->pts < 0) packet->pts = 0;
+            if (packet->dts < 0) packet->dts = 0;
+
+            // 转换到输出流的时间基准（这很重要！之前被注释掉了）
+            av_packet_rescale_ts(packet, in_stream->time_base, out_stream->time_base);
+            packet->stream_index = 0;  // 设置为输出视频流索引
 
             writePacket(packet);
         } else if (packet->stream_index == m_audio_stream_idx && m_output_ctx) {
@@ -414,16 +444,28 @@ bool IPCRecorder::openInput() {
     m_input_ctx->interrupt_callback.opaque = this;
 
     // 设置超时选项（微秒单位）
-    // 分析超时：5秒
-    m_input_ctx->probesize = 5 * 1024 * 1024;  // 5MB
-    m_input_ctx->max_analyze_duration = 5 * AV_TIME_BASE;
+    // 增加缓冲区以防止帧丢失导致花屏
+    m_input_ctx->probesize = 10 * 1024 * 1024;  // 10MB
+    m_input_ctx->max_analyze_duration = 10 * AV_TIME_BASE;
 
-    // 设置低延迟模式
-    m_input_ctx->flags |= AVFMT_FLAG_NOBUFFER;  // 减少缓冲
+    // 注意：不设置 AVFMT_FLAG_NOBUFFER，保留适当缓冲以避免帧丢失
+    // 之前使用 NOBUFFER 导致 P 帧/B 帧丢失，造成画面花屏
 
-    m_logger->info("Opening stream: {} (timeout: {}s)", m_stream_url, m_timeout_seconds);
+    // 设置 FFmpeg 选项以增强错误恢复
+    AVDictionary* options = nullptr;
+    av_dict_set(&options, "rtsp_transport", "tcp", 0);  // 使用 TCP 传输（更稳定，防止丢包花屏）
+    av_dict_set(&options, "fflags", "+genpts+discardcorrupt", 0);  // 生成 PTS 并丢弃损坏的数据包
+    av_dict_set(&options, "err_detect", "ignore_err", 0);  // 忽略错误继续解码
+    //av_dict_set(&options, "max_delay", "500000", 0);  // 最大延迟 500ms
 
-    int ret = avformat_open_input(&m_input_ctx, m_stream_url.c_str(), nullptr, nullptr);
+    m_logger->info("Opening stream: {} (timeout: {}s, transport: tcp)", m_stream_url, m_timeout_seconds);
+
+    int ret = avformat_open_input(&m_input_ctx, m_stream_url.c_str(), nullptr, &options);
+
+    // 释放选项字典
+    if (options) {
+        av_dict_free(&options);
+    }
     if (ret < 0) {
         if (ret == AVERROR_EXIT) {
             m_logger->error("Cannot open input: timeout after {}s", m_timeout_seconds);
@@ -533,15 +575,18 @@ void IPCRecorder::closeOutput() {
 
         // 移动文件从临时目录到最终目录，并重命名添加完整信息
         if (!m_current_filename.empty()) {
-            // 计算实际录制时长（基于视频PTS，而不是系统时间）
+            // 计算实际录制时长（基于视频PTS）
             int64_t duration_seconds = 0;
 
-            if (m_last_video_pts > 0 && m_video_stream_idx >= 0) {
-                // 使用视频流的 time_base 将 PTS 转换为秒
+            if (m_last_video_pts > 0 && m_segment_start_pts >= 0 && m_video_stream_idx >= 0) {
+                // 计算相对PTS（最后一个视频PTS - 起始PTS）
+                int64_t relative_pts = m_last_video_pts - m_segment_start_pts;
+
+                // 使用视频流的 time_base 将相对 PTS 转换为秒
                 AVRational tb = m_video_time_base;
-                duration_seconds = av_rescale_q(m_last_video_pts, tb, AVRational{1, 1});
-                m_logger->debug("Video duration calculation: last_pts={}, tb={}/{}, duration={}s",
-                               m_last_video_pts, tb.num, tb.den, duration_seconds);
+                duration_seconds = av_rescale_q(relative_pts, tb, AVRational{1, 1});
+                m_logger->debug("Video duration calculation: last_pts={}, start_pts={}, relative_pts={}, tb={}/{}, duration={}s",
+                               m_last_video_pts, m_segment_start_pts, relative_pts, tb.num, tb.den, duration_seconds);
             }
 
             // 如果视频PTS计算失败（或为0），回退到系统时间计算

@@ -81,6 +81,12 @@ private:
     double getVideoFPS();
     std::string generateUUID();
 
+    // 编码器兼容性检查
+    bool isVideoCodecCompatible(AVCodecID codec_id, const std::string& format_name);
+    bool isAudioCodecCompatible(AVCodecID codec_id, const std::string& format_name);
+    AVCodecID getBestAudioCodec(const std::string& format_name);
+    std::string parseOutputFormat();
+
     std::string m_stream_id;
     std::string m_stream_name;       // 流名称（用于文件名）
     std::string m_stream_url;
@@ -88,6 +94,7 @@ private:
     std::string m_temp_dir;          // 临时文件目录
     std::string m_filename_template;
     std::string m_current_filename;  // 当前录制的文件名
+    std::string m_output_format;     // 输出格式（mp4, mkv, avi 等）
     bool m_enable_audio;             // 是否启用音频录制
     int m_shop_id;                   // 店铺 ID
 

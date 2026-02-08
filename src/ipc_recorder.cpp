@@ -92,6 +92,10 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
     , m_current_dts(0)
     , m_pts_offset(0)
 {
+    // 解析输出格式（从文件名模板）
+    m_output_format = parseOutputFormat();
+    m_logger->info("Output format: {}", m_output_format);
+
     // 创建输出目录和临时目录
     fs::create_directories(m_output_dir);
     fs::create_directories(m_temp_dir);
@@ -499,16 +503,53 @@ bool IPCRecorder::openOutput(const std::string& filename) {
     // 使用临时目录存放正在录制的文件
     std::string full_path = (fs::path(m_temp_dir) / filename).string();
 
-    int ret = avformat_alloc_output_context2(&m_output_ctx, nullptr, "mp4", full_path.c_str());
+    // 动态创建输出上下文，使用解析的格式
+    int ret = avformat_alloc_output_context2(&m_output_ctx, nullptr, m_output_format.c_str(), full_path.c_str());
     if (ret < 0) {
-        m_logger->error("Cannot create output context: {}", av_err2str(ret));
+        m_logger->error("Cannot create output context for format {}: {}", m_output_format, av_err2str(ret));
         return false;
     }
+
+    m_logger->info("Creating output file with format: {}", m_output_format);
+
+    // 重置音频编码器（需要重新检查是否需要转码）
+    if (m_audio_encoder_ctx) {
+        avcodec_free_context(&m_audio_encoder_ctx);
+        m_audio_encoder_ctx = nullptr;
+    }
+    if (m_audio_decoder_ctx) {
+        avcodec_free_context(&m_audio_decoder_ctx);
+        m_audio_decoder_ctx = nullptr;
+    }
+    if (m_audio_fifo) {
+        av_audio_fifo_free(m_audio_fifo);
+        m_audio_fifo = nullptr;
+    }
+    if (m_swr_ctx) {
+        swr_free(&m_swr_ctx);
+        m_swr_ctx = nullptr;
+    }
+    m_audio_fifo_initialized = 0;
+
+    bool need_audio_transcode = false;
 
     for (unsigned i = 0; i < m_input_ctx->nb_streams; i++) {
         AVStream* in_stream = m_input_ctx->streams[i];
 
         if (in_stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            // 检查视频编码器是否与输出格式兼容
+            AVCodecID video_codec = in_stream->codecpar->codec_id;
+            if (!isVideoCodecCompatible(video_codec, m_output_format)) {
+                m_logger->error("Video codec {} (ID:{}) is not compatible with output format {}. Stream recording aborted.",
+                               avcodec_get_name(video_codec), static_cast<int>(video_codec), m_output_format);
+                avformat_free_context(m_output_ctx);
+                m_output_ctx = nullptr;
+                return false;
+            }
+
+            m_logger->info("Video codec {} (ID:{}) is compatible with format {}",
+                          avcodec_get_name(video_codec), static_cast<int>(video_codec), m_output_format);
+
             AVStream* out_stream = avformat_new_stream(m_output_ctx, nullptr);
             if (!out_stream) {
                 m_logger->error("Failed to allocate output stream");
@@ -525,6 +566,18 @@ bool IPCRecorder::openOutput(const std::string& filename) {
             out_stream->time_base = in_stream->time_base;
             out_stream->codecpar->codec_tag = 0;
         } else if (in_stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && m_audio_stream_idx != -1) {
+            // 检查音频编码器是否与输出格式兼容
+            AVCodecID audio_codec = in_stream->codecpar->codec_id;
+            if (!isAudioCodecCompatible(audio_codec, m_output_format)) {
+                m_logger->warn("Audio codec {} (ID:{}) is not compatible with output format {}. Will transcode to {}.",
+                              avcodec_get_name(audio_codec), static_cast<int>(audio_codec), m_output_format,
+                              avcodec_get_name(getBestAudioCodec(m_output_format)));
+                need_audio_transcode = true;
+            } else {
+                m_logger->info("Audio codec {} (ID:{}) is compatible with format {}",
+                              avcodec_get_name(audio_codec), static_cast<int>(audio_codec), m_output_format);
+            }
+
             // 添加音频流到输出
             AVStream* out_stream = avformat_new_stream(m_output_ctx, nullptr);
             if (!out_stream) {
@@ -532,14 +585,10 @@ bool IPCRecorder::openOutput(const std::string& filename) {
                 return false;
             }
 
-            // 如果有音频编码器，使用编码器的参数；否则复制输入参数
-            if (m_audio_encoder_ctx) {
-                ret = avcodec_parameters_from_context(out_stream->codecpar, m_audio_encoder_ctx);
-                if (ret < 0) {
-                    m_logger->error("Failed to copy audio encoder parameters");
-                    return false;
-                }
+            if (need_audio_transcode) {
+                // 需要转码，稍后设置编码器
             } else {
+                // 直接复制音频编码器参数
                 ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
                 if (ret < 0) {
                     m_logger->error("Failed to copy audio codec parameters");
@@ -551,6 +600,14 @@ bool IPCRecorder::openOutput(const std::string& filename) {
             out_stream->codecpar->codec_tag = 0;
 
             m_logger->info("Added audio stream to output");
+        }
+    }
+
+    // 如果需要音频转码，设置转码器
+    if (need_audio_transcode) {
+        if (!setupAudioTranscoding()) {
+            m_logger->warn("Failed to setup audio transcoding, will record video only");
+            m_audio_stream_idx = -1;
         }
     }
 
@@ -566,7 +623,7 @@ bool IPCRecorder::openOutput(const std::string& filename) {
         return false;
     }
 
-    m_logger->info("Opened output file: {}, using pts_offset: {}", full_path, m_pts_offset);
+    m_logger->info("Opened output file: {}", full_path);
     return true;
 }
 
@@ -667,26 +724,30 @@ bool IPCRecorder::setupAudioTranscoding() {
                    avcodec_get_name(audio_par->codec_id), audio_par->sample_rate,
                    audio_par->ch_layout.nb_channels);
 
-    // 检查音频编码格式，如果是 AAC 则不需要转码
-    if (audio_par->codec_id == AV_CODEC_ID_AAC) {
-        m_logger->info("Audio codec is AAC, no transcoding needed");
+    // 检查是否需要转码（已在 openOutput 中检查）
+    // 这里直接获取目标编码器并设置转码
+    AVCodecID target_codec_id = getBestAudioCodec(m_output_format);
+
+    // 如果已经是目标编码器，不需要转码
+    if (audio_par->codec_id == target_codec_id) {
+        m_logger->info("Audio codec is already {}, no transcoding needed", avcodec_get_name(target_codec_id));
         m_audio_decoder_ctx = nullptr;
         m_audio_encoder_ctx = nullptr;
         return true;
     }
 
-    // 需要转码为 AAC
-    m_logger->info("Audio transcoding to AAC enabled");
+    m_logger->info("Audio transcoding: {} -> {} (format: {})",
+                   avcodec_get_name(audio_par->codec_id), avcodec_get_name(target_codec_id), m_output_format);
 
-    // 查找 AAC 编码器
-    const AVCodec* aac_codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
-    if (!aac_codec) {
-        m_logger->error("AAC encoder not found");
+    // 查找目标编码器
+    const AVCodec* encoder = avcodec_find_encoder(target_codec_id);
+    if (!encoder) {
+        m_logger->error("Target audio encoder {} not found", avcodec_get_name(target_codec_id));
         return false;
     }
 
     // 创建音频编码器上下文
-    m_audio_encoder_ctx = avcodec_alloc_context3(aac_codec);
+    m_audio_encoder_ctx = avcodec_alloc_context3(encoder);
     if (!m_audio_encoder_ctx) {
         m_logger->error("Failed to allocate audio encoder context");
         return false;
@@ -698,7 +759,7 @@ bool IPCRecorder::setupAudioTranscoding() {
     if (m_audio_encoder_ctx->ch_layout.nb_channels == 0) {
         av_channel_layout_default(&m_audio_encoder_ctx->ch_layout, 2);
     }
-    m_audio_encoder_ctx->sample_fmt = aac_codec->sample_fmts ? aac_codec->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
+    m_audio_encoder_ctx->sample_fmt = encoder->sample_fmts ? encoder->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
 
     // 设置比特率
     m_audio_encoder_ctx->bit_rate = 128000;
@@ -707,9 +768,9 @@ bool IPCRecorder::setupAudioTranscoding() {
     m_audio_encoder_ctx->time_base = AVRational{1, m_audio_encoder_ctx->sample_rate};
 
     // 打开编码器
-    int ret = avcodec_open2(m_audio_encoder_ctx, aac_codec, nullptr);
+    int ret = avcodec_open2(m_audio_encoder_ctx, encoder, nullptr);
     if (ret < 0) {
-        m_logger->error("Failed to open AAC encoder: {}", av_err2str(ret));
+        m_logger->error("Failed to open {} encoder: {}", avcodec_get_name(target_codec_id), av_err2str(ret));
         return false;
     }
 
@@ -1090,4 +1151,69 @@ IPCRecorder::StatusInfo IPCRecorder::getStatus() const {
     info.last_error = m_last_error;
     info.last_packet_time = m_last_packet_time.load();
     return info;
+}
+
+std::string IPCRecorder::parseOutputFormat() {
+    // 从文件名模板中提取扩展名
+    size_t dot_pos = m_filename_template.find_last_of('.');
+    if (dot_pos != std::string::npos && dot_pos < m_filename_template.length() - 1) {
+        std::string ext = m_filename_template.substr(dot_pos + 1);
+
+        // 移除可能的变量占位符
+        size_t brace_pos = ext.find('{');
+        if (brace_pos != std::string::npos) {
+            ext = ext.substr(0, brace_pos);
+        }
+
+        // 转换为小写
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+        // 验证格式是否被 FFmpeg 支持
+        const AVOutputFormat* fmt = av_guess_format(ext.c_str(), nullptr, nullptr);
+        if (fmt) {
+            return fmt->name;
+        }
+    }
+
+    // 默认使用 mp4
+    return "mp4";
+}
+
+bool IPCRecorder::isVideoCodecCompatible(AVCodecID codec_id, const std::string& format_name) {
+    // 使用 FFmpeg API 查询格式是否支持该视频编码
+    const AVOutputFormat* fmt = av_guess_format(format_name.c_str(), nullptr, nullptr);
+    if (!fmt) {
+        m_logger->warn("Unknown output format: {}", format_name);
+        return false;
+    }
+
+    // 使用 avformat_query_codec 检查兼容性
+    int ret = avformat_query_codec(fmt, codec_id, FF_COMPLIANCE_NORMAL);
+    // 返回 1 表示支持，0 表示不支持，负值表示错误
+    return ret == 1;
+}
+
+bool IPCRecorder::isAudioCodecCompatible(AVCodecID codec_id, const std::string& format_name) {
+    // 使用 FFmpeg API 查询格式是否支持该音频编码
+    const AVOutputFormat* fmt = av_guess_format(format_name.c_str(), nullptr, nullptr);
+    if (!fmt) {
+        m_logger->warn("Unknown output format: {}", format_name);
+        return false;
+    }
+
+    // 使用 avformat_query_codec 检查兼容性
+    int ret = avformat_query_codec(fmt, codec_id, FF_COMPLIANCE_NORMAL);
+    return ret == 1;
+}
+
+AVCodecID IPCRecorder::getBestAudioCodec(const std::string& format_name) {
+    // 使用 FFmpeg API 查找格式的最佳音频编码器
+    const AVOutputFormat* fmt = av_guess_format(format_name.c_str(), nullptr, nullptr);
+    if (!fmt || !fmt->audio_codec) {
+        // 默认使用 AAC
+        return AV_CODEC_ID_AAC;
+    }
+
+    // 返回格式推荐的音频编码器
+    return fmt->audio_codec;
 }

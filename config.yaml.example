@@ -65,8 +65,28 @@ record:
   #   {height}          - 视频高度
   #   {fps}             - 帧率
   #   {codec}           - 编解码器名称
+  #
+  # 支持的视频格式（通过文件扩展名指定）：
+  #   .mp4  - MP4 格式，视频支持 H.264/H.265，音频支持 AAC/MP3/Opus
+  #   .mkv  - MKV 格式，几乎支持所有音视频编码
+  #   .avi  - AVI 格式，视频支持 H.264/MPEG4，音频支持 MP3/AC3
+  #   .mov  - MOV 格式，视频支持 H.264/H.265，音频支持 AAC/MP3
+  #   .flv  - FLV 格式，视频支持 H.264/FLV1，音频支持 AAC/MP3
+  #   .webm - WebM 格式，视频支持 VP8/VP9/AV1，音频支持 Opus/Vorbis
+  #   .ts   - MPEG-TS 格式，视频支持 H.264，音频支持 AAC/MP3/AC3
+  #
+  # 编码策略：
+  #   - 视频：优先直接 copy，不转码。如果不兼容则报错并停止该流录制
+  #   - 音频：优先直接 copy，不转码。如果不兼容则自动转码为格式最佳编码
+  #
   filename_template: "{shop_id}_{stream_name}_{start_datetime}_{end_time}.mp4"
   # 示例输出: 1_前门摄像头_20260208_174244_175251.mp4
+  #
+  # 使用 MKV 格式（兼容性最好）：
+  # filename_template: "{shop_id}_{stream_name}_{start_datetime}.mkv"
+  #
+  # 使用 WebM 格式（适合 Web 播放）：
+  # filename_template: "{shop_id}_{stream_name}_{start_datetime}.webm"
 
   # 是否启用音频录制
   enable_audio: true  # true: 启用音频, false: 仅视频

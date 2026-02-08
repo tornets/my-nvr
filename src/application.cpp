@@ -237,7 +237,8 @@ int Application::run(const Config& config, ApplicationState& state) {
                                                   stream.auto_reconnect,
                                                   stream.reconnect_interval_seconds,
                                                   stream.max_reconnect_attempts,
-                                                  stream.timeout_seconds)) {
+                                                  stream.timeout_seconds,
+                                                  stream.name)) {
             spdlog::error("Failed to add stream: {} ({})", stream.id, stream.url);
             return 1;
         }

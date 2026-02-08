@@ -110,12 +110,17 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
                     stream_config.reconnect_interval_seconds = 5;
                     stream_config.max_reconnect_attempts = -1;  // 无限重连
                     stream_config.timeout_seconds = 30;
+                    stream_config.name = "";  // 默认为空
 
                     if (stream["id"]) {
                         stream_config.id = stream["id"].as<std::string>();
                     } else {
                         std::cerr << "Warning: stream missing 'id', using default" << std::endl;
                         stream_config.id = "camera_" + std::to_string(config.streams.size() + 1);
+                    }
+
+                    if (stream["name"]) {
+                        stream_config.name = stream["name"].as<std::string>();
                     }
 
                     if (stream["url"]) {
@@ -241,6 +246,7 @@ std::optional<StreamConfig> Config::parseStreamArgument(const std::string& arg) 
     config.reconnect_interval_seconds = 5;
     config.max_reconnect_attempts = -1;  // 无限重连
     config.timeout_seconds = 30;
+    config.name = "";  // 默认为空
 
     // 检查是否包含 url=（向后兼容纯URL的情况）
     if (arg.find("url=") == std::string::npos) {
@@ -276,6 +282,8 @@ std::optional<StreamConfig> Config::parseStreamArgument(const std::string& arg) 
         if (key == "url") {
             config.url = value;
             has_url = true;
+        } else if (key == "name") {
+            config.name = value;
         } else {
             config.extra_params[key] = value;
         }

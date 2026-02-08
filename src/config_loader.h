@@ -7,6 +7,7 @@
 
 struct StreamConfig {
     std::string id;
+    std::string name;               // 流名称（可选，用于文件名显示）
     std::string url;
     std::map<std::string, std::string> extra_params;  // 额外参数，如 timeout=30
     bool auto_reconnect;           // 是否自动重连

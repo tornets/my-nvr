@@ -13,6 +13,7 @@ shop:
 streams:
   # 摄像头 1
   - id: camera1
+    name: 前门摄像头  # 流名称（可选，用于文件名显示，默认为空则使用 id）
     url: rtsp://admin:password@192.168.1.100:554/stream1
 
     # 自动重连配置
@@ -50,16 +51,22 @@ record:
   # 文件名模板
   # 支持的变量:
   #   {stream_id}       - 流ID（如：camera1）
-  #   {start_date}      - 录制开始日期（如：20260203_143000）
+  #   {stream_name}     - 流名称（如配置中的 name 字段，为空则使用 stream_id）
+  #   {shop_id}         - 店铺ID
+  #   {start_date}      - 录制开始日期（如：2026-02-03）
   #   {start_time}      - 录制开始时间（如：143000）
   #   {start_datetime}  - 录制开始时间（如：20260203_143000）
   #   {end_time}        - 结束时间（HHMMSS 格式）
   #   {end_datetime}    - 结束时间（yyyymmdd_HHMMSS 格式）
   #   {segment_index}   - 分段序号（该流的第N个分段）
-  #   {duration}        - 该段时长
+  #   {duration}        - 该段时长（HHMMSS 格式）
   #   {duration_seconds} - 该段时长（秒）
-  filename_template: "{stream_id}_{start_datetime}_seg{segment_index}_{duration}.mp4"
-  # 示例输出: camera1_2026-02-03_14-30-00_seg1_600.mp4
+  #   {width}           - 视频宽度
+  #   {height}          - 视频高度
+  #   {fps}             - 帧率
+  #   {codec}           - 编解码器名称
+  filename_template: "{shop_id}_{stream_name}_{start_datetime}_{end_time}.mp4"
+  # 示例输出: 1_前门摄像头_20260208_174244_175251.mp4
 
   # 是否启用音频录制
   enable_audio: true  # true: 启用音频, false: 仅视频

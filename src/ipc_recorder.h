@@ -39,7 +39,9 @@ public:
                 bool auto_reconnect = true,
                 int reconnect_interval_seconds = 5,
                 int max_reconnect_attempts = -1,
-                int timeout_seconds = 30);
+                int timeout_seconds = 30,
+                int shop_id = 0,
+                const std::string& stream_name = "");
     ~IPCRecorder();
 
     void start();
@@ -80,12 +82,14 @@ private:
     std::string generateUUID();
 
     std::string m_stream_id;
+    std::string m_stream_name;       // 流名称（用于文件名）
     std::string m_stream_url;
     std::string m_output_dir;
     std::string m_temp_dir;          // 临时文件目录
     std::string m_filename_template;
     std::string m_current_filename;  // 当前录制的文件名
     bool m_enable_audio;             // 是否启用音频录制
+    int m_shop_id;                   // 店铺 ID
 
     // 重连配置
     bool m_auto_reconnect;           // 是否自动重连

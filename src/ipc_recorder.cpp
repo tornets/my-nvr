@@ -53,13 +53,17 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
                          bool auto_reconnect,
                          int reconnect_interval_seconds,
                          int max_reconnect_attempts,
-                         int timeout_seconds)
+                         int timeout_seconds,
+                         int shop_id,
+                         const std::string& stream_name)
     : m_stream_id(stream_id)
+    , m_stream_name(stream_name.empty() ? stream_id : stream_name)
     , m_stream_url(stream_url)
     , m_output_dir(output_dir)
     , m_temp_dir(temp_dir)
     , m_filename_template(filename_template)
     , m_enable_audio(enable_audio)
+    , m_shop_id(shop_id)
     , m_auto_reconnect(auto_reconnect)
     , m_reconnect_interval_seconds(reconnect_interval_seconds)
     , m_max_reconnect_attempts(max_reconnect_attempts)
@@ -1024,6 +1028,8 @@ std::string IPCRecorder::generateFilenameFromTemplate(int64_t start_pts, int64_t
 
     // 流相关
     vars["{stream_id}"] = m_stream_id;
+    vars["{stream_name}"] = m_stream_name;
+    vars["{shop_id}"] = std::to_string(m_shop_id);
 
     // 时间相关
     vars["{start_date}"] = formatDate(m_segment_start_time, "%Y-%m-%d");

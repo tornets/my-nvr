@@ -33,12 +33,13 @@ NVRManager::~NVRManager() {
 }
 
 bool NVRManager::addStream(const std::string& stream_id, const std::string& stream_url) {
-    return addStreamWithConfig(stream_id, stream_url, true, 5, -1, 30);
+    return addStreamWithConfig(stream_id, stream_url, true, 5, -1, 30, "");
 }
 
 bool NVRManager::addStreamWithConfig(const std::string& stream_id, const std::string& stream_url,
                                      bool auto_reconnect, int reconnect_interval_seconds,
-                                     int max_reconnect_attempts, int timeout_seconds) {
+                                     int max_reconnect_attempts, int timeout_seconds,
+                                     const std::string& stream_name) {
     std::lock_guard<std::mutex> lock(m_recorders_mutex);
 
     if (m_recorders.find(stream_id) != m_recorders.end()) {
@@ -55,12 +56,15 @@ bool NVRManager::addStreamWithConfig(const std::string& stream_id, const std::st
                                                       auto_reconnect,
                                                       reconnect_interval_seconds,
                                                       max_reconnect_attempts,
-                                                      timeout_seconds);
+                                                      timeout_seconds,
+                                                      m_config.shop.id,
+                                                      stream_name);
     recorder->start();
 
     m_recorders[stream_id] = std::move(recorder);
-    m_logger->info("Added stream: {} -> {} (auto_reconnect={}, interval={}s, max_attempts={}, timeout={}s)",
-                   stream_id, stream_url, auto_reconnect, reconnect_interval_seconds,
+    m_logger->info("Added stream: {} -> {} (name={}, auto_reconnect={}, interval={}s, max_attempts={}, timeout={}s)",
+                   stream_id, stream_url, stream_name.empty() ? stream_id : stream_name,
+                   auto_reconnect, reconnect_interval_seconds,
                    max_reconnect_attempts == -1 ? -1 : max_reconnect_attempts, timeout_seconds);
 
     if (!m_running) {

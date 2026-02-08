@@ -83,15 +83,22 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
     , m_audio_fifo_initialized(0)
     , m_audio_frame_count(0)
     , m_segment_start_pts(0)
+    , m_segment_start_dts(0)
     , m_audio_start_pts(0)
     , m_segment_duration(segment_duration)
     , m_segment_index(0)
     , m_segment_start_time(0)
     , m_last_video_pts(0)
+    , m_last_video_dts(0)
     , m_video_time_base{1, 90000}
     , m_current_dts(0)
     , m_pts_offset(0)
 {
+    m_logger = spdlog::get("recorder");
+    if (!m_logger) {
+        m_logger = spdlog::default_logger()->clone("recorder");
+    }
+
     // 解析输出格式（从文件名模板）
     m_output_format = parseOutputFormat();
     m_logger->info("Output format: {}", m_output_format);
@@ -99,10 +106,6 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
     // 创建输出目录和临时目录
     fs::create_directories(m_output_dir);
     fs::create_directories(m_temp_dir);
-    m_logger = spdlog::get("recorder");
-    if (!m_logger) {
-        m_logger = spdlog::default_logger()->clone("recorder");
-    }
 }
 
 IPCRecorder::~IPCRecorder() {
@@ -326,7 +329,7 @@ bool IPCRecorder::connectAndRecord() {
                 // 记录开始时间
                 std::time(&m_segment_start_time);
 
-                // 生成临时文件名（使用随机字符串）
+                // 生成临时文件名（使用随机字符串和目标格式扩展名）
                 static const char charset[] = "0123456789abcdefghijklmnopqrstuvwxyz";
                 static std::random_device rd;
                 static std::mt19937 gen(rd());
@@ -337,7 +340,24 @@ bool IPCRecorder::connectAndRecord() {
                 for (int i = 0; i < 16; i++) {
                     random_str += charset[dis(gen)];
                 }
-                std::string filename = "temp_" + random_str + ".mp4";
+
+                // 根据输出格式确定扩展名
+                std::string ext = ".mp4";  // 默认
+                if (m_output_format == "matroska") {
+                    ext = ".mkv";
+                } else if (m_output_format == "avi") {
+                    ext = ".avi";
+                } else if (m_output_format == "mov") {
+                    ext = ".mov";
+                } else if (m_output_format == "flv") {
+                    ext = ".flv";
+                } else if (m_output_format == "webm") {
+                    ext = ".webm";
+                } else if (m_output_format == "mpegts") {
+                    ext = ".ts";
+                }
+
+                std::string filename = "temp_" + random_str + ext;
 
                 m_logger->info("Opening temp file: {}", filename);
                 if (!openOutput(filename)) {
@@ -347,13 +367,18 @@ bool IPCRecorder::connectAndRecord() {
                 }
                 m_logger->info("Temp file opened successfully");
 
-                if (packet->pts > 0)
+                if (packet->pts > 0) {
                     m_segment_start_pts = packet->pts;
+                    // 使用相同帧的 DTS 作为起始 DTS
+                    m_segment_start_dts = packet->dts >= 0 ? packet->dts : packet->pts;
+                    m_logger->debug("Segment start: pts={}, dts={}", m_segment_start_pts, m_segment_start_dts);
+                }
 
                 // 重置音频起始 PTS 和帧计数
                 m_audio_start_pts = 0;
                 m_audio_frame_count = 0;
                 m_last_video_pts = 0;  // 重置最后一个视频PTS
+                m_last_video_dts = 0;   // 重置最后一个视频DTS
             }
 
             int stream_index = packet->stream_index;
@@ -366,22 +391,29 @@ bool IPCRecorder::connectAndRecord() {
             if (packet->pts > 0) {
                 m_last_video_pts = packet->pts;
             }
+            if (packet->dts >= 0) {
+                m_last_video_dts = packet->dts;
+            }
 
             // 计算相对时间戳并转换到输出时间基准
             AVStream* in_stream = m_input_ctx->streams[stream_index];
             AVStream* out_stream = m_output_ctx->streams[0];  // 视频流在输出的第一个位置
 
-            // 先减去起始PTS
-            int64_t original_pts = packet->pts;
-            int64_t original_dts = packet->dts;
+            // 分别减去起始 PTS 和 DTS
             packet->pts -= m_segment_start_pts;
-            packet->dts -= m_segment_start_pts;
+            packet->dts -= m_segment_start_dts;
 
             // 确保时间戳非负
             if (packet->pts < 0) packet->pts = 0;
             if (packet->dts < 0) packet->dts = 0;
 
-            // 转换到输出流的时间基准（这很重要！之前被注释掉了）
+            // 确保 DTS <= PTS（对于某些编码格式）
+            if (packet->dts > packet->pts) {
+                m_logger->debug("DTS > PTS, setting DTS = PTS: pts={}, dts={}", packet->pts, packet->dts);
+                packet->dts = packet->pts;
+            }
+
+            // 转换到输出流的时间基准
             av_packet_rescale_ts(packet, in_stream->time_base, out_stream->time_base);
             packet->stream_index = 0;  // 设置为输出视频流索引
 
@@ -585,21 +617,18 @@ bool IPCRecorder::openOutput(const std::string& filename) {
                 return false;
             }
 
-            if (need_audio_transcode) {
-                // 需要转码，稍后设置编码器
-            } else {
-                // 直接复制音频编码器参数
-                ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
-                if (ret < 0) {
-                    m_logger->error("Failed to copy audio codec parameters");
-                    return false;
-                }
+            // 先复制输入参数作为占位符（无论是否转码）
+            // 这样可以确保 codecpar 有有效的初始值
+            ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
+            if (ret < 0) {
+                m_logger->error("Failed to copy audio codec parameters");
+                return false;
             }
 
             out_stream->time_base = in_stream->time_base;
             out_stream->codecpar->codec_tag = 0;
 
-            m_logger->info("Added audio stream to output");
+            m_logger->info("Added audio stream to output (transcode: {})", need_audio_transcode);
         }
     }
 
@@ -608,6 +637,30 @@ bool IPCRecorder::openOutput(const std::string& filename) {
         if (!setupAudioTranscoding()) {
             m_logger->warn("Failed to setup audio transcoding, will record video only");
             m_audio_stream_idx = -1;
+
+            // 移除音频输出流
+            for (unsigned i = 0; i < m_output_ctx->nb_streams; i++) {
+                if (m_output_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                    // 找到音频流，需要标记为无效
+                    // 由于 FFmpeg 不支持删除流，我们只能保留它但忽略它
+                    m_logger->warn("Audio stream left in output but will not be written");
+                    break;
+                }
+            }
+        } else {
+            // 转码设置成功，将编码器参数复制到输出流
+            for (unsigned i = 0; i < m_output_ctx->nb_streams; i++) {
+                if (m_output_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                    AVStream* out_stream = m_output_ctx->streams[i];
+                    int ret = avcodec_parameters_from_context(out_stream->codecpar, m_audio_encoder_ctx);
+                    if (ret < 0) {
+                        m_logger->error("Failed to copy audio encoder parameters to output stream");
+                        return false;
+                    }
+                    m_logger->info("Audio encoder parameters copied to output stream");
+                    break;
+                }
+            }
         }
     }
 
@@ -739,38 +792,89 @@ bool IPCRecorder::setupAudioTranscoding() {
     m_logger->info("Audio transcoding: {} -> {} (format: {})",
                    avcodec_get_name(audio_par->codec_id), avcodec_get_name(target_codec_id), m_output_format);
 
-    // 查找目标编码器
-    const AVCodec* encoder = avcodec_find_encoder(target_codec_id);
-    if (!encoder) {
-        m_logger->error("Target audio encoder {} not found", avcodec_get_name(target_codec_id));
-        return false;
+    // 尝试使用目标编码器，如果失败则回退到 AAC
+    AVCodecID codecs_to_try[] = {target_codec_id, AV_CODEC_ID_AAC};
+    const char* codec_names[] = {avcodec_get_name(target_codec_id), "AAC"};
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        AVCodecID try_codec = codecs_to_try[attempt];
+
+        // 跳过重复的编码器
+        if (attempt > 0 && try_codec == codecs_to_try[attempt - 1]) {
+            continue;
+        }
+
+        m_logger->info("Attempting to use {} encoder", codec_names[attempt]);
+
+        // 查找编码器
+        const AVCodec* encoder = avcodec_find_encoder(try_codec);
+        if (!encoder) {
+            m_logger->warn("{} encoder not found", codec_names[attempt]);
+            continue;
+        }
+
+        // 创建音频编码器上下文
+        m_audio_encoder_ctx = avcodec_alloc_context3(encoder);
+        if (!m_audio_encoder_ctx) {
+            m_logger->warn("Failed to allocate audio encoder context for {}", codec_names[attempt]);
+            continue;
+        }
+
+        // 设置编码器参数
+        m_audio_encoder_ctx->sample_rate = audio_par->sample_rate > 0 ? audio_par->sample_rate : 44100;
+        m_audio_encoder_ctx->ch_layout = audio_par->ch_layout;
+        if (m_audio_encoder_ctx->ch_layout.nb_channels == 0) {
+            av_channel_layout_default(&m_audio_encoder_ctx->ch_layout, 2);
+        }
+        m_audio_encoder_ctx->sample_fmt = encoder->sample_fmts ? encoder->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
+
+        // 设置比特率（根据采样率和通道数调整）
+        int channels = m_audio_encoder_ctx->ch_layout.nb_channels;
+        if (try_codec == AV_CODEC_ID_AAC) {
+            // AAC: 根据采样率和通道数设置合理的比特率
+            // 8000 Hz: 32-64 kbps per channel
+            // 16000 Hz: 48-96 kbps per channel
+            // 44100/48000 Hz: 128-192 kbps per channel
+            if (m_audio_encoder_ctx->sample_rate <= 8000) {
+                m_audio_encoder_ctx->bit_rate = channels * 32000;
+            } else if (m_audio_encoder_ctx->sample_rate <= 16000) {
+                m_audio_encoder_ctx->bit_rate = channels * 64000;
+            } else {
+                m_audio_encoder_ctx->bit_rate = channels * 128000;
+            }
+        } else {
+            m_audio_encoder_ctx->bit_rate = 128000;
+        }
+
+        // 设置 frame_size（AAC 需要）
+        if (encoder->capabilities & AV_CODEC_CAP_VARIABLE_FRAME_SIZE) {
+            m_audio_encoder_ctx->frame_size = 1;  // 可变帧大小
+        } else if (try_codec == AV_CODEC_ID_AAC) {
+            // AAC 固定帧大小：通常是 1024 个样本
+            m_audio_encoder_ctx->frame_size = 1024;
+        }
+
+        // 设置时间基准
+        m_audio_encoder_ctx->time_base = AVRational{1, m_audio_encoder_ctx->sample_rate};
+
+        // 打开编码器
+        int ret = avcodec_open2(m_audio_encoder_ctx, encoder, nullptr);
+        if (ret < 0) {
+            m_logger->warn("Failed to open {} encoder: {}, trying next codec", codec_names[attempt], av_err2str(ret));
+            avcodec_free_context(&m_audio_encoder_ctx);
+            m_audio_encoder_ctx = nullptr;
+            continue;
+        }
+
+        m_logger->info("Successfully opened {} encoder", codec_names[attempt]);
+
+        // 成功，跳出循环
+        break;
     }
 
-    // 创建音频编码器上下文
-    m_audio_encoder_ctx = avcodec_alloc_context3(encoder);
+    // 如果所有编码器都失败
     if (!m_audio_encoder_ctx) {
-        m_logger->error("Failed to allocate audio encoder context");
-        return false;
-    }
-
-    // 设置编码器参数
-    m_audio_encoder_ctx->sample_rate = audio_par->sample_rate > 0 ? audio_par->sample_rate : 44100;
-    m_audio_encoder_ctx->ch_layout = audio_par->ch_layout;
-    if (m_audio_encoder_ctx->ch_layout.nb_channels == 0) {
-        av_channel_layout_default(&m_audio_encoder_ctx->ch_layout, 2);
-    }
-    m_audio_encoder_ctx->sample_fmt = encoder->sample_fmts ? encoder->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
-
-    // 设置比特率
-    m_audio_encoder_ctx->bit_rate = 128000;
-
-    // 设置时间基准
-    m_audio_encoder_ctx->time_base = AVRational{1, m_audio_encoder_ctx->sample_rate};
-
-    // 打开编码器
-    int ret = avcodec_open2(m_audio_encoder_ctx, encoder, nullptr);
-    if (ret < 0) {
-        m_logger->error("Failed to open {} encoder: {}", avcodec_get_name(target_codec_id), av_err2str(ret));
+        m_logger->error("Failed to open any audio encoder, transcoding aborted");
         return false;
     }
 
@@ -789,7 +893,7 @@ bool IPCRecorder::setupAudioTranscoding() {
     }
 
     // 复制解码器参数
-    ret = avcodec_parameters_to_context(m_audio_decoder_ctx, audio_par);
+    int ret = avcodec_parameters_to_context(m_audio_decoder_ctx, audio_par);
     if (ret < 0) {
         m_logger->error("Failed to copy audio decoder parameters: {}", av_err2str(ret));
         return false;
@@ -802,8 +906,8 @@ bool IPCRecorder::setupAudioTranscoding() {
         return false;
     }
 
-    m_logger->info("Audio transcoding setup completed: {} -> AAC",
-                   avcodec_get_name(audio_par->codec_id));
+    m_logger->info("Audio transcoding setup completed: {} -> {}",
+                   avcodec_get_name(audio_par->codec_id), avcodec_get_name(m_audio_encoder_ctx->codec_id));
 
     return true;
 }
@@ -1154,25 +1258,10 @@ IPCRecorder::StatusInfo IPCRecorder::getStatus() const {
 }
 
 std::string IPCRecorder::parseOutputFormat() {
-    // 从文件名模板中提取扩展名
-    size_t dot_pos = m_filename_template.find_last_of('.');
-    if (dot_pos != std::string::npos && dot_pos < m_filename_template.length() - 1) {
-        std::string ext = m_filename_template.substr(dot_pos + 1);
-
-        // 移除可能的变量占位符
-        size_t brace_pos = ext.find('{');
-        if (brace_pos != std::string::npos) {
-            ext = ext.substr(0, brace_pos);
-        }
-
-        // 转换为小写
-        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-
-        // 验证格式是否被 FFmpeg 支持
-        const AVOutputFormat* fmt = av_guess_format(ext.c_str(), nullptr, nullptr);
-        if (fmt) {
-            return fmt->name;
-        }
+    // 验证格式是否被 FFmpeg 支持
+    const AVOutputFormat* fmt = av_guess_format(nullptr, m_filename_template.c_str(), nullptr);
+    if (fmt) {
+        return fmt->name;
     }
 
     // 默认使用 mp4

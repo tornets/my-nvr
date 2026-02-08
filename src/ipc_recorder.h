@@ -130,11 +130,13 @@ private:
     int64_t m_audio_frame_count;  // 用于计算音频输出 PTS
 
     int64_t m_segment_start_pts;
+    int64_t m_segment_start_dts;    // 视频流起始 DTS
     int64_t m_audio_start_pts;  // 音频流起始 PTS
     int64_t m_segment_duration;
     int m_segment_index;         // 当前分段序号（每个流独立）
     std::time_t m_segment_start_time; // 分段开始时间（系统时间）
     int64_t m_last_video_pts;   // 最后一个视频包的 PTS（用于计算实际时长）
+    int64_t m_last_video_dts;   // 最后一个视频包的 DTS
     AVRational m_video_time_base;
     int64_t m_current_dts;
     int64_t m_pts_offset;

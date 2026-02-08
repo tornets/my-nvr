@@ -3,7 +3,7 @@
 #include "video_uploader.h"
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
-#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/rotating_file_sink.h>
 #include <csignal>
 #include <iostream>
 #include <httplib.h>
@@ -154,7 +154,7 @@ void Application::initializeLogging(const std::string& logLevel) {
     }
     #endif
 
-    auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logPath, true);
+    auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(logPath, 100*1024*1024, 5, true);
 
     // Try to add console sink, but don't fail if it doesn't work (e.g., in service mode)
     std::vector<spdlog::sink_ptr> sinks = {file_sink};

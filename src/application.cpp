@@ -168,8 +168,10 @@ void Application::initializeLogging(const std::string& logLevel) {
     }
     #endif
 
+    auto log_level = parseLogLevel(logLevel);
     auto logger = std::make_shared<spdlog::logger>("main", sinks.begin(), sinks.end());
-    logger->set_level(parseLogLevel(logLevel));
+    logger->set_level(log_level);
+    logger->flush_on(log_level);
     logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%n] [%^%l%$] %v");
     spdlog::set_default_logger(logger);
 

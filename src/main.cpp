@@ -31,7 +31,9 @@ int runConsoleMode(int argc, char* argv[]);
 int main(int argc, char* argv[]) {
     // Check for --version flag
     if (argc > 1 && (std::string(argv[1]) == "--version" || std::string(argv[1]) == "-v")) {
-        std::cout << NVR::getDetailedVersionString() << std::endl;
+        std::cout << "version: " << NVR::getDetailedVersionString() << std::endl;
+        std::cout << "build at: " << NVR::getBuildDateString() << std::endl;
+        std::cout << "build type: " << NVR::getBuildTypeString() << std::endl;
         return 0;
     }
 

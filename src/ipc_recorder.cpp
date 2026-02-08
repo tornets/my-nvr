@@ -11,6 +11,8 @@
 #include <random>
 #include <algorithm>
 #include <map>
+#include <locale>
+#include <codecvt>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -19,6 +21,46 @@
 #endif
 
 namespace fs = std::filesystem;
+
+#ifdef _WIN32
+// Windows UTF-8 路径转换辅助函数
+std::wstring utf8_to_wide(const std::string& utf8) {
+    if (utf8.empty()) return std::wstring();
+    int size = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
+    std::wstring wstr(size - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, &wstr[0], size);
+    return wstr;
+}
+
+// Windows 特定的创建目录
+bool create_directory_utf8(const std::string& path) {
+    std::wstring wpath = utf8_to_wide(path);
+    return CreateDirectoryW(wpath.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+// 递归创建目录
+bool create_directories_recursive(const std::string& path) {
+    if (path.empty()) return false;
+
+    size_t pos = 0;
+    while ((pos = path.find_first_of("\\/", pos + 1)) != std::string::npos) {
+        std::string subdir = path.substr(0, pos);
+        if (!create_directory_utf8(subdir)) {
+            // 检查是否因为已存在而失败
+            DWORD attr = GetFileAttributesW(utf8_to_wide(subdir).c_str());
+            if (attr == INVALID_FILE_ATTRIBUTES && GetLastError() != ERROR_ALREADY_EXISTS) {
+                return false;
+            }
+        }
+    }
+    return create_directory_utf8(path);
+}
+
+// Windows 特定的文件重命名
+bool rename_file_utf8(const std::string& old_path, const std::string& new_path) {
+    return MoveFileExW(utf8_to_wide(old_path).c_str(), utf8_to_wide(new_path).c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+}
+#endif
 
 // 静态成员初始化
 std::atomic<uint64_t> IPCRecorder::m_global_sequence{1};
@@ -103,9 +145,14 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
     m_output_format = parseOutputFormat();
     m_logger->info("Output format: {}", m_output_format);
 
-    // 创建输出目录和临时目录
+    // 创建输出目录和临时目录（使用 UTF-8 兼容函数）
+#ifdef _WIN32
+    create_directories_recursive(m_output_dir);
+    create_directories_recursive(m_temp_dir);
+#else
     fs::create_directories(m_output_dir);
     fs::create_directories(m_temp_dir);
+#endif
 }
 
 IPCRecorder::~IPCRecorder() {
@@ -664,7 +711,32 @@ bool IPCRecorder::openOutput(const std::string& filename) {
         }
     }
 
+    // 打开输出文件（处理 Windows 中文路径问题）
+#ifdef _WIN32
+    // Windows: 临时切换到目标目录，使用相对路径打开文件
+    std::string old_dir;
+    wchar_t old_wdir[MAX_PATH];
+    if (GetCurrentDirectoryW(MAX_PATH, old_wdir)) {
+        // 转换为 UTF-8
+        std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+        old_dir = converter.to_bytes(old_wdir);
+    }
+
+    // 切换到临时目录
+    std::wstring temp_wdir = utf8_to_wide(m_temp_dir);
+    SetCurrentDirectoryW(temp_wdir.c_str());
+
+    // 使用相对路径打开文件
+    ret = avio_open(&m_output_ctx->pb, m_current_filename.c_str(), AVIO_FLAG_WRITE);
+
+    // 恢复原目录
+    if (!old_dir.empty()) {
+        SetCurrentDirectoryW(utf8_to_wide(old_dir).c_str());
+    }
+#else
     ret = avio_open(&m_output_ctx->pb, full_path.c_str(), AVIO_FLAG_WRITE);
+#endif
+
     if (ret < 0) {
         m_logger->error("Cannot open output file: {}", av_err2str(ret));
         return false;
@@ -718,13 +790,25 @@ void IPCRecorder::closeOutput() {
             fs::path new_filepath(new_filename);
             if (new_filepath.has_parent_path()) {
                 fs::path full_final_dir = m_output_dir / new_filepath.parent_path();
+#ifdef _WIN32
+                create_directories_recursive(full_final_dir.string());
+#else
                 fs::create_directories(full_final_dir);
+#endif
             }
 
             fs::path temp_path = fs::path(m_temp_dir) / m_current_filename;
             fs::path final_path = fs::path(m_output_dir) / new_filename;
 
-            // 移动文件
+            // 移动文件（使用 UTF-8 兼容函数）
+#ifdef _WIN32
+            if (rename_file_utf8(temp_path.string(), final_path.string())) {
+                m_logger->info("Moved recording: {} -> {}", m_current_filename, new_filename);
+            } else {
+                m_logger->error("Failed to move recording {} to {}: {}",
+                               m_current_filename, new_filename, GetLastError());
+            }
+#else
             std::error_code ec;
             if (fs::exists(temp_path)) {
                 fs::rename(temp_path, final_path, ec);
@@ -737,6 +821,7 @@ void IPCRecorder::closeOutput() {
             } else {
                 m_logger->warn("Temp file not found: {}", temp_path.string());
             }
+#endif
 
             m_current_filename.clear();
         }

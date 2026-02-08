@@ -81,7 +81,7 @@ static bool uploadConfigInfo(const Config& config) {
     try {
         // 构建 JSON 数据
         nlohmann::json j;
-        j["ship_id"] = config.shop.id;  // 使用 ship_id 字段名
+        j["shop_id"] = config.shop.id;  // 使用 shop_id 字段名
 
         nlohmann::json cameras = nlohmann::json::array();
         for (const auto& stream : config.streams) {

@@ -1092,10 +1092,6 @@ bool IPCRecorder::transcodeAudio(AVPacket* packet) {
         m_audio_fifo_initialized = 1;
     }
 
-    // 保存输入包的 PTS（在时间基准转换前）
-    int64_t input_pts = packet->pts;
-    AVRational input_tb = m_input_ctx->streams[m_audio_stream_idx]->time_base;
-
     // 接收解码后的帧
     AVFrame* frame = av_frame_alloc();
     while (ret >= 0) {
@@ -1111,7 +1107,7 @@ bool IPCRecorder::transcodeAudio(AVPacket* packet) {
 
         // 重采样
         AVFrame* output_frame = av_frame_alloc();
-        output_frame->nb_samples = m_audio_encoder_ctx->frame_size;
+        output_frame->nb_samples = m_audio_encoder_ctx->frame_size;  // 编码器需要的样本数
         output_frame->ch_layout = m_audio_encoder_ctx->ch_layout;
         output_frame->format = m_audio_encoder_ctx->sample_fmt;
         output_frame->sample_rate = m_audio_encoder_ctx->sample_rate;
@@ -1119,9 +1115,26 @@ bool IPCRecorder::transcodeAudio(AVPacket* packet) {
 
         av_frame_get_buffer(output_frame, 0);
 
+        // 先添加到 FIFO 缓冲
+        uint8_t** converted_data = nullptr;
+        int aligned_samples = av_samples_alloc_array_and_samples(&converted_data, nullptr,
+                                                                 m_audio_encoder_ctx->ch_layout.nb_channels,
+                                                                 frame->nb_samples,
+                                                                 m_audio_encoder_ctx->sample_fmt,
+                                                                 0);
+        if (aligned_samples < 0) {
+            m_logger->error("Failed to allocate converted samples");
+            av_frame_free(&frame);
+            av_frame_free(&output_frame);
+            if (converted_data) av_freep(&converted_data[0]);
+            av_freep(&converted_data);
+            return false;
+        }
+
+        // 重采样到临时缓冲
         int out_samples = swr_convert(m_swr_ctx,
-                                     output_frame->data,
-                                     output_frame->nb_samples,
+                                     converted_data,
+                                     frame->nb_samples,
                                      (const uint8_t**)frame->data,
                                      frame->nb_samples);
 
@@ -1129,62 +1142,100 @@ bool IPCRecorder::transcodeAudio(AVPacket* packet) {
             m_logger->error("Error resampling audio");
             av_frame_free(&frame);
             av_frame_free(&output_frame);
+            if (converted_data) av_freep(&converted_data[0]);
+            av_freep(&converted_data);
             return false;
         }
 
-        // 编码
-        ret = avcodec_send_frame(m_audio_encoder_ctx, output_frame);
-        if (ret < 0) {
-            m_logger->error("Error sending frame to audio encoder: {}", av_err2str(ret));
+        // 添加到 FIFO
+        if (av_audio_fifo_realloc(m_audio_fifo, av_audio_fifo_size(m_audio_fifo) + out_samples) < 0) {
+            m_logger->error("Failed to reallocate audio FIFO");
             av_frame_free(&frame);
             av_frame_free(&output_frame);
+            if (converted_data) av_freep(&converted_data[0]);
+            av_freep(&converted_data);
             return false;
         }
 
-        // 获取编码后的包
-        while (ret >= 0) {
-            AVPacket* encoded_packet = av_packet_alloc();
-            ret = avcodec_receive_packet(m_audio_encoder_ctx, encoded_packet);
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                av_packet_free(&encoded_packet);
-                break;
-            }
-            if (ret < 0) {
-                m_logger->error("Error encoding audio frame: {}", av_err2str(ret));
-                av_packet_free(&encoded_packet);
-                break;
+        if (av_audio_fifo_write(m_audio_fifo, (void**)converted_data, out_samples) != out_samples) {
+            m_logger->error("Failed to write to audio FIFO");
+            av_frame_free(&frame);
+            av_frame_free(&output_frame);
+            if (converted_data) av_freep(&converted_data[0]);
+            av_freep(&converted_data);
+            return false;
+        }
+
+        if (converted_data) av_freep(&converted_data[0]);
+        av_freep(&converted_data);
+
+        av_frame_free(&frame);
+        av_frame_free(&output_frame);
+
+        // 从 FIFO 读取足够的样本进行编码
+        while (av_audio_fifo_size(m_audio_fifo) >= m_audio_encoder_ctx->frame_size) {
+            AVFrame* enc_frame = av_frame_alloc();
+            enc_frame->nb_samples = m_audio_encoder_ctx->frame_size;
+            enc_frame->ch_layout = m_audio_encoder_ctx->ch_layout;
+            enc_frame->format = m_audio_encoder_ctx->sample_fmt;
+            enc_frame->sample_rate = m_audio_encoder_ctx->sample_rate;
+            av_frame_get_buffer(enc_frame, 0);
+
+            int read_samples = av_audio_fifo_read(m_audio_fifo, (void**)enc_frame->data, m_audio_encoder_ctx->frame_size);
+            if (read_samples != m_audio_encoder_ctx->frame_size) {
+                m_logger->warn("Incomplete read from audio FIFO: {} != {}", read_samples, m_audio_encoder_ctx->frame_size);
             }
 
-            // 找到输出流中的音频流索引
-            int out_audio_idx = -1;
-            for (unsigned i = 0; i < m_output_ctx->nb_streams; i++) {
-                if (m_output_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-                    out_audio_idx = i;
+            // 设置 PTS（使用累积的帧数）
+            enc_frame->pts = m_audio_frame_count;
+            m_audio_frame_count += m_audio_encoder_ctx->frame_size;
+
+            // 编码
+            ret = avcodec_send_frame(m_audio_encoder_ctx, enc_frame);
+            av_frame_free(&enc_frame);  // 释放帧，编码器已经保留了一份拷贝
+
+            if (ret < 0) {
+                m_logger->error("Error sending frame to audio encoder: {}", av_err2str(ret));
+                return false;
+            }
+
+            // 获取编码后的包
+            while (ret >= 0) {
+                AVPacket* encoded_packet = av_packet_alloc();
+                ret = avcodec_receive_packet(m_audio_encoder_ctx, encoded_packet);
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                    av_packet_free(&encoded_packet);
                     break;
                 }
-            }
+                if (ret < 0) {
+                    m_logger->error("Error encoding audio frame: {}", av_err2str(ret));
+                    av_packet_free(&encoded_packet);
+                    break;
+                }
 
-            if (out_audio_idx >= 0) {
-                encoded_packet->stream_index = out_audio_idx;
+                // 找到输出流中的音频流索引
+                int out_audio_idx = -1;
+                for (unsigned i = 0; i < m_output_ctx->nb_streams; i++) {
+                    if (m_output_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                        out_audio_idx = i;
+                        break;
+                    }
+                }
 
-                // 根据输入帧的 PTS 重新计算输出包的 PTS
-                // 将输入 PTS 转换为输出时间基准，然后减去起始 PTS
-                int64_t pts_rescaled = av_rescale_q(input_pts, input_tb,
-                                                    m_audio_encoder_ctx->time_base);
-                encoded_packet->pts = pts_rescaled - m_audio_start_pts;
-                encoded_packet->dts = encoded_packet->pts;
+                if (out_audio_idx >= 0) {
+                    encoded_packet->stream_index = out_audio_idx;
 
-                // 再转换到输出流的时间基准
+                // 使用编码器返回的 PTS/DTS（已经基于 m_audio_frame_count，是单调递增的）
+                // 只进行时间基准转换
                 av_packet_rescale_ts(encoded_packet,
                                     m_audio_encoder_ctx->time_base,
                                     m_output_ctx->streams[out_audio_idx]->time_base);
                 writePacket(encoded_packet);
             }
 
-            av_packet_free(&encoded_packet);
+                av_packet_free(&encoded_packet);
+            }
         }
-
-        av_frame_free(&output_frame);
     }
 
     av_frame_free(&frame);

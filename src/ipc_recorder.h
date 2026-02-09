@@ -72,6 +72,13 @@ private:
     bool writePacket(AVPacket* packet);
     bool transcodeAudio(AVPacket* packet);
 
+    // 音频转码辅助方法
+    bool initAudioResampleAndFifo();
+    bool decodeAndProcessAudioPackets(AVPacket* packet);
+    bool resampleAndStoreAudioFrame(AVFrame* frame);
+    bool encodeAndFlushAudioFrames();
+    void resetAudioTranscodingState();
+
     // 模板解析辅助方法
     std::string formatDate(std::time_t time, const std::string& format);
     std::string formatDuration(int64_t seconds);

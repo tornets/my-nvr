@@ -137,22 +137,18 @@ void NVRManager::cleanupLoop() {
     m_logger->info("Cleanup loop started");
 
     while (m_running) {
-        std::unique_lock<std::mutex> lock(m_cleanup_mutex);
-        // 等待指定时间或直到收到停止信号
-        if (m_cleanup_cv.wait_for(lock, std::chrono::seconds(m_config.autoclean.check_interval_seconds),
-                                 [this] { return !m_running; })) {
-            break;  // 收到停止信号
-        }
-
-        if (!m_running) {
-            break;
-        }
-
         try {
             cleanOldFiles();
             checkDiskUsage();
         } catch (const std::exception& e) {
             m_logger->error("Cleanup error: {}", e.what());
+        }
+
+        std::unique_lock<std::mutex> lock(m_cleanup_mutex);
+        // 等待指定时间或直到收到停止信号
+        if (m_cleanup_cv.wait_for(lock, std::chrono::seconds(m_config.autoclean.check_interval_seconds),
+                                 [this] { return !m_running; })) {
+            break;  // 收到停止信号
         }
     }
 
@@ -163,21 +159,17 @@ void NVRManager::uploadLoop() {
     m_logger->info("Upload scan loop started");
 
     while (m_running) {
+        try {
+            scanAndUploadNewFiles();
+        } catch (const std::exception& e) {
+            m_logger->error("Upload scan error: {}", e.what());
+        }
+
         std::unique_lock<std::mutex> lock(m_upload_mutex);
         // 每10秒扫描一次新文件
         if (m_upload_cv.wait_for(lock, std::chrono::seconds(10),
                                 [this] { return !m_running; })) {
             break;  // 收到停止信号
-        }
-
-        if (!m_running) {
-            break;
-        }
-
-        try {
-            scanAndUploadNewFiles();
-        } catch (const std::exception& e) {
-            m_logger->error("Upload scan error: {}", e.what());
         }
     }
 
@@ -374,7 +366,8 @@ bool NVRManager::checkDiskUsage() {
         m_logger->warn("Disk usage {:.2f} GB exceeds limit {} GB", total_gb, m_config.autoclean.max_disk_usage_gb);
 
         std::vector<fs::path> files;
-        for (const auto& entry : fs::directory_iterator(m_config.record.output_dir)) {
+        // 递归遍历收集所有 MP4 文件（与计算总大小时保持一致）
+        for (const auto& entry : fs::recursive_directory_iterator(m_config.record.output_dir)) {
             if (entry.is_regular_file() && entry.path().extension() == ".mp4") {
                 // 跳过临时目录中的文件
                 fs::path file_parent = entry.path().parent_path();
@@ -402,8 +395,9 @@ bool NVRManager::checkDiskUsage() {
         int deleted = 0;
         while (total_gb > m_config.autoclean.max_disk_usage_gb * 0.9 && !files.empty()) {
             std::error_code ec;
+            auto file_size = fs::file_size(files.front());
             if (fs::remove(files.front(), ec)) {
-                total_size -= fs::file_size(files.front());
+                total_size -= file_size;
                 total_gb = static_cast<double>(total_size) / (1024.0 * 1024.0 * 1024.0);
                 m_logger->info("Deleted file to free space: {}", files.front().filename().string());
                 deleted++;

@@ -26,6 +26,15 @@ NVRManager::NVRManager(const Config& config)
 
     // 清理可能残留的临时文件（例如程序异常退出后）
     cleanTempFiles();
+
+    // 启动后台服务线程
+    m_running = true;
+
+    // 如果启用了自动清理，启动清理线程
+    if (m_config.autoclean.enabled) {
+        m_cleanup_thread = std::thread(&NVRManager::cleanupLoop, this);
+        m_logger->info("Cleanup thread started");
+    }
 }
 
 NVRManager::~NVRManager() {
@@ -66,20 +75,6 @@ bool NVRManager::addStreamWithConfig(const std::string& stream_id, const std::st
                    stream_id, stream_url, stream_name.empty() ? stream_id : stream_name,
                    auto_reconnect, reconnect_interval_seconds,
                    max_reconnect_attempts == -1 ? -1 : max_reconnect_attempts, timeout_seconds);
-
-    if (!m_running) {
-        m_running = true;
-
-        // 如果启用了自动清理，启动清理线程
-        if (m_config.autoclean.enabled) {
-            m_cleanup_thread = std::thread(&NVRManager::cleanupLoop, this);
-        }
-
-        // 如果配置了上传器且启用了上传，启动上传扫描线程
-        if (m_uploader && m_uploader->isEnabled()) {
-            m_upload_thread = std::thread(&NVRManager::uploadLoop, this);
-        }
-    }
 
     return true;
 }
@@ -129,6 +124,12 @@ void NVRManager::setUploader(std::shared_ptr<VideoUploader> uploader) {
     m_uploader = uploader;
     if (m_uploader && m_uploader->isEnabled()) {
         m_logger->info("Video uploader configured");
+
+        // 启动上传扫描线程（如果还未启动）
+        if (m_running && !m_upload_thread.joinable()) {
+            m_upload_thread = std::thread(&NVRManager::uploadLoop, this);
+            m_logger->info("Upload scan thread started");
+        }
     }
 }
 

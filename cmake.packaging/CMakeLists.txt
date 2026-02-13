@@ -21,7 +21,7 @@ if(WIN32)
   #set(CPACK_INNOSETUP_DEFINE_MyMacro "Hello, World!")
   #set(CPACK_INNOSETUP_EXTRA_SCRIPTS "${CMAKE_CURRENT_SOURCE_DIR}/innosetup/installer.iss")
 
-  set(CPACK_PACKAGE_FILE_NAME "nvr-win64_${CMAKE_PROJECT_VERSION}_${GIT_COMMIT_HASH}")
+  set(CPACK_PACKAGE_FILE_NAME "nvr-win64_${CMAKE_PROJECT_VERSION}")
 
   # WiX configuration
   # Upgrade GUID must never change

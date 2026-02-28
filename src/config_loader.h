@@ -29,6 +29,9 @@ struct UploadConfig {
     int timeout_seconds;          // 上传超时时间
     int max_retries;              // 最大重试次数
     int retry_delay_seconds;      // 重试延迟
+    int threads;                  // 上传线程数（默认 1）
+    bool persist_progress;        // 是否持久化上传进度
+    std::string progress_file;    // 上传进度文件路径
 };
 
 struct ShopConfig {

@@ -40,6 +40,9 @@ Config Config::getDefault() {
     config.upload.timeout_seconds = 300;
     config.upload.max_retries = 3;
     config.upload.retry_delay_seconds = 5;
+    config.upload.threads = 1;                       // 默认单线程（向后兼容）
+    config.upload.persist_progress = true;           // 默认启用进度持久化
+    config.upload.progress_file = "./upload_progress.json";  // 默认进度文件位置
 
     // 店铺默认配置
     config.shop.id = 0;                              // 默认店铺ID为0
@@ -219,6 +222,24 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
             }
             if (upload["retry_delay_seconds"]) {
                 config.upload.retry_delay_seconds = upload["retry_delay_seconds"].as<int>();
+            }
+            // 解析 threads 配置（带验证）
+            if (upload["threads"]) {
+                int threads = upload["threads"].as<int>();
+                if (threads < 1 || threads > 32) {
+                    std::cerr << "Warning: upload.threads must be between 1 and 32, using default (1)" << std::endl;
+                    config.upload.threads = 1;
+                } else {
+                    config.upload.threads = threads;
+                }
+            }
+            // 解析 persist_progress 配置
+            if (upload["persist_progress"]) {
+                config.upload.persist_progress = upload["persist_progress"].as<bool>();
+            }
+            // 解析 progress_file 配置
+            if (upload["progress_file"]) {
+                config.upload.progress_file = upload["progress_file"].as<std::string>();
             }
         }
 

@@ -10,6 +10,7 @@ add_executable(nvr
     nvr_manager.cpp
     config_loader.cpp
     video_uploader.cpp
+    upload_progress.cpp
     application.cpp
     cmdline_parser.cpp
     version.cpp

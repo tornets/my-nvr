@@ -19,6 +19,7 @@
 
 #include "ipc_recorder.h"
 #include "video_uploader.h"
+#include "upload_progress.h"
 #include "config_loader.h"
 
 class NVRManager {
@@ -59,8 +60,7 @@ private:
     std::mutex m_upload_mutex;
 
     std::shared_ptr<VideoUploader> m_uploader;
-    std::set<std::string> m_uploaded_files;  // 已上传的文件
-    std::mutex m_uploaded_files_mutex;
+    std::shared_ptr<UploadProgressManager> m_upload_progress;  // 上传进度管理器
 
     std::shared_ptr<spdlog::logger> m_logger;
 };

@@ -100,11 +100,22 @@ log_level: "info"  # 可选值: trace, debug, info, warn, error, critical
 # 视频上传配置（可选）
 # ============================================
 upload:
-  enabled: false
-  url: "https://your-server.com/api/upload"
-  timeout_seconds: 300
-  max_retries: 3
-  retry_delay_seconds: 5
+  enabled: false                      # 是否启用上传功能
+  url: "https://your-server.com/api/upload"  # 上传服务器 URL
+  timeout_seconds: 300                # 上传超时时间（秒）
+  max_retries: 3                      # 上传失败最大重试次数
+  retry_delay_seconds: 5              # 重试间隔（秒）
+
+  # 多线程上传配置
+  threads: 4                          # 并发上传线程数（1-32，默认: 1）
+                                       # 建议：4-8 个线程适用于大多数场景
+                                       # 网络带宽充足时可以增加到 16-32
+
+  # 上传进度持久化配置
+  persist_progress: true               # 是否保存上传进度到磁盘
+  progress_file: "./upload_progress.json"  # 进度文件路径
+                                       # 进度信息包括：已上传文件、失败文件、重试次数等
+                                       # 重启后会自动恢复，避免重复上传
 
 # ============================================
 # 自动清理配置

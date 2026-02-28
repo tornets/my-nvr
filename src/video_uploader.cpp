@@ -9,7 +9,18 @@
 #include <algorithm>
 
 VideoUploader::VideoUploader(const UploadConfig& config)
-    : config_(config), running_(false), stopped_(false) {
+    : config_(config),
+      thread_count_(config.threads),
+      running_(false),
+      stopped_(false) {
+
+    // 初始化进度管理器
+    if (config.persist_progress) {
+        progress_manager_ = std::make_shared<UploadProgressManager>(
+            config.progress_file
+        );
+        progress_manager_->load();
+    }
 }
 
 VideoUploader::~VideoUploader() {
@@ -28,8 +39,14 @@ void VideoUploader::start() {
     }
 
     running_.store(true);
-    upload_thread_ = std::thread(&VideoUploader::uploadLoop, this);
-    spdlog::info("Video uploader started, target URL: {}", config_.url);
+
+    // 启动多个工作线程
+    for (size_t i = 0; i < thread_count_; ++i) {
+        worker_threads_.emplace_back(&VideoUploader::workerLoop, this, i);
+    }
+
+    spdlog::info("Video uploader started with {} worker thread(s), target URL: {}",
+                 thread_count_, config_.url);
 }
 
 void VideoUploader::stop() {
@@ -40,8 +57,17 @@ void VideoUploader::stop() {
     running_.store(false);
     queue_cv_.notify_all();
 
-    if (upload_thread_.joinable()) {
-        upload_thread_.join();
+    // 等待所有工作线程完成
+    for (auto& thread : worker_threads_) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    worker_threads_.clear();
+
+    // 保存进度
+    if (progress_manager_) {
+        progress_manager_->save();
     }
 
     stopped_.store(true);
@@ -61,7 +87,9 @@ void VideoUploader::enqueue(const UploadTask& task) {
     spdlog::debug("Upload task enqueued: {} (stream: {})", task.file_path, task.stream_id);
 }
 
-void VideoUploader::uploadLoop() {
+void VideoUploader::workerLoop(size_t thread_id) {
+    spdlog::debug("Upload worker thread {} started", thread_id);
+
     while (running_.load()) {
         UploadTask task;
 
@@ -84,21 +112,24 @@ void VideoUploader::uploadLoop() {
             task_queue_.pop();
         }
 
+        // 通知上传开始
+        onUploadStart(task);
+
         // 执行上传
-        uploadFile(task);
+        bool success = uploadFile(task);
+        if (success) {
+            onUploadSuccess(task);
+        } else {
+            onUploadFailure(task, "Max retries exceeded");
+        }
     }
 
-    // 处理剩余任务
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-    while (!task_queue_.empty()) {
-        auto task = task_queue_.front();
-        task_queue_.pop();
-        uploadFile(task);
-    }
+    spdlog::debug("Upload worker thread {} stopped", thread_id);
 }
 
 bool VideoUploader::uploadFile(const UploadTask& task) {
     int retry_count = 0;
+    std::string relative_path = std::filesystem::path(task.file_path).filename().string();
 
     while (retry_count <= config_.max_retries) {
         if (retry_count > 0) {
@@ -114,6 +145,14 @@ bool VideoUploader::uploadFile(const UploadTask& task) {
         }
 
         retry_count++;
+
+        // 更新重试计数到进度管理器
+        if (progress_manager_) {
+            auto record = progress_manager_->getRecord(relative_path);
+            if (record) {
+                record->retry_count = retry_count;
+            }
+        }
     }
 
     spdlog::error("Failed to upload after {} retries: {}",
@@ -194,4 +233,50 @@ bool VideoUploader::uploadToServer(const std::string& file_path,
         spdlog::error("Upload exception: {} - {}", file_path, e.what());
         return false;
     }
+}
+
+void VideoUploader::onUploadStart(const UploadTask& task) {
+    if (!progress_manager_) {
+        return;
+    }
+
+    UploadRecord record;
+    record.file_path = task.file_path;
+    // 生成相对路径（用于去重）
+    record.relative_path = std::filesystem::path(task.file_path).filename().string();
+    record.stream_id = task.stream_id;
+    record.recording_time = task.recording_time;
+    record.status = UploadStatus::Uploading;
+    record.retry_count = 0;
+    record.created_at = std::chrono::system_clock::now();
+    record.updated_at = record.created_at;
+
+    try {
+        record.file_size = std::filesystem::file_size(task.file_path);
+    } catch (...) {
+        record.file_size = 0;
+    }
+
+    progress_manager_->addRecord(record);
+    spdlog::debug("Upload started: {}", record.relative_path);
+}
+
+void VideoUploader::onUploadSuccess(const UploadTask& task) {
+    if (!progress_manager_) {
+        return;
+    }
+
+    std::string relative_path = std::filesystem::path(task.file_path).filename().string();
+    progress_manager_->updateRecord(relative_path, UploadStatus::Success);
+    spdlog::debug("Upload success: {}", relative_path);
+}
+
+void VideoUploader::onUploadFailure(const UploadTask& task, const std::string& error) {
+    if (!progress_manager_) {
+        return;
+    }
+
+    std::string relative_path = std::filesystem::path(task.file_path).filename().string();
+    progress_manager_->updateRecord(relative_path, UploadStatus::Failed, error);
+    spdlog::debug("Upload failed: {} - {}", relative_path, error);
 }

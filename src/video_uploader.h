@@ -7,7 +7,9 @@
 #include <queue>
 #include <atomic>
 #include <memory>
+#include <vector>
 #include "config_loader.h"
+#include "upload_progress.h"
 
 class VideoUploader {
 public:
@@ -27,8 +29,8 @@ public:
     bool isEnabled() const { return !config_.url.empty(); }
 
 private:
-    // 上传线程主函数
-    void uploadLoop();
+    // 工作线程主函数
+    void workerLoop(size_t thread_id);
 
     // 执行单个文件上传
     bool uploadFile(const UploadTask& task);
@@ -38,11 +40,26 @@ private:
                        const std::string& stream_id,
                        const std::string& recording_time);
 
+    // 进度回调
+    void onUploadStart(const UploadTask& task);
+    void onUploadSuccess(const UploadTask& task);
+    void onUploadFailure(const UploadTask& task, const std::string& error);
+
     UploadConfig config_;
-    std::thread upload_thread_;
+
+    // 线程池
+    std::vector<std::thread> worker_threads_;
+    size_t thread_count_;
+
+    // 任务队列
     std::queue<UploadTask> task_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
+
+    // 进度管理
+    std::shared_ptr<UploadProgressManager> progress_manager_;
+
+    // 同步控制
     std::atomic<bool> running_;
     std::atomic<bool> stopped_;
 };

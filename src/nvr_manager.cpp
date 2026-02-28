@@ -7,6 +7,8 @@
 #include <chrono>
 #include <filesystem>
 #include <system_error>
+#include <iomanip>
+#include <sstream>
 
 namespace fs = std::filesystem;
 
@@ -19,6 +21,19 @@ NVRManager::NVRManager(const Config& config)
     m_logger = spdlog::get("manager");
     if (!m_logger) {
         m_logger = spdlog::default_logger()->clone("manager");
+    }
+
+    // 初始化上传进度管理器
+    if (m_config.upload.persist_progress) {
+        m_upload_progress = std::make_shared<UploadProgressManager>(
+            m_config.upload.progress_file
+        );
+        m_upload_progress->load();
+
+        // 恢复之前失败的上传任务（将在 uploader 启动后重新入队）
+        auto pending = m_upload_progress->getPendingRecords();
+        m_logger->info("Loaded {} upload records from progress file",
+                     pending.size());
     }
 
     m_logger->info("NVRManager initialized with output_dir: {}", m_config.record.output_dir);
@@ -118,10 +133,27 @@ void NVRManager::stopAll() {
             m_upload_thread.join();
         }
     }
+
+    // 停止上传器（会自动保存进度）
+    if (m_uploader) {
+        m_uploader->stop();
+    }
+
+    // 额外确保进度已保存
+    if (m_upload_progress) {
+        m_upload_progress->save();
+    }
 }
 
 void NVRManager::setUploader(std::shared_ptr<VideoUploader> uploader) {
     m_uploader = uploader;
+
+    // 共享进度管理器给 uploader
+    if (m_upload_progress && m_uploader) {
+        // VideoUploader 已经在其构造函数中初始化了自己的进度管理器
+        // 这里我们不需要做额外的操作
+    }
+
     if (m_uploader && m_uploader->isEnabled()) {
         m_logger->info("Video uploader configured");
 
@@ -181,8 +213,6 @@ void NVRManager::scanAndUploadNewFiles() {
         return;
     }
 
-    std::lock_guard<std::mutex> lock(m_uploaded_files_mutex);
-
     // 获取临时目录的规范路径，用于比较
     fs::path temp_dir_path;
     try {
@@ -221,13 +251,20 @@ void NVRManager::scanAndUploadNewFiles() {
         fs::path relative_path = fs::relative(entry.path(), m_config.record.output_dir);
         std::string relative_key = relative_path.string();
 
-        std::string file_path_str = entry.path().string();
-        std::string filename = entry.path().filename().string();
-
-        // 检查是否已上传（使用相对路径作为key）
-        if (m_uploaded_files.find(relative_key) != m_uploaded_files.end()) {
+        // 使用进度管理器检查是否已上传
+        if (m_upload_progress && m_upload_progress->isUploaded(relative_key)) {
+            m_logger->debug("Skipping already uploaded file: {}", relative_key);
             continue;
         }
+
+        // 检查是否正在上传或已入队
+        if (m_upload_progress && m_upload_progress->isPendingOrUploading(relative_key)) {
+            m_logger->debug("Skipping file already in upload queue: {}", relative_key);
+            continue;
+        }
+
+        std::string file_path_str = entry.path().string();
+        std::string filename = entry.path().filename().string();
 
         // 获取第一个可用的流ID（所有流录制到同一目录）
         std::string stream_id = "default";
@@ -243,10 +280,12 @@ void NVRManager::scanAndUploadNewFiles() {
         auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
             ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
         std::time_t time = std::chrono::system_clock::to_time_t(sctp);
-        std::string time_str = std::ctime(&time);
-        if (!time_str.empty()) {
-            time_str.pop_back();  // 移除末尾的换行符
-        }
+
+        // 格式化为 YYYY-MM-DD HH:MM:SS 格式（与进度文件格式一致）
+        std::tm tm = *std::localtime(&time);
+        std::stringstream ss;
+        ss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+        std::string time_str = ss.str();
 
         // 创建上传任务
         UploadTask task;
@@ -256,9 +295,6 @@ void NVRManager::scanAndUploadNewFiles() {
 
         m_logger->info("Found new file to upload: {} (stream: {})", relative_key, stream_id);
         m_uploader->enqueue(task);
-
-        // 标记为已加入上传队列（使用相对路径）
-        m_uploaded_files.insert(relative_key);
     }
 }
 

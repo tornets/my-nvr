@@ -64,4 +64,7 @@ private:
     // 同步控制
     std::atomic<bool> running_;
     std::atomic<bool> stopped_;
+
+    thread_local static int lastError_;
+    thread_local static std::string lastErrorString_;
 };

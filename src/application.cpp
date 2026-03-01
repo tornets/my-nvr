@@ -233,6 +233,11 @@ int Application::run(const Config& config, ApplicationState& state) {
     LOG_INFO("  Shop ID: {}", config.shop.id);
     uploadConfigInfo(config);
 
+    // Start uploader
+    if (state.uploader) {
+        state.uploader->start();
+    }
+
     // Add all streams
     for (const auto& stream : config.streams) {
         if (!state.manager->addStreamWithConfig(stream.id, stream.url,
@@ -250,11 +255,6 @@ int Application::run(const Config& config, ApplicationState& state) {
         LOG_INFO("  Max reconnect attempts: {}",
                     stream.max_reconnect_attempts == -1 ? "unlimited" : std::to_string(stream.max_reconnect_attempts));
         LOG_INFO("  Stream timeout: {}s", stream.timeout_seconds);
-    }
-
-    // Start uploader
-    if (state.uploader) {
-        state.uploader->start();
     }
 
     LOG_INFO("NVR is running.");

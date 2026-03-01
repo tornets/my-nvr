@@ -11,6 +11,10 @@
 
 using namespace std::chrono_literals;
 
+
+thread_local int VideoUploader::lastError_ = 0;
+thread_local std::string VideoUploader::lastErrorString_ = "OK";
+
 VideoUploader::VideoUploader(const UploadConfig& config)
     : config_(config),
       thread_count_(config.threads),
@@ -188,7 +192,7 @@ void VideoUploader::workerLoop(size_t thread_id) {
         if (success) {
             onUploadSuccess(task);
         } else {
-            onUploadFailure(task, "http error");
+            onUploadFailure(task, lastErrorString_);
         }
     }
 
@@ -219,8 +223,6 @@ bool VideoUploader::uploadFile(const UploadTask& task) {
         }
     }
 
-    LOG_ERROR("Failed to upload after {} retries: {}",
-                 retry_count, task.file_path);
     return false;
 }
 
@@ -230,6 +232,8 @@ bool VideoUploader::uploadToServer(const std::string& file_path,
     try {
         // 检查文件是否存在
         if (!std::filesystem::exists(file_path)) {
+            lastError_ = -1;
+            lastErrorString_ = "file not found: " + file_path;
             LOG_ERROR("File not found: {}", file_path);
             return false;
         }
@@ -255,6 +259,8 @@ bool VideoUploader::uploadToServer(const std::string& file_path,
         // 二进制读取文件
         std::ifstream ifs(file_path_normalized, std::ios::binary);
         if (!ifs) {
+            lastError_ = -1;
+            lastErrorString_ = "open file failed: " + file_path;
             LOG_ERROR("open file failed: {}",
                           file_path);
             return false;
@@ -280,20 +286,28 @@ bool VideoUploader::uploadToServer(const std::string& file_path,
 
         if (res) {
             if (res->status == 200 || res->status == 201) {
+                lastError_ = res->status;
+                lastErrorString_ = res->body;
                 LOG_DEBUG("Upload successful: {} - Status: {}, Body: {}",
                              file_path, res->status, res->body);
                 return true;
             } else {
+                lastError_ = res->status;
+                lastErrorString_ = res->body;
                 LOG_ERROR("Upload failed: {} - Status: {}, Body: {}",
                              file_path, res->status, res->body);
                 return false;
             }
         } else {
+            lastError_ = static_cast<int>(res.error());
+            lastErrorString_ = httplib::to_string(res.error());
             LOG_ERROR("Upload failed: {} - Error: {}", file_path, httplib::to_string(res.error()));
             return false;
         }
 
     } catch (const std::exception& e) {
+        lastError_ = -1;
+        lastErrorString_ = e.what();
         LOG_ERROR("Upload exception: {} - {}", file_path, e.what());
         return false;
     }

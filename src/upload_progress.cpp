@@ -94,12 +94,16 @@ bool UploadProgressManager::load() {
         json j;
         ifs >> j;
 
-        std::lock_guard<std::mutex> lock(records_mutex_);
+        std::lock_guard<std::recursive_mutex> lock(records_mutex_);
 
+        records_.clear();
         if (j.contains("records")) {
-            records_ = j["records"].get<std::vector<UploadRecord>>();
-        } else {
-            records_.clear();
+            for (auto& item : j["records"].get<std::vector<UploadRecord>>()) {
+                // 过滤不存在/已删除的文件
+                if (std::filesystem::exists(item.file_path)) {
+                    records_.push_back(item);
+                }
+            }
         }
 
         // 重建索引
@@ -154,7 +158,7 @@ bool UploadProgressManager::save() {
         j["pending_cnt"] = pending_cnt;
 
         {
-            std::lock_guard<std::mutex> lock(records_mutex_);
+            std::lock_guard<std::recursive_mutex> lock(records_mutex_);
             j["records"] = records_;
         }
 
@@ -201,7 +205,7 @@ bool UploadProgressManager::shouldSave() const {
 }
 
 bool UploadProgressManager::addRecord(const UploadRecord& record) {
-    std::lock_guard<std::mutex> lock(records_mutex_);
+    std::lock_guard<std::recursive_mutex> lock(records_mutex_);
 
     // 检查是否已存在
     auto it = path_to_index_.find(record.relative_path);
@@ -222,7 +226,7 @@ bool UploadProgressManager::addRecord(const UploadRecord& record) {
 bool UploadProgressManager::updateRecord(const std::string& relative_path,
                                          UploadStatus status,
                                          const std::string& error) {
-    std::lock_guard<std::mutex> lock(records_mutex_);
+    std::lock_guard<std::recursive_mutex> lock(records_mutex_);
 
     auto it = path_to_index_.find(relative_path);
     if (it == path_to_index_.end()) {
@@ -241,10 +245,8 @@ bool UploadProgressManager::updateRecord(const std::string& relative_path,
 
     // 智能保存：仅在超过保存间隔时保存
     if (shouldSave()) {
-        // 释放锁后保存（避免死锁）
-        records_mutex_.unlock();
+        cleanRecords();
         bool saved = save();
-        records_mutex_.lock();
         return saved;
     }
 
@@ -252,7 +254,7 @@ bool UploadProgressManager::updateRecord(const std::string& relative_path,
 }
 
 UploadRecord* UploadProgressManager::getRecord(const std::string& relative_path) {
-    std::lock_guard<std::mutex> lock(records_mutex_);
+    std::lock_guard<std::recursive_mutex> lock(records_mutex_);
 
     auto it = path_to_index_.find(relative_path);
     if (it == path_to_index_.end()) {
@@ -263,7 +265,7 @@ UploadRecord* UploadProgressManager::getRecord(const std::string& relative_path)
 }
 
 bool UploadProgressManager::isUploaded(const std::string& relative_path) const {
-    std::lock_guard<std::mutex> lock(records_mutex_);
+    std::lock_guard<std::recursive_mutex> lock(records_mutex_);
 
     auto it = path_to_index_.find(relative_path);
     if (it == path_to_index_.end()) {
@@ -274,7 +276,7 @@ bool UploadProgressManager::isUploaded(const std::string& relative_path) const {
 }
 
 bool UploadProgressManager::isPendingOrUploading(const std::string& relative_path) const {
-    std::lock_guard<std::mutex> lock(records_mutex_);
+    std::lock_guard<std::recursive_mutex> lock(records_mutex_);
 
     auto it = path_to_index_.find(relative_path);
     if (it == path_to_index_.end()) {
@@ -287,7 +289,7 @@ bool UploadProgressManager::isPendingOrUploading(const std::string& relative_pat
 }
 
 std::vector<UploadRecord> UploadProgressManager::getPendingRecords() const {
-    std::lock_guard<std::mutex> lock(records_mutex_);
+    std::lock_guard<std::recursive_mutex> lock(records_mutex_);
 
     std::vector<UploadRecord> pending;
     for (const auto& record : records_) {
@@ -300,11 +302,8 @@ std::vector<UploadRecord> UploadProgressManager::getPendingRecords() const {
     return pending;
 }
 
-void UploadProgressManager::clearSuccessfulRecords(int older_than_hours) {
-    std::lock_guard<std::mutex> lock(records_mutex_);
-
-    auto cutoff = std::chrono::system_clock::now() -
-                  std::chrono::hours(older_than_hours);
+void UploadProgressManager::cleanRecords(int older_than_hours) {
+    std::lock_guard<std::recursive_mutex> lock(records_mutex_);
 
     size_t removed = 0;
     std::vector<UploadRecord> filtered;
@@ -313,11 +312,7 @@ void UploadProgressManager::clearSuccessfulRecords(int older_than_hours) {
     for (size_t i = 0; i < records_.size(); ++i) {
         const auto& record = records_[i];
 
-        // 保留条件：
-        // 1. 状态不是 Success
-        // 2. 或者是 Success 但未超过 cutoff 时间
-        if (record.status != UploadStatus::Success ||
-            record.updated_at > cutoff) {
+        if (std::filesystem::exists(record.file_path)) {
             new_index[record.relative_path] = filtered.size();
             filtered.push_back(record);
         } else {
@@ -328,8 +323,6 @@ void UploadProgressManager::clearSuccessfulRecords(int older_than_hours) {
     records_ = std::move(filtered);
     path_to_index_ = std::move(new_index);
 
-    LOG_INFO("Cleared {} successful upload records (older than {} hours)",
-                 removed, older_than_hours);
-
-    save();
+    LOG_INFO("Cleared {} upload records",
+                 removed);
 }

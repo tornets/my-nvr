@@ -58,10 +58,10 @@ public:
     std::vector<UploadRecord> getPendingRecords() const;
 
     // 清理旧记录
-    void clearSuccessfulRecords(int older_than_hours = 24);
+    void cleanRecords(int older_than_hours = 24);
 
     // 线程安全
-    mutable std::mutex records_mutex_;
+    mutable std::recursive_mutex records_mutex_;
 
 private:
     std::string progress_file_;

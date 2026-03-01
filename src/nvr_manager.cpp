@@ -223,23 +223,14 @@ void NVRManager::scanAndUploadNewFiles() {
         }
 
         // 使用相对路径作为唯一标识（支持多级目录）
-        fs::path relative_path = fs::relative(entry.path(), m_config.record.output_dir);
-        std::string relative_key = relative_path.string();
-
-        // 使用进度管理器检查是否已上传
-        if (m_upload_progress && m_upload_progress->isUploaded(relative_key)) {
-            LOG_TRACE("Skipping already uploaded file: {}", relative_key);
-            continue;
-        }
-
-        // 检查是否正在上传或已入队
-        if (m_upload_progress && m_upload_progress->isPendingOrUploading(relative_key)) {
-            LOG_TRACE("Skipping file already in upload queue: {}", relative_key);
-            continue;
-        }
-
         std::string file_path_str = entry.path().string();
         std::string filename = entry.path().filename().string();
+
+        // 使用进度管理器检查是否已上传
+        if (m_upload_progress && m_upload_progress->getRecord(filename)) {
+            //LOG_DEBUG("Skipping already scheduled file: {}", relative_key);
+            continue;
+        }
 
         // 获取第一个可用的流ID（所有流录制到同一目录）
         std::string stream_id = "default";

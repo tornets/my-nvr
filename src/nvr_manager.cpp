@@ -304,6 +304,16 @@ bool NVRManager::cleanOldFiles() {
                 LOG_INFO("Deleted old file: {} (age: {}h)", entry.path().string(),
                               age / 3600.0);
                 deleted_count++;
+
+                // 清除空目录
+                auto parent_dir = entry.path().parent_path();
+                while (parent_dir != m_config.record.output_dir && fs::is_empty(parent_dir)) {
+                    if(!fs::remove(parent_dir)) {
+                        LOG_ERROR("Failed to delete empty directory {}: {}", parent_dir.string(), ec.message());
+                        break;
+                    }
+                    parent_dir = parent_dir.parent_path();
+                }
             } else {
                 LOG_ERROR("Failed to delete {}: {}", entry.path().string(), ec.message());
             }

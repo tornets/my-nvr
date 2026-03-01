@@ -17,7 +17,7 @@ extern "C" {
 #include "video_uploader.h"
 #include "cmdline_parser.h"
 #include "version.h"
-#include <spdlog/spdlog.h>
+#include "log.h"
 
 // Forward declarations
 int handleServiceInstall(const std::vector<std::string>& args);
@@ -182,42 +182,42 @@ int runServiceMode(int argc, char* argv[]) {
     Application::initializeLogging("debug");
 
     try {
-        spdlog::info("{}", NVR::getDetailedVersionString());
-        spdlog::info("Service mode starting with {} arguments", svcArgv.size());
+        LOG_INFO("{}", NVR::getDetailedVersionString());
+        LOG_INFO("Service mode starting with {} arguments", svcArgv.size());
         for (size_t i = 0; i < svcArgv.size(); i++) {
-            spdlog::info("  Arg[{}]: {}", i, svcArgv[i]);
+            LOG_INFO("  Arg[{}]: {}", i, svcArgv[i]);
         }
 
         Config config = parseCommandLine(static_cast<int>(svcArgv.size()), svcArgv.data());
 
         if (config.streams.empty()) {
-            spdlog::error("No streams configured for service");
+            LOG_ERROR("No streams configured for service");
             std::cerr << "Error: No streams configured for service." << std::endl;
             return 1;
         }
 
-        spdlog::info("Config loaded successfully, {} stream(s) configured", config.streams.size());
+        LOG_INFO("Config loaded successfully, {} stream(s) configured", config.streams.size());
 
         Win32Service service("NVRService", "NVR Video Recorder Service");
         ApplicationState state;
 
         service.setServiceStopCallback([&state]() {
-            spdlog::info("Service stop callback triggered");
+            LOG_INFO("Service stop callback triggered");
             state.shutdown();
         });
 
-        spdlog::info("Starting service dispatcher...");
+        LOG_INFO("Starting service dispatcher...");
         service.runAsService([&]() {
-            spdlog::info("Service main function started");
+            LOG_INFO("Service main function started");
             Application::setupSignalHandlers(state);
             Application::run(config, state);
-            spdlog::info("Service main function completed");
+            LOG_INFO("Service main function completed");
         });
 
-        spdlog::info("Service mode completed successfully");
+        LOG_INFO("Service mode completed successfully");
         return 0;
     } catch (const std::exception& e) {
-        spdlog::critical("Error in service mode: {}", e.what());
+        LOG_CRITICAL("Error in service mode: {}", e.what());
         std::cerr << "Error in service mode: " << e.what() << std::endl;
         return 1;
     }
@@ -253,14 +253,14 @@ int runConsoleMode(int argc, char* argv[]) {
 
         Application::initializeLogging(config.log_level);
 
-        spdlog::info("Version: {}", NVR::getDetailedVersionString());
-        spdlog::info("Built: {}", NVR::getBuildDateString());
-        spdlog::info("Build type: {}", NVR::getBuildTypeString());
+        LOG_INFO("Version: {}", NVR::getDetailedVersionString());
+        LOG_INFO("Built: {}", NVR::getBuildDateString());
+        LOG_INFO("Build type: {}", NVR::getBuildTypeString());
 
         ApplicationState state;
         Application::setupSignalHandlers(state);
 
-        spdlog::info("NVR is running in console mode. Press Ctrl+C to stop.");
+        LOG_INFO("NVR is running in console mode. Press Ctrl+C to stop.");
 
         return Application::run(config, state);
 

@@ -1,6 +1,6 @@
+#include "log.h"
 #include "upload_progress.h"
 #include <nlohmann/json.hpp>
-#include <spdlog/spdlog.h>
 #include <fstream>
 #include <filesystem>
 #include <iomanip>
@@ -17,8 +17,6 @@ NLOHMANN_JSON_SERIALIZE_ENUM(UploadStatus, {
     {UploadStatus::Failed, "failed"}
 })
 
-namespace {
-
 // 时间点转字符串
 std::string time_to_string(const std::chrono::system_clock::time_point& tp) {
     time_t t = std::chrono::system_clock::to_time_t(tp);
@@ -34,8 +32,6 @@ std::chrono::system_clock::time_point string_to_time(const std::string& s) {
     ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
     return std::chrono::system_clock::from_time_t(std::mktime(&tm));
 }
-
-} // anonymous namespace
 
 // UploadRecord JSON 序列化
 void to_json(json& j, const UploadRecord& record) {
@@ -91,7 +87,7 @@ bool UploadProgressManager::load() {
     try {
         std::ifstream ifs(progress_file_);
         if (!ifs.is_open()) {
-            spdlog::info("No existing progress file found, starting fresh");
+            LOG_INFO("No existing progress file found, starting fresh");
             return true;  // 文件不存在是正常情况
         }
 
@@ -110,18 +106,23 @@ bool UploadProgressManager::load() {
         path_to_index_.clear();
         for (size_t i = 0; i < records_.size(); ++i) {
             path_to_index_[records_[i].relative_path] = i;
+
+            // reset status
+            if (records_[i].status == UploadStatus::Uploading) {
+                records_[i].status = UploadStatus::Pending;
+            }
         }
 
-        spdlog::info("Loaded {} upload records from {}", records_.size(), progress_file_);
+        LOG_INFO("Loaded {} upload records from {}", records_.size(), progress_file_);
         return true;
     } catch (const std::exception& e) {
-        spdlog::error("Failed to load progress file: {}", e.what());
+        LOG_ERROR("Failed to load progress file: {}", e.what());
 
         // 尝试备份损坏的文件
         try {
             std::string backup_path = progress_file_ + ".corrupted";
             std::filesystem::rename(progress_file_, backup_path);
-            spdlog::info("Corrupted progress file backed up to {}", backup_path);
+            LOG_INFO("Corrupted progress file backed up to {}", backup_path);
         } catch (...) {
             // 备份失败，忽略
         }
@@ -136,6 +137,22 @@ bool UploadProgressManager::save() {
         j["version"] = 1;
         j["last_updated"] = time_to_string(std::chrono::system_clock::now());
 
+        int running_cnt = 0, failed_cnt = 0, pending_cnt = 0;
+        for (const auto& record : records_) {
+            if (record.status == UploadStatus::Pending) {
+                pending_cnt++;
+            } else if (record.status == UploadStatus::Failed) {
+                failed_cnt++;
+            } else if (record.status == UploadStatus::Uploading) {
+                running_cnt++;
+            }
+        }
+
+        j["total_cnt"] = records_.size();
+        j["failed_cnt"] = failed_cnt;
+        j["running_cnt"] = running_cnt;
+        j["pending_cnt"] = pending_cnt;
+
         {
             std::lock_guard<std::mutex> lock(records_mutex_);
             j["records"] = records_;
@@ -145,7 +162,7 @@ bool UploadProgressManager::save() {
         std::string temp_file = progress_file_ + ".tmp";
         std::ofstream ofs(temp_file, std::ios::binary);
         if (!ofs.is_open()) {
-            spdlog::error("Failed to open temp file for writing: {}", temp_file);
+            LOG_ERROR("Failed to open temp file for writing: {}", temp_file);
             return false;
         }
 
@@ -154,7 +171,7 @@ bool UploadProgressManager::save() {
         try {
             ofs << j.dump(2, ' ', false, json::error_handler_t::ignore);
         } catch (const std::exception& e) {
-            spdlog::error("Failed to serialize JSON: {}", e.what());
+            LOG_ERROR("Failed to serialize JSON: {}", e.what());
             return false;
         }
         ofs.close();
@@ -163,15 +180,15 @@ bool UploadProgressManager::save() {
         std::error_code ec;
         std::filesystem::rename(temp_file, progress_file_, ec);
         if (ec) {
-            spdlog::error("Failed to rename progress file: {}", ec.message());
+            LOG_ERROR("Failed to rename progress file: {}", ec.message());
             return false;
         }
 
         last_save_ = std::chrono::system_clock::now();
-        spdlog::debug("Saved {} upload records to {}", records_.size(), progress_file_);
+        LOG_DEBUG("Saved {} upload records to {}", records_.size(), progress_file_);
         return true;
     } catch (const std::exception& e) {
-        spdlog::error("Failed to save progress file: {}", e.what());
+        LOG_ERROR("Failed to save progress file: {}", e.what());
         return false;
     }
 }
@@ -191,12 +208,12 @@ bool UploadProgressManager::addRecord(const UploadRecord& record) {
     if (it != path_to_index_.end()) {
         // 已存在，更新
         records_[it->second] = record;
-        spdlog::debug("Updated existing record for: {}", record.relative_path);
+        LOG_DEBUG("Updated existing record for: {}", record.relative_path);
     } else {
         // 新记录，添加
         path_to_index_[record.relative_path] = records_.size();
         records_.push_back(record);
-        spdlog::debug("Added new record for: {}", record.relative_path);
+        LOG_DEBUG("Added new record for: {}", record.relative_path);
     }
 
     return true;
@@ -209,7 +226,7 @@ bool UploadProgressManager::updateRecord(const std::string& relative_path,
 
     auto it = path_to_index_.find(relative_path);
     if (it == path_to_index_.end()) {
-        spdlog::warn("Record not found for update: {}", relative_path);
+        LOG_WARN("Record not found for update: {}", relative_path);
         return false;
     }
 
@@ -220,7 +237,7 @@ bool UploadProgressManager::updateRecord(const std::string& relative_path,
         record.last_error = error;
     }
 
-    spdlog::debug("Updated record status: {} -> {}", relative_path, static_cast<int>(status));
+    LOG_DEBUG("Updated record status: {} -> {}", relative_path, static_cast<int>(status));
 
     // 智能保存：仅在超过保存间隔时保存
     if (shouldSave()) {
@@ -275,8 +292,7 @@ std::vector<UploadRecord> UploadProgressManager::getPendingRecords() const {
     std::vector<UploadRecord> pending;
     for (const auto& record : records_) {
         if (record.status == UploadStatus::Pending ||
-            record.status == UploadStatus::Failed ||
-            record.status == UploadStatus::Uploading) {
+            record.status == UploadStatus::Failed) {
             pending.push_back(record);
         }
     }
@@ -312,7 +328,7 @@ void UploadProgressManager::clearSuccessfulRecords(int older_than_hours) {
     records_ = std::move(filtered);
     path_to_index_ = std::move(new_index);
 
-    spdlog::info("Cleared {} successful upload records (older than {} hours)",
+    LOG_INFO("Cleared {} successful upload records (older than {} hours)",
                  removed, older_than_hours);
 
     save();

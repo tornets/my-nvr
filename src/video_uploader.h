@@ -23,10 +23,12 @@ public:
     void stop();
 
     // 添加上传任务
-    void enqueue(const UploadTask& task);
+    void upload(const UploadTask& task);
 
     // 检查是否启用
     bool isEnabled() const { return !config_.url.empty(); }
+
+    std::shared_ptr<UploadProgressManager> progress() const { return progress_manager_; }
 
 private:
     // 工作线程主函数

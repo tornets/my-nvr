@@ -1,7 +1,7 @@
+#include "log.h"
 #include "application.h"
 #include "nvr_manager.h"
 #include "video_uploader.h"
-#include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <csignal>
@@ -30,7 +30,7 @@ void ApplicationState::shutdown() {
 
 void signalHandler(int signal) {
     if (signal == SIGINT || signal == SIGTERM) {
-        spdlog::info("Received signal, shutting down...");
+        LOG_INFO("Received signal, shutting down...");
         if (g_running_ptr) {
             *g_running_ptr = false;
         }
@@ -74,7 +74,7 @@ static std::string extractIpFromUrl(const std::string& url) {
 static bool uploadConfigInfo(const Config& config) {
     // 如果没有配置上传 URL，则跳过
     if (config.upload.url.empty() || config.shop.id == 0) {
-        spdlog::info("Skipping config upload (upload.url or shop.id not configured)");
+        LOG_INFO("Skipping config upload (upload.url or shop.id not configured)");
         return true;
     }
 
@@ -93,7 +93,7 @@ static bool uploadConfigInfo(const Config& config) {
         j["cameras"] = cameras;
 
         std::string json_body = j.dump();
-        spdlog::info("Uploading config info: {}", json_body);
+        LOG_INFO("Uploading config info: {}", json_body);
 
         // 解析 URL
         std::string scheme_host_port = config.upload.url;
@@ -105,24 +105,24 @@ static bool uploadConfigInfo(const Config& config) {
         cli.set_read_timeout(config.upload.timeout_seconds);
         cli.set_write_timeout(config.upload.timeout_seconds);
 
-        spdlog::debug("Connecting to: {}, path: {}", scheme_host_port, path);
+        LOG_DEBUG("Connecting to: {}, path: {}", scheme_host_port, path);
         httplib::Result res = cli.Post(path, json_body, "application/json");
 
         if (res) {
             if (res->status == 200 || res->status == 201) {
-                spdlog::info("Config info uploaded successfully - Status: {}, Body: {}", res->status, res->body);
+                LOG_INFO("Config info uploaded successfully - Status: {}, Body: {}", res->status, spdlog::string_view_t(res->body));
                 return true;
             } else {
-                spdlog::warn("Config info upload returned status: {}, Body: {}", res->status, res->body);
+                LOG_WARN("Config info upload returned status: {}, Body: {}", res->status, res->body);
                 return false;
             }
         } else {
-            spdlog::error("Config info upload failed - Error: {}", httplib::to_string(res.error()));
+            LOG_ERROR("Config info upload failed - Error: {}", httplib::to_string(res.error()));
             return false;
         }
 
     } catch (const std::exception& e) {
-        spdlog::error("Config info upload exception: {}", e.what());
+        LOG_ERROR("Config info upload exception: {}", e.what());
         return false;
     }
 }
@@ -164,6 +164,8 @@ void Application::initializeLogging(const std::string& logLevel) {
     #else
     // On Windows, check if we have a console
     if (GetConsoleWindow() != NULL) {
+        // 设置控制台输出编码为 utf8
+        SetConsoleOutputCP(65001);
         sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
     }
     #endif
@@ -172,63 +174,63 @@ void Application::initializeLogging(const std::string& logLevel) {
     auto logger = std::make_shared<spdlog::logger>("main", sinks.begin(), sinks.end());
     logger->set_level(log_level);
     logger->flush_on(log_level);
-    logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%n] [%^%l%$] %v");
+    logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [threadId:%t] [%s:%#] [%^%l%$] %v");
     spdlog::set_default_logger(logger);
 
-    spdlog::info("Logging to file: {}", logPath);
+    LOG_INFO("Logging to file: {}", logPath);
 }
 
 int Application::run(const Config& config, ApplicationState& state) {
-    spdlog::info("=== NVR starting ===");
-    spdlog::info("Output directory: {}", config.record.output_dir);
-    spdlog::info("Temporary directory: {}", config.record.temp_dir);
-    spdlog::info("Recording configuration:");
-    spdlog::info("  Segment duration: {} seconds", config.record.segment_duration_seconds);
-    spdlog::info("  Filename template: {}", config.record.filename_template);
-    spdlog::info("  Audio recording: {}", config.record.enable_audio ? "enabled" : "disabled");
-    spdlog::info("Configured {} stream(s)", config.streams.size());
+    LOG_INFO("=== NVR starting ===");
+    LOG_INFO("Output directory: {}", config.record.output_dir);
+    LOG_INFO("Temporary directory: {}", config.record.temp_dir);
+    LOG_INFO("Recording configuration:");
+    LOG_INFO("  Segment duration: {} seconds", config.record.segment_duration_seconds);
+    LOG_INFO("  Filename template: {}", config.record.filename_template);
+    LOG_INFO("  Audio recording: {}", config.record.enable_audio ? "enabled" : "disabled");
+    LOG_INFO("Configured {} stream(s)", config.streams.size());
 
     for (size_t i = 0; i < config.streams.size(); i++) {
-        spdlog::info("  Stream [{}]: ID={}, URL={}", i, config.streams[i].id, config.streams[i].url);
+        LOG_INFO("  Stream [{}]: ID={}, URL={}", i, config.streams[i].id, config.streams[i].url);
         if (!config.streams[i].extra_params.empty()) {
             for (const auto& [key, value] : config.streams[i].extra_params) {
-                spdlog::info("    {}={}", key, value);
+                LOG_INFO("    {}={}", key, value);
             }
         }
     }
 
-    spdlog::info("Auto clean configuration:");
-    spdlog::info("  Enabled: {}", config.autoclean.enabled ? "yes" : "no");
+    LOG_INFO("Auto clean configuration:");
+    LOG_INFO("  Enabled: {}", config.autoclean.enabled ? "yes" : "no");
     if (config.autoclean.enabled) {
-        spdlog::info("  Max file age: {} hours", config.autoclean.max_age_hours);
-        spdlog::info("  Max disk usage: {} GB", config.autoclean.max_disk_usage_gb);
-        spdlog::info("  Check interval: {} seconds", config.autoclean.check_interval_seconds);
+        LOG_INFO("  Max file age: {} hours", config.autoclean.max_age_hours);
+        LOG_INFO("  Max disk usage: {} GB", config.autoclean.max_disk_usage_gb);
+        LOG_INFO("  Check interval: {} seconds", config.autoclean.check_interval_seconds);
     }
 
     // Create NVR manager
     state.manager = std::make_unique<NVRManager>(config);
 
     // Create uploader if configured
-    spdlog::info("Video upload configuration:");
-    spdlog::info("  Enabled: {}", config.upload.enabled ? "yes" : "no");
+    LOG_INFO("Video upload configuration:");
+    LOG_INFO("  Enabled: {}", config.upload.enabled ? "yes" : "no");
     if (config.upload.enabled && !config.upload.url.empty()) {
         state.uploader = std::make_shared<VideoUploader>(config.upload);
         state.manager->setUploader(state.uploader);
-        spdlog::info("  URL: {}", config.upload.url);
-        spdlog::info("  Timeout: {}s", config.upload.timeout_seconds);
-        spdlog::info("  Max retries: {}", config.upload.max_retries);
-        spdlog::info("  Retry delay: {}s", config.upload.retry_delay_seconds);
+        LOG_INFO("  URL: {}", config.upload.url);
+        LOG_INFO("  Timeout: {}s", config.upload.timeout_seconds);
+        LOG_INFO("  Max retries: {}", config.upload.max_retries);
+        LOG_INFO("  Retry delay: {}s", config.upload.retry_delay_seconds);
     } else {
         if (!config.upload.enabled) {
-            spdlog::info("  Status: disabled by configuration");
+            LOG_INFO("  Status: disabled by configuration");
         } else if (config.upload.url.empty()) {
-            spdlog::info("  Status: disabled (no URL configured)");
+            LOG_INFO("  Status: disabled (no URL configured)");
         }
     }
 
     // Upload shop and cameras configuration info
-    spdlog::info("Shop configuration:");
-    spdlog::info("  Shop ID: {}", config.shop.id);
+    LOG_INFO("Shop configuration:");
+    LOG_INFO("  Shop ID: {}", config.shop.id);
     uploadConfigInfo(config);
 
     // Add all streams
@@ -239,15 +241,15 @@ int Application::run(const Config& config, ApplicationState& state) {
                                                   stream.max_reconnect_attempts,
                                                   stream.timeout_seconds,
                                                   stream.name)) {
-            spdlog::error("Failed to add stream: {} ({})", stream.id, stream.url);
+            LOG_ERROR("Failed to add stream: {} ({})", stream.id, stream.url);
             return 1;
         }
-        spdlog::info("Added stream: {} -> {}", stream.id, stream.url);
-        spdlog::info("  Auto reconnect: {}", stream.auto_reconnect ? "enabled" : "disabled");
-        spdlog::info("  Reconnect interval: {}s", stream.reconnect_interval_seconds);
-        spdlog::info("  Max reconnect attempts: {}",
+        LOG_INFO("Added stream: {} -> {}", stream.id, stream.url);
+        LOG_INFO("  Auto reconnect: {}", stream.auto_reconnect ? "enabled" : "disabled");
+        LOG_INFO("  Reconnect interval: {}s", stream.reconnect_interval_seconds);
+        LOG_INFO("  Max reconnect attempts: {}",
                     stream.max_reconnect_attempts == -1 ? "unlimited" : std::to_string(stream.max_reconnect_attempts));
-        spdlog::info("  Stream timeout: {}s", stream.timeout_seconds);
+        LOG_INFO("  Stream timeout: {}s", stream.timeout_seconds);
     }
 
     // Start uploader
@@ -255,7 +257,7 @@ int Application::run(const Config& config, ApplicationState& state) {
         state.uploader->start();
     }
 
-    spdlog::info("NVR is running.");
+    LOG_INFO("NVR is running.");
 
     // Main loop with shorter sleep interval for faster shutdown response
     while (state.running) {
@@ -264,11 +266,11 @@ int Application::run(const Config& config, ApplicationState& state) {
 
     // Stop uploader
     if (state.uploader) {
-        spdlog::info("Stopping video uploader...");
+        LOG_INFO("Stopping video uploader...");
         state.uploader->stop();
     }
 
-    spdlog::info("=== NVR stopped ===");
+    LOG_INFO("=== NVR stopped ===");
 
     return 0;
 }

@@ -1,5 +1,5 @@
+#include "log.h"
 #include "win32_service.h"
-#include <spdlog/spdlog.h>
 #include <iostream>
 #include <sstream>
 #include <vector>
@@ -90,7 +90,7 @@ bool Win32Service::install(const std::string& binaryPath, const std::vector<std:
     CloseServiceHandle(service);
     CloseServiceHandle(scManager);
 
-    spdlog::info("Service '{}' installed successfully", m_serviceName);
+    LOG_INFO("Service '{}' installed successfully", m_serviceName);
     return true;
 }
 
@@ -113,7 +113,7 @@ bool Win32Service::uninstall() {
     SERVICE_STATUS status;
     if (QueryServiceStatus(service, &status)) {
         if (status.dwCurrentState == SERVICE_RUNNING) {
-            spdlog::info("Stopping service before uninstall...");
+            LOG_INFO("Stopping service before uninstall...");
             ControlService(service, SERVICE_CONTROL_STOP, &status);
             Sleep(1000);
         }
@@ -131,7 +131,7 @@ bool Win32Service::uninstall() {
     CloseServiceHandle(service);
     CloseServiceHandle(scManager);
 
-    spdlog::info("Service '{}' uninstalled successfully", m_serviceName);
+    LOG_INFO("Service '{}' uninstalled successfully", m_serviceName);
     return true;
 }
 
@@ -165,7 +165,7 @@ bool Win32Service::start() {
     CloseServiceHandle(service);
     CloseServiceHandle(scManager);
 
-    spdlog::info("Service '{}' started successfully", m_serviceName);
+    LOG_INFO("Service '{}' started successfully", m_serviceName);
     return true;
 }
 
@@ -200,18 +200,18 @@ bool Win32Service::stop() {
     CloseServiceHandle(service);
     CloseServiceHandle(scManager);
 
-    spdlog::info("Service '{}' stopped successfully", m_serviceName);
+    LOG_INFO("Service '{}' stopped successfully", m_serviceName);
     return true;
 }
 
 bool Win32Service::restart() {
-    spdlog::info("Restarting service '{}'...", m_serviceName);
+    LOG_INFO("Restarting service '{}'...", m_serviceName);
     if (!stop()) {
         // If not running, try to start
         std::string err = m_lastError;
         if (err.find("not running") != std::string::npos ||
             err.find("ERROR_SERVICE_NOT_ACTIVE") != std::string::npos) {
-            spdlog::info("Service was not running, starting...");
+            LOG_INFO("Service was not running, starting...");
             return start();
         }
         return false;
@@ -238,7 +238,7 @@ void Win32Service::runAsService(ServiceMainFunction serviceMain) {
     if (!StartServiceCtrlDispatcherW(serviceTable)) {
         DWORD error = GetLastError();
         m_lastError = "StartServiceCtrlDispatcher failed (error code: " + std::to_string(error) + ")";
-        spdlog::error("{}", m_lastError);
+        LOG_ERROR("{}", m_lastError);
     }
 }
 
@@ -288,7 +288,7 @@ void Win32Service::serviceMainImpl(DWORD argc, LPWSTR* argv) {
 
     // Report running
     reportStatus(SERVICE_RUNNING, NO_ERROR, 0);
-    spdlog::info("Service '{}' started", m_serviceName);
+    LOG_INFO("Service '{}' started", m_serviceName);
 
     // Start the application in a separate thread
     std::thread* appThread = nullptr;
@@ -298,18 +298,18 @@ void Win32Service::serviceMainImpl(DWORD argc, LPWSTR* argv) {
                 __try {
                     m_serviceMainFunc();
                 } __except(EXCEPTION_EXECUTE_HANDLER) {
-                    spdlog::error("Exception in service thread");
+                    LOG_ERROR("Exception in service thread");
                 }
             });
         } catch (const std::exception& e) {
-            spdlog::error("Service start error: {}", e.what());
+            LOG_ERROR("Service start error: {}", e.what());
             m_lastError = e.what();
         }
     }
 
     // Wait for stop signal
     WaitForSingleObject(m_stopEvent, INFINITE);
-    spdlog::info("Stop signal received, waiting for application thread...");
+    LOG_INFO("Stop signal received, waiting for application thread...");
 
     // Give the application thread a moment to finish gracefully
     if (appThread && appThread->joinable()) {
@@ -329,7 +329,7 @@ void Win32Service::serviceMainImpl(DWORD argc, LPWSTR* argv) {
 
         // Force cleanup if thread hasn't finished
         if (appThread->joinable()) {
-            spdlog::warn("Application thread still running, detaching");
+            LOG_WARN("Application thread still running, detaching");
             appThread->detach();
         }
 
@@ -339,7 +339,7 @@ void Win32Service::serviceMainImpl(DWORD argc, LPWSTR* argv) {
     CloseHandle(m_stopEvent);
     m_stopEvent = nullptr;
 
-    spdlog::info("Service '{}' stopped", m_serviceName);
+    LOG_INFO("Service '{}' stopped", m_serviceName);
 
     // Report stopped
     reportStatus(SERVICE_STOPPED, NO_ERROR, 0);
@@ -357,7 +357,7 @@ DWORD WINAPI Win32Service::serviceCtrlHandlerEx(DWORD ctrlCode, DWORD eventType,
 void Win32Service::handleControlCode(DWORD ctrlCode) {
     switch (ctrlCode) {
         case SERVICE_CONTROL_STOP:
-            spdlog::info("Received SERVICE_CONTROL_STOP");
+            LOG_INFO("Received SERVICE_CONTROL_STOP");
             reportStatus(SERVICE_STOP_PENDING, NO_ERROR, 5000);
 
             // Signal application to stop
@@ -377,7 +377,7 @@ void Win32Service::handleControlCode(DWORD ctrlCode) {
             break;
 
         case SERVICE_CONTROL_SHUTDOWN:
-            spdlog::info("Received SERVICE_CONTROL_SHUTDOWN");
+            LOG_INFO("Received SERVICE_CONTROL_SHUTDOWN");
             reportStatus(SERVICE_STOP_PENDING, NO_ERROR, 5000);
             if (m_stopCallback) {
                 m_stopCallback();

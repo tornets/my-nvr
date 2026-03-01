@@ -2,6 +2,7 @@
 // Created by wention on 2026/1/27.
 //
 
+#include "log.h"
 #include "ipc_recorder.h"
 
 #include <chrono>
@@ -143,7 +144,7 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
 
     // 解析输出格式（从文件名模板）
     m_output_format = parseOutputFormat();
-    m_logger->info("Output format: {}", m_output_format);
+    LOG_INFO("Output format: {}", m_output_format);
 
     // 创建输出目录和临时目录（使用 UTF-8 兼容函数）
 #ifdef _WIN32
@@ -210,8 +211,8 @@ void IPCRecorder::stop() {
 }
 
 void IPCRecorder::recordingLoop() {
-    m_logger->info("Starting recording: {}", m_stream_url);
-    m_logger->info("Auto reconnect: {}, Interval: {}s, Max attempts: {}, Timeout: {}s",
+    LOG_INFO("Starting recording: {}", m_stream_url);
+    LOG_INFO("Auto reconnect: {}, Interval: {}s, Max attempts: {}, Timeout: {}s",
                    m_auto_reconnect, m_reconnect_interval_seconds,
                    m_max_reconnect_attempts == -1 ? "unlimited" : std::to_string(m_max_reconnect_attempts),
                    m_timeout_seconds);
@@ -221,25 +222,25 @@ void IPCRecorder::recordingLoop() {
         if (!connectAndRecord()) {
             // 连接或录制失败
             if (!m_auto_reconnect) {
-                m_logger->warn("Auto reconnect disabled, stopping recording");
+                LOG_WARN("Auto reconnect disabled, stopping recording");
                 break;
             }
 
             // 检查是否达到最大重连次数
             if (m_max_reconnect_attempts != -1 && m_reconnect_count >= m_max_reconnect_attempts) {
-                m_logger->error("Max reconnect attempts ({}) reached, stopping recording", m_max_reconnect_attempts);
+                LOG_ERROR("Max reconnect attempts ({}) reached, stopping recording", m_max_reconnect_attempts);
                 break;
             }
 
             // 等待后重连
-            m_logger->info("Reconnecting in {} seconds...", m_reconnect_interval_seconds);
+            LOG_INFO("Reconnecting in {} seconds...", m_reconnect_interval_seconds);
             for (int i = 0; i < m_reconnect_interval_seconds && m_running; i++) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
         }
     }
 
-    m_logger->info("Recording loop ended: {} (reconnect count: {})", m_stream_url, m_reconnect_count.load());
+    LOG_INFO("Recording loop ended: {} (reconnect count: {})", m_stream_url, m_reconnect_count.load());
 }
 
 bool IPCRecorder::connectAndRecord() {
@@ -272,11 +273,11 @@ bool IPCRecorder::connectAndRecord() {
 
     // 设置音频转码
     if (m_audio_stream_idx != -1 && !setupAudioTranscoding()) {
-        m_logger->warn("Failed to setup audio transcoding, will record video only");
+        LOG_WARN("Failed to setup audio transcoding, will record video only");
         m_audio_stream_idx = -1;
     }
 
-    m_logger->info("Connection established, starting recording loop");
+    LOG_INFO("Connection established, starting recording loop");
 
     AVPacket* packet = av_packet_alloc();
     auto last_activity_time = std::chrono::steady_clock::now();
@@ -290,7 +291,7 @@ bool IPCRecorder::connectAndRecord() {
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_activity_time).count();
         if (elapsed > m_timeout_seconds) {
             m_last_error = "Stream timeout - no data received";
-            m_logger->error("Stream timeout: no data for {} seconds, reconnecting...", elapsed);
+            LOG_ERROR("Stream timeout: no data for {} seconds, reconnecting...", elapsed);
             m_reconnect_count++;
             av_packet_free(&packet);
             return false;
@@ -308,17 +309,17 @@ bool IPCRecorder::connectAndRecord() {
 
             // 检查是否是超时中断
             if (ret == AVERROR_EXIT) {
-                m_logger->warn("Read interrupted by timeout (error count: {})", consecutive_errors);
+                LOG_WARN("Read interrupted by timeout (error count: {})", consecutive_errors);
             } else if (ret == AVERROR_EOF) {
-                m_logger->warn("End of stream (error count: {})", consecutive_errors);
+                LOG_WARN("End of stream (error count: {})", consecutive_errors);
             } else {
-                m_logger->error("Error reading frame: {} (error count: {})", av_err2str(ret), consecutive_errors);
+                LOG_ERROR("Error reading frame: {} (error count: {})", av_err2str(ret), consecutive_errors);
             }
 
             // 连续错误过多，认为连接已断开
             if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
                 m_last_error = "Too many consecutive read errors";
-                m_logger->error("Too many consecutive errors ({}), reconnecting...", MAX_CONSECUTIVE_ERRORS);
+                LOG_ERROR("Too many consecutive errors ({}), reconnecting...", MAX_CONSECUTIVE_ERRORS);
                 m_reconnect_count++;
                 av_packet_free(&packet);
                 return false;
@@ -337,7 +338,7 @@ bool IPCRecorder::connectAndRecord() {
 
         // 验证时间戳有效性
         if (packet->pts < 0 || packet->dts < 0) {
-            m_logger->debug("Skipping packet with invalid pts/dts: pts={}, dts={}",
+            LOG_DEBUG("Skipping packet with invalid pts/dts: pts={}, dts={}",
                            packet->pts, packet->dts);
             continue;
         }
@@ -346,10 +347,10 @@ bool IPCRecorder::connectAndRecord() {
         // 这确保录制从完整画面开始，避免花屏
         if (m_output_ctx == nullptr) {
             if (!(packet->flags & AV_PKT_FLAG_KEY)) {
-                m_logger->debug("Waiting for key frame before starting recording...");
+                LOG_DEBUG("Waiting for key frame before starting recording...");
                 continue;
             }
-            m_logger->info("Key frame received, starting new segment");
+            LOG_INFO("Key frame received, starting new segment");
         }
 
         /*
@@ -359,7 +360,7 @@ bool IPCRecorder::connectAndRecord() {
                 closeOutput();
             }
 
-            //m_logger->debug("Writing packet: original_pts={}, original_dts={}, ts={}",
+            //LOG_DEBUG("Writing packet: original_pts={}, original_dts={}, ts={}",
             //                packet->pts, packet->dts, ts);
         }
         */
@@ -406,19 +407,19 @@ bool IPCRecorder::connectAndRecord() {
 
                 std::string filename = "temp_" + random_str + ext;
 
-                m_logger->info("Opening temp file: {}", filename);
+                LOG_INFO("Opening temp file: {}", filename);
                 if (!openOutput(filename)) {
-                    m_logger->error("Failed to open temp file: {}", filename);
+                    LOG_ERROR("Failed to open temp file: {}", filename);
                     av_packet_unref(packet);
                     continue;
                 }
-                m_logger->info("Temp file opened successfully");
+                LOG_INFO("Temp file opened successfully");
 
                 if (packet->pts > 0) {
                     m_segment_start_pts = packet->pts;
                     // 使用相同帧的 DTS 作为起始 DTS
                     m_segment_start_dts = packet->dts >= 0 ? packet->dts : packet->pts;
-                    m_logger->debug("Segment start: pts={}, dts={}", m_segment_start_pts, m_segment_start_dts);
+                    LOG_DEBUG("Segment start: pts={}, dts={}", m_segment_start_pts, m_segment_start_dts);
                 }
 
                 // 重置音频起始 PTS 和帧计数
@@ -431,7 +432,7 @@ bool IPCRecorder::connectAndRecord() {
             int stream_index = packet->stream_index;
 
             if (packet->flags & AV_PKT_FLAG_KEY) {
-                m_logger->debug("Key frame received at pts={}", packet->pts);
+                LOG_DEBUG("Key frame received at pts={}", packet->pts);
             }
 
             // 保存最后一个视频包的原始PTS（用于计算实际录制时长）
@@ -456,7 +457,7 @@ bool IPCRecorder::connectAndRecord() {
 
             // 确保 DTS <= PTS（对于某些编码格式）
             if (packet->dts > packet->pts) {
-                m_logger->debug("DTS > PTS, setting DTS = PTS: pts={}, dts={}", packet->pts, packet->dts);
+                LOG_DEBUG("DTS > PTS, setting DTS = PTS: pts={}, dts={}", packet->pts, packet->dts);
                 packet->dts = packet->pts;
             }
 
@@ -470,7 +471,7 @@ bool IPCRecorder::connectAndRecord() {
             if (m_audio_start_pts == 0 && packet->pts > 0) {
                 // 记录第一个音频包的 PTS 作为起始点
                 m_audio_start_pts = packet->pts;
-                m_logger->debug("Audio start PTS set to: {}", m_audio_start_pts);
+                LOG_DEBUG("Audio start PTS set to: {}", m_audio_start_pts);
             }
 
             if (m_audio_encoder_ctx) {
@@ -510,7 +511,7 @@ bool IPCRecorder::connectAndRecord() {
     av_packet_free(&packet);
     closeOutput();
 
-    m_logger->info("Recording stopped: {}", m_stream_url);
+    LOG_INFO("Recording stopped: {}", m_stream_url);
     return true;  // 正常结束
 }
 
@@ -518,7 +519,7 @@ bool IPCRecorder::openInput() {
     // 分配输入上下文
     m_input_ctx = avformat_alloc_context();
     if (!m_input_ctx) {
-        m_logger->error("Cannot allocate input context");
+        LOG_ERROR("Cannot allocate input context");
         return false;
     }
 
@@ -545,7 +546,7 @@ bool IPCRecorder::openInput() {
     av_dict_set(&options, "err_detect", "ignore_err", 0);  // 忽略错误继续解码
     //av_dict_set(&options, "max_delay", "500000", 0);  // 最大延迟 500ms
 
-    m_logger->info("Opening stream: {} (timeout: {}s, transport: tcp)", m_stream_url, m_timeout_seconds);
+    LOG_INFO("Opening stream: {} (timeout: {}s, transport: tcp)", m_stream_url, m_timeout_seconds);
 
     int ret = avformat_open_input(&m_input_ctx, m_stream_url.c_str(), nullptr, &options);
 
@@ -555,9 +556,9 @@ bool IPCRecorder::openInput() {
     }
     if (ret < 0) {
         if (ret == AVERROR_EXIT) {
-            m_logger->error("Cannot open input: timeout after {}s", m_timeout_seconds);
+            LOG_ERROR("Cannot open input: timeout after {}s", m_timeout_seconds);
         } else {
-            m_logger->error("Cannot open input: {}", av_err2str(ret));
+            LOG_ERROR("Cannot open input: {}", av_err2str(ret));
         }
         m_input_ctx = nullptr;
         return false;
@@ -565,7 +566,7 @@ bool IPCRecorder::openInput() {
 
     ret = avformat_find_stream_info(m_input_ctx, nullptr);
     if (ret < 0) {
-        m_logger->error("Cannot find stream info: {}", av_err2str(ret));
+        LOG_ERROR("Cannot find stream info: {}", av_err2str(ret));
         avformat_close_input(&m_input_ctx);
         m_input_ctx = nullptr;
         return false;
@@ -585,11 +586,11 @@ bool IPCRecorder::openOutput(const std::string& filename) {
     // 动态创建输出上下文，使用解析的格式
     int ret = avformat_alloc_output_context2(&m_output_ctx, nullptr, m_output_format.c_str(), full_path.c_str());
     if (ret < 0) {
-        m_logger->error("Cannot create output context for format {}: {}", m_output_format, av_err2str(ret));
+        LOG_ERROR("Cannot create output context for format {}: {}", m_output_format, av_err2str(ret));
         return false;
     }
 
-    m_logger->info("Creating output file with format: {}", m_output_format);
+    LOG_INFO("Creating output file with format: {}", m_output_format);
 
     // 重置音频编码器（需要重新检查是否需要转码）
     if (m_audio_encoder_ctx) {
@@ -622,25 +623,25 @@ bool IPCRecorder::openOutput(const std::string& filename) {
             // 检查视频编码器是否与输出格式兼容
             AVCodecID video_codec = in_stream->codecpar->codec_id;
             if (!isVideoCodecCompatible(video_codec, m_output_format)) {
-                m_logger->error("Video codec {} (ID:{}) is not compatible with output format {}. Stream recording aborted.",
+                LOG_ERROR("Video codec {} (ID:{}) is not compatible with output format {}. Stream recording aborted.",
                                avcodec_get_name(video_codec), static_cast<int>(video_codec), m_output_format);
                 avformat_free_context(m_output_ctx);
                 m_output_ctx = nullptr;
                 return false;
             }
 
-            m_logger->info("Video codec {} (ID:{}) is compatible with format {}",
+            LOG_INFO("Video codec {} (ID:{}) is compatible with format {}",
                           avcodec_get_name(video_codec), static_cast<int>(video_codec), m_output_format);
 
             AVStream* out_stream = avformat_new_stream(m_output_ctx, nullptr);
             if (!out_stream) {
-                m_logger->error("Failed to allocate output stream");
+                LOG_ERROR("Failed to allocate output stream");
                 return false;
             }
 
             ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
             if (ret < 0) {
-                m_logger->error("Failed to copy codec parameters");
+                LOG_ERROR("Failed to copy codec parameters");
                 return false;
             }
 
@@ -651,19 +652,19 @@ bool IPCRecorder::openOutput(const std::string& filename) {
             // 检查音频编码器是否与输出格式兼容
             AVCodecID audio_codec = in_stream->codecpar->codec_id;
             if (!isAudioCodecCompatible(audio_codec, m_output_format)) {
-                m_logger->warn("Audio codec {} (ID:{}) is not compatible with output format {}. Will transcode to {}.",
+                LOG_WARN("Audio codec {} (ID:{}) is not compatible with output format {}. Will transcode to {}.",
                               avcodec_get_name(audio_codec), static_cast<int>(audio_codec), m_output_format,
                               avcodec_get_name(getBestAudioCodec(m_output_format)));
                 need_audio_transcode = true;
             } else {
-                m_logger->info("Audio codec {} (ID:{}) is compatible with format {}",
+                LOG_INFO("Audio codec {} (ID:{}) is compatible with format {}",
                               avcodec_get_name(audio_codec), static_cast<int>(audio_codec), m_output_format);
             }
 
             // 添加音频流到输出
             AVStream* out_stream = avformat_new_stream(m_output_ctx, nullptr);
             if (!out_stream) {
-                m_logger->error("Failed to allocate audio output stream");
+                LOG_ERROR("Failed to allocate audio output stream");
                 return false;
             }
 
@@ -671,21 +672,21 @@ bool IPCRecorder::openOutput(const std::string& filename) {
             // 这样可以确保 codecpar 有有效的初始值
             ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
             if (ret < 0) {
-                m_logger->error("Failed to copy audio codec parameters");
+                LOG_ERROR("Failed to copy audio codec parameters");
                 return false;
             }
 
             out_stream->time_base = in_stream->time_base;
             out_stream->codecpar->codec_tag = 0;
 
-            m_logger->info("Added audio stream to output (transcode: {})", need_audio_transcode);
+            LOG_INFO("Added audio stream to output (transcode: {})", need_audio_transcode);
         }
     }
 
     // 如果需要音频转码，设置转码器
     if (need_audio_transcode) {
         if (!setupAudioTranscoding()) {
-            m_logger->warn("Failed to setup audio transcoding, will record video only");
+            LOG_WARN("Failed to setup audio transcoding, will record video only");
             m_audio_stream_idx = -1;
 
             // 移除音频输出流
@@ -693,7 +694,7 @@ bool IPCRecorder::openOutput(const std::string& filename) {
                 if (m_output_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
                     // 找到音频流，需要标记为无效
                     // 由于 FFmpeg 不支持删除流，我们只能保留它但忽略它
-                    m_logger->warn("Audio stream left in output but will not be written");
+                    LOG_WARN("Audio stream left in output but will not be written");
                     break;
                 }
             }
@@ -704,10 +705,10 @@ bool IPCRecorder::openOutput(const std::string& filename) {
                     AVStream* out_stream = m_output_ctx->streams[i];
                     int ret = avcodec_parameters_from_context(out_stream->codecpar, m_audio_encoder_ctx);
                     if (ret < 0) {
-                        m_logger->error("Failed to copy audio encoder parameters to output stream");
+                        LOG_ERROR("Failed to copy audio encoder parameters to output stream");
                         return false;
                     }
-                    m_logger->info("Audio encoder parameters copied to output stream");
+                    LOG_INFO("Audio encoder parameters copied to output stream");
                     break;
                 }
             }
@@ -741,17 +742,17 @@ bool IPCRecorder::openOutput(const std::string& filename) {
 #endif
 
     if (ret < 0) {
-        m_logger->error("Cannot open output file: {}", av_err2str(ret));
+        LOG_ERROR("Cannot open output file: {}", av_err2str(ret));
         return false;
     }
 
     ret = avformat_write_header(m_output_ctx, nullptr);
     if (ret < 0) {
-        m_logger->error("Cannot write header: {}", av_err2str(ret));
+        LOG_ERROR("Cannot write header: {}", av_err2str(ret));
         return false;
     }
 
-    m_logger->info("Opened output file: {}", full_path);
+    LOG_INFO("Opened output file: {}", full_path);
     return true;
 }
 
@@ -774,7 +775,7 @@ void IPCRecorder::closeOutput() {
                 // 使用视频流的 time_base 将相对 PTS 转换为秒
                 AVRational tb = m_video_time_base;
                 duration_seconds = av_rescale_q(relative_pts, tb, AVRational{1, 1});
-                m_logger->debug("Video duration calculation: last_pts={}, start_pts={}, relative_pts={}, tb={}/{}, duration={}s",
+                LOG_DEBUG("Video duration calculation: last_pts={}, start_pts={}, relative_pts={}, tb={}/{}, duration={}s",
                                m_last_video_pts, m_segment_start_pts, relative_pts, tb.num, tb.den, duration_seconds);
             }
 
@@ -783,7 +784,7 @@ void IPCRecorder::closeOutput() {
                 std::time_t end_time;
                 std::time(&end_time);
                 duration_seconds = end_time - m_segment_start_time;
-                m_logger->warn("Video PTS not available, using system time for duration: {}s", duration_seconds);
+                LOG_WARN("Video PTS not available, using system time for duration: {}s", duration_seconds);
             }
 
             // 生成新的文件名（包含结束时间和时长）
@@ -806,9 +807,9 @@ void IPCRecorder::closeOutput() {
             // 移动文件（使用 UTF-8 兼容函数）
 #ifdef _WIN32
             if (rename_file_utf8(temp_path.string(), final_path.string())) {
-                m_logger->info("Moved recording: {} -> {}", m_current_filename, new_filename);
+                LOG_INFO("Moved recording: {} -> {}", m_current_filename, new_filename);
             } else {
-                m_logger->error("Failed to move recording {} to {}: {}",
+                LOG_ERROR("Failed to move recording {} to {}: {}",
                                m_current_filename, new_filename, GetLastError());
             }
 #else
@@ -816,13 +817,13 @@ void IPCRecorder::closeOutput() {
             if (fs::exists(temp_path)) {
                 fs::rename(temp_path, final_path, ec);
                 if (!ec) {
-                    m_logger->info("Moved recording: {} -> {}", m_current_filename, new_filename);
+                    LOG_INFO("Moved recording: {} -> {}", m_current_filename, new_filename);
                 } else {
-                    m_logger->error("Failed to move recording {} to {}: {}",
+                    LOG_ERROR("Failed to move recording {} to {}: {}",
                                    m_current_filename, new_filename, ec.message().c_str());
                 }
             } else {
-                m_logger->warn("Temp file not found: {}", temp_path.string());
+                LOG_WARN("Temp file not found: {}", temp_path.string());
             }
 #endif
 
@@ -841,12 +842,12 @@ bool IPCRecorder::setupStreams() {
     }
 
     if (m_video_stream_idx == -1) {
-        m_logger->error("No video stream found");
+        LOG_ERROR("No video stream found");
         return false;
     }
 
     if (!m_enable_audio) {
-        m_logger->info("Audio recording disabled by configuration");
+        LOG_INFO("Audio recording disabled by configuration");
     }
 
     return true;
@@ -854,14 +855,14 @@ bool IPCRecorder::setupStreams() {
 
 bool IPCRecorder::setupAudioTranscoding() {
     if (m_audio_stream_idx == -1) {
-        m_logger->info("No audio stream found, video only mode");
+        LOG_INFO("No audio stream found, video only mode");
         return true;
     }
 
     AVStream* audio_stream = m_input_ctx->streams[m_audio_stream_idx];
     AVCodecParameters* audio_par = audio_stream->codecpar;
 
-    m_logger->info("Found audio stream: codec={}, sample_rate={}, channels={}",
+    LOG_INFO("Found audio stream: codec={}, sample_rate={}, channels={}",
                    avcodec_get_name(audio_par->codec_id), audio_par->sample_rate,
                    audio_par->ch_layout.nb_channels);
 
@@ -871,13 +872,13 @@ bool IPCRecorder::setupAudioTranscoding() {
 
     // 如果已经是目标编码器，不需要转码
     if (audio_par->codec_id == target_codec_id) {
-        m_logger->info("Audio codec is already {}, no transcoding needed", avcodec_get_name(target_codec_id));
+        LOG_INFO("Audio codec is already {}, no transcoding needed", avcodec_get_name(target_codec_id));
         m_audio_decoder_ctx = nullptr;
         m_audio_encoder_ctx = nullptr;
         return true;
     }
 
-    m_logger->info("Audio transcoding: {} -> {} (format: {})",
+    LOG_INFO("Audio transcoding: {} -> {} (format: {})",
                    avcodec_get_name(audio_par->codec_id), avcodec_get_name(target_codec_id), m_output_format);
 
     // 尝试使用目标编码器，如果失败则回退到 AAC
@@ -892,19 +893,19 @@ bool IPCRecorder::setupAudioTranscoding() {
             continue;
         }
 
-        m_logger->info("Attempting to use {} encoder", codec_names[attempt]);
+        LOG_INFO("Attempting to use {} encoder", codec_names[attempt]);
 
         // 查找编码器
         const AVCodec* encoder = avcodec_find_encoder(try_codec);
         if (!encoder) {
-            m_logger->warn("{} encoder not found", codec_names[attempt]);
+            LOG_WARN("{} encoder not found", codec_names[attempt]);
             continue;
         }
 
         // 创建音频编码器上下文
         m_audio_encoder_ctx = avcodec_alloc_context3(encoder);
         if (!m_audio_encoder_ctx) {
-            m_logger->warn("Failed to allocate audio encoder context for {}", codec_names[attempt]);
+            LOG_WARN("Failed to allocate audio encoder context for {}", codec_names[attempt]);
             continue;
         }
 
@@ -948,13 +949,13 @@ bool IPCRecorder::setupAudioTranscoding() {
         // 打开编码器
         int ret = avcodec_open2(m_audio_encoder_ctx, encoder, nullptr);
         if (ret < 0) {
-            m_logger->warn("Failed to open {} encoder: {}, trying next codec", codec_names[attempt], av_err2str(ret));
+            LOG_WARN("Failed to open {} encoder: {}, trying next codec", codec_names[attempt], av_err2str(ret));
             avcodec_free_context(&m_audio_encoder_ctx);
             m_audio_encoder_ctx = nullptr;
             continue;
         }
 
-        m_logger->info("Successfully opened {} encoder", codec_names[attempt]);
+        LOG_INFO("Successfully opened {} encoder", codec_names[attempt]);
 
         // 成功，跳出循环
         break;
@@ -962,39 +963,39 @@ bool IPCRecorder::setupAudioTranscoding() {
 
     // 如果所有编码器都失败
     if (!m_audio_encoder_ctx) {
-        m_logger->error("Failed to open any audio encoder, transcoding aborted");
+        LOG_ERROR("Failed to open any audio encoder, transcoding aborted");
         return false;
     }
 
     // 查找输入音频解码器
     const AVCodec* decoder = avcodec_find_decoder(audio_par->codec_id);
     if (!decoder) {
-        m_logger->error("Audio decoder not found for codec={}", avcodec_get_name(audio_par->codec_id));
+        LOG_ERROR("Audio decoder not found for codec={}", avcodec_get_name(audio_par->codec_id));
         return false;
     }
 
     // 创建解码器上下文
     m_audio_decoder_ctx = avcodec_alloc_context3(decoder);
     if (!m_audio_decoder_ctx) {
-        m_logger->error("Failed to allocate audio decoder context");
+        LOG_ERROR("Failed to allocate audio decoder context");
         return false;
     }
 
     // 复制解码器参数
     int ret = avcodec_parameters_to_context(m_audio_decoder_ctx, audio_par);
     if (ret < 0) {
-        m_logger->error("Failed to copy audio decoder parameters: {}", av_err2str(ret));
+        LOG_ERROR("Failed to copy audio decoder parameters: {}", av_err2str(ret));
         return false;
     }
 
     // 打开解码器
     ret = avcodec_open2(m_audio_decoder_ctx, decoder, nullptr);
     if (ret < 0) {
-        m_logger->error("Failed to open audio decoder: {}", av_err2str(ret));
+        LOG_ERROR("Failed to open audio decoder: {}", av_err2str(ret));
         return false;
     }
 
-    m_logger->info("Audio transcoding setup completed: {} -> {}",
+    LOG_INFO("Audio transcoding setup completed: {} -> {}",
                    avcodec_get_name(audio_par->codec_id), avcodec_get_name(m_audio_encoder_ctx->codec_id));
 
     return true;
@@ -1042,13 +1043,13 @@ std::string IPCRecorder::generateFilename(int64_t start_pts, int64_t end_pts) {
 
 bool IPCRecorder::writePacket(AVPacket* packet) {
     if (!m_output_ctx) {
-        m_logger->error("writePacket: m_output_ctx is null");
+        LOG_ERROR("writePacket: m_output_ctx is null");
         return false;
     }
 
     int ret = av_interleaved_write_frame(m_output_ctx, packet);
     if (ret < 0) {
-        m_logger->error("Error writing packet: {}", av_err2str(ret));
+        LOG_ERROR("Error writing packet: {}", av_err2str(ret));
         return false;
     }
     return true;
@@ -1074,7 +1075,7 @@ bool IPCRecorder::initAudioResampleAndFifo() {
                                   0, nullptr);
 
     if (!m_swr_ctx || swr_init(m_swr_ctx) < 0) {
-        m_logger->error("Failed to initialize resampler");
+        LOG_ERROR("Failed to initialize resampler");
         return false;
     }
 
@@ -1083,7 +1084,7 @@ bool IPCRecorder::initAudioResampleAndFifo() {
                                       m_audio_encoder_ctx->ch_layout.nb_channels,
                                       1);
     if (!m_audio_fifo) {
-        m_logger->error("Failed to allocate audio FIFO");
+        LOG_ERROR("Failed to allocate audio FIFO");
         return false;
     }
 
@@ -1100,7 +1101,7 @@ bool IPCRecorder::resampleAndStoreAudioFrame(AVFrame* frame) {
                                                              m_audio_encoder_ctx->sample_fmt,
                                                              0);
     if (aligned_samples < 0) {
-        m_logger->error("Failed to allocate converted samples");
+        LOG_ERROR("Failed to allocate converted samples");
         return false;
     }
 
@@ -1112,7 +1113,7 @@ bool IPCRecorder::resampleAndStoreAudioFrame(AVFrame* frame) {
                                  frame->nb_samples);
 
     if (out_samples < 0) {
-        m_logger->error("Error resampling audio");
+        LOG_ERROR("Error resampling audio");
         av_freep(&converted_data[0]);
         av_freep(&converted_data);
         return false;
@@ -1120,7 +1121,7 @@ bool IPCRecorder::resampleAndStoreAudioFrame(AVFrame* frame) {
 
     // 扩展 FIFO 缓冲区
     if (av_audio_fifo_realloc(m_audio_fifo, av_audio_fifo_size(m_audio_fifo) + out_samples) < 0) {
-        m_logger->error("Failed to reallocate audio FIFO");
+        LOG_ERROR("Failed to reallocate audio FIFO");
         av_freep(&converted_data[0]);
         av_freep(&converted_data);
         return false;
@@ -1128,7 +1129,7 @@ bool IPCRecorder::resampleAndStoreAudioFrame(AVFrame* frame) {
 
     // 写入 FIFO
     if (av_audio_fifo_write(m_audio_fifo, (void**)converted_data, out_samples) != out_samples) {
-        m_logger->error("Failed to write to audio FIFO");
+        LOG_ERROR("Failed to write to audio FIFO");
         av_freep(&converted_data[0]);
         av_freep(&converted_data);
         return false;
@@ -1151,14 +1152,14 @@ bool IPCRecorder::encodeAndFlushAudioFrames() {
 
         int ret = av_frame_get_buffer(enc_frame, 0);
         if (ret < 0) {
-            m_logger->error("Failed to allocate encoder frame buffer: {}", av_err2str(ret));
+            LOG_ERROR("Failed to allocate encoder frame buffer: {}", av_err2str(ret));
             av_frame_free(&enc_frame);
             return false;
         }
 
         int read_samples = av_audio_fifo_read(m_audio_fifo, (void**)enc_frame->data, m_audio_encoder_ctx->frame_size);
         if (read_samples != m_audio_encoder_ctx->frame_size) {
-            m_logger->warn("Incomplete read from audio FIFO: {} != {}", read_samples, m_audio_encoder_ctx->frame_size);
+            LOG_WARN("Incomplete read from audio FIFO: {} != {}", read_samples, m_audio_encoder_ctx->frame_size);
         }
 
         // 设置 PTS（使用累积的帧数）
@@ -1170,7 +1171,7 @@ bool IPCRecorder::encodeAndFlushAudioFrames() {
         av_frame_free(&enc_frame);  // 释放帧，编码器已经保留了一份拷贝
 
         if (ret < 0) {
-            m_logger->error("Error sending frame to audio encoder: {}", av_err2str(ret));
+            LOG_ERROR("Error sending frame to audio encoder: {}", av_err2str(ret));
             return false;
         }
 
@@ -1183,7 +1184,7 @@ bool IPCRecorder::encodeAndFlushAudioFrames() {
                 break;
             }
             if (ret < 0) {
-                m_logger->error("Error encoding audio frame: {}", av_err2str(ret));
+                LOG_ERROR("Error encoding audio frame: {}", av_err2str(ret));
                 av_packet_free(&encoded_packet);
                 break;
             }
@@ -1224,7 +1225,7 @@ bool IPCRecorder::decodeAndProcessAudioPackets(AVPacket* packet) {
             break;  // 没有更多帧了
         }
         if (ret < 0) {
-            m_logger->error("Error decoding audio frame: {}", av_err2str(ret));
+            LOG_ERROR("Error decoding audio frame: {}", av_err2str(ret));
             av_frame_free(&frame);
             return false;
         }
@@ -1250,7 +1251,7 @@ void IPCRecorder::resetAudioTranscodingState() {
     // 清空 FIFO 缓冲区
     if (m_audio_fifo) {
         av_audio_fifo_reset(m_audio_fifo);
-        m_logger->debug("Audio FIFO reset for new segment");
+        LOG_DEBUG("Audio FIFO reset for new segment");
     }
 
     // 重置帧计数器
@@ -1269,27 +1270,27 @@ bool IPCRecorder::transcodeAudio(AVPacket* packet) {
 
     // 2. 验证 packet 有效性
     if (!packet) {
-        m_logger->warn("Null packet passed to transcodeAudio");
+        LOG_WARN("Null packet passed to transcodeAudio");
         return false;
     }
 
     // 3. 验证数据指针和大小
     if (!packet->data || packet->size <= 0) {
-        m_logger->debug("Skipping empty audio packet: data={}, size={}",
+        LOG_DEBUG("Skipping empty audio packet: data={}, size={}",
                        static_cast<void*>(packet->data), packet->size);
         return false;  // 空包不是错误，跳过即可
     }
 
     // 4. 验证包大小是否合理
     if (packet->size > 8192) {
-        m_logger->warn("Audio packet size too large: {}", packet->size);
+        LOG_WARN("Audio packet size too large: {}", packet->size);
         return false;
     }
 
     // 5. 发送包到解码器
     int ret = avcodec_send_packet(m_audio_decoder_ctx, packet);
     if (ret < 0) {
-        m_logger->error("Error sending audio packet to decoder: {}", av_err2str(ret));
+        LOG_ERROR("Error sending audio packet to decoder: {}", av_err2str(ret));
         return false;
     }
 
@@ -1468,7 +1469,7 @@ bool IPCRecorder::isVideoCodecCompatible(AVCodecID codec_id, const std::string& 
     // 使用 FFmpeg API 查询格式是否支持该视频编码
     const AVOutputFormat* fmt = av_guess_format(format_name.c_str(), nullptr, nullptr);
     if (!fmt) {
-        m_logger->warn("Unknown output format: {}", format_name);
+        LOG_WARN("Unknown output format: {}", format_name);
         return false;
     }
 
@@ -1482,7 +1483,7 @@ bool IPCRecorder::isAudioCodecCompatible(AVCodecID codec_id, const std::string& 
     // 使用 FFmpeg API 查询格式是否支持该音频编码
     const AVOutputFormat* fmt = av_guess_format(format_name.c_str(), nullptr, nullptr);
     if (!fmt) {
-        m_logger->warn("Unknown output format: {}", format_name);
+        LOG_WARN("Unknown output format: {}", format_name);
         return false;
     }
 

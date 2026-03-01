@@ -14,6 +14,7 @@ add_executable(nvr
     application.cpp
     cmdline_parser.cpp
     version.cpp
+    log.h
 )
 
 # Add Windows service support on Windows

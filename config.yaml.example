@@ -102,8 +102,8 @@ log_level: "info"  # 可选值: trace, debug, info, warn, error, critical
 upload:
   enabled: false                      # 是否启用上传功能
   url: "https://your-server.com/api/upload"  # 上传服务器 URL
-  timeout_seconds: 300                # 上传超时时间（秒）
-  max_retries: 3                      # 上传失败最大重试次数
+  timeout_seconds: 10                 # 上传超时时间（秒）
+  max_retries: 3                      # 上传失败最大重试次数, -1 无限重试
   retry_delay_seconds: 5              # 重试间隔（秒）
 
   # 多线程上传配置

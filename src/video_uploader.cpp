@@ -205,7 +205,7 @@ bool VideoUploader::uploadFile(const UploadTask& task) {
     auto record = progress_manager_->getRecord(relative_path);
     int retry_count = record ? record->retry_count : 0;
 
-    if (running_.load() && retry_count <= config_.max_retries) {
+    if (config_.max_retries < 0 || retry_count <= config_.max_retries) {
         if (uploadToServer(task.file_path, task.stream_id, task.recording_time)) {
             LOG_INFO("Successfully uploaded: {}", task.file_path);
             return true;

@@ -13,7 +13,6 @@
 #include <condition_variable>
 #include <atomic>
 #include <functional>
-#include <set>
 
 #include <spdlog/spdlog.h>
 
@@ -21,6 +20,7 @@
 #include "video_uploader.h"
 #include "upload_progress.h"
 #include "config_loader.h"
+#include "schedule_utils.h"
 
 class NVRManager {
 public:
@@ -46,6 +46,12 @@ private:
     void scanAndUploadNewFiles();
     bool cleanTempFiles();  // 清理临时目录中残留的文件
 
+    // 调度相关
+    void scheduleLoop();                    // 调度线程主循环
+    void checkAndUpdateSchedule();          // 检查并更新调度状态
+    void startStreamRecording(const std::string& stream_id);   // 启动单个流录制
+    void stopStreamRecording(const std::string& stream_id);    // 停止单个流录制
+
     Config m_config;
 
     std::unordered_map<std::string, std::unique_ptr<IPCRecorder>> m_recorders;
@@ -53,11 +59,14 @@ private:
 
     std::thread m_cleanup_thread;
     std::thread m_upload_thread;  // 上传扫描线程
+    std::thread m_schedule_thread; // 调度线程
     std::atomic<bool> m_running;
     std::condition_variable m_cleanup_cv;
     std::condition_variable m_upload_cv;
+    std::condition_variable m_schedule_cv;
     std::mutex m_cleanup_mutex;
     std::mutex m_upload_mutex;
+    std::mutex m_schedule_mutex;
 
     std::shared_ptr<VideoUploader> m_uploader;
     std::shared_ptr<UploadProgressManager> m_upload_progress;  // 上传进度管理器

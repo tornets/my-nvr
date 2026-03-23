@@ -13,6 +13,21 @@
 #include <pwd.h>
 #endif
 
+// 辅助函数：解析时间字符串 "HH:MM"
+static bool parseTimeString(const std::string& time_str, int& hour, int& minute) {
+    size_t colon_pos = time_str.find(':');
+    if (colon_pos == std::string::npos) {
+        return false;
+    }
+    try {
+        hour = std::stoi(time_str.substr(0, colon_pos));
+        minute = std::stoi(time_str.substr(colon_pos + 1));
+        return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
+    } catch (...) {
+        return false;
+    }
+}
+
 Config Config::getDefault() {
     Config config;
     config.streams.clear();
@@ -180,6 +195,34 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
             }
             if (record["enable_audio"]) {
                 config.record.enable_audio = record["enable_audio"].as<bool>();
+            }
+            // 解析调度配置
+            if (record["schedule"]) {
+                const auto& schedule = record["schedule"];
+                if (schedule["enabled"]) {
+                    config.record.schedule.enabled = schedule["enabled"].as<bool>();
+                }
+                if (schedule["check_interval_seconds"]) {
+                    config.record.schedule.check_interval_seconds = schedule["check_interval_seconds"].as<int>();
+                }
+                if (schedule["time_ranges"] && schedule["time_ranges"].IsSequence()) {
+                    for (const auto& range : schedule["time_ranges"]) {
+                        TimeRange time_range;
+                        if (range["start"]) {
+                            std::string start = range["start"].as<std::string>();
+                            if (!parseTimeString(start, time_range.start_hour, time_range.start_minute)) {
+                                std::cerr << "Warning: invalid start time format: " << start << std::endl;
+                            }
+                        }
+                        if (range["end"]) {
+                            std::string end = range["end"].as<std::string>();
+                            if (!parseTimeString(end, time_range.end_hour, time_range.end_minute)) {
+                                std::cerr << "Warning: invalid end time format: " << end << std::endl;
+                            }
+                        }
+                        config.record.schedule.time_ranges.push_back(time_range);
+                    }
+                }
             }
         }
 

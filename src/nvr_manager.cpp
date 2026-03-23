@@ -4,12 +4,14 @@
 
 #include "log.h"
 #include "nvr_manager.h"
+#include "schedule_utils.h"
 
 #include <chrono>
 #include <filesystem>
 #include <system_error>
 #include <iomanip>
 #include <sstream>
+#include <ctime>
 
 namespace fs = std::filesystem;
 
@@ -32,6 +34,22 @@ NVRManager::NVRManager(const Config& config)
     if (m_config.autoclean.enabled) {
         m_cleanup_thread = std::thread(&NVRManager::cleanupLoop, this);
         LOG_INFO("Cleanup thread started");
+    }
+
+    // 如果启用了调度，启动调度线程
+    if (m_config.record.schedule.enabled) {
+        LOG_INFO("Recording schedule enabled with {} time ranges",
+                 m_config.record.schedule.time_ranges.size());
+        for (const auto& range : m_config.record.schedule.time_ranges) {
+            LOG_INFO("  Schedule: {:02d}:{:02d} - {:02d}:{:02d}",
+                     range.start_hour, range.start_minute,
+                     range.end_hour, range.end_minute);
+        }
+        // 先执行一次检查
+        checkAndUpdateSchedule();
+        // 启动调度线程
+        m_schedule_thread = std::thread(&NVRManager::scheduleLoop, this);
+        LOG_INFO("Schedule thread started");
     }
 }
 
@@ -66,7 +84,22 @@ bool NVRManager::addStreamWithConfig(const std::string& stream_id, const std::st
                                                       timeout_seconds,
                                                       m_config.shop.id,
                                                       stream_name);
-    recorder->start();
+
+    // 检查是否应该启动录制
+    bool should_start = true;
+    if (m_config.record.schedule.enabled) {
+        std::time_t now = std::time(nullptr);
+        std::tm local_tm = *std::localtime(&now);
+        should_start = ScheduleUtils::isInRecordingTime(
+            m_config.record.schedule.time_ranges, local_tm);
+        if (!should_start) {
+            LOG_INFO("Schedule: Stream {} added but not started (outside recording time)", stream_id);
+        }
+    }
+
+    if (should_start) {
+        recorder->start();
+    }
 
     m_recorders[stream_id] = std::move(recorder);
     LOG_INFO("Added stream: {} -> {} (name={}, auto_reconnect={}, interval={}s, max_attempts={}, timeout={}s)",
@@ -107,6 +140,7 @@ void NVRManager::stopAll() {
         // 通知所有等待的线程
         m_cleanup_cv.notify_all();
         m_upload_cv.notify_all();
+        m_schedule_cv.notify_all();
 
         // 只在线程实际启动时 join
         if (m_cleanup_thread.joinable()) {
@@ -114,6 +148,9 @@ void NVRManager::stopAll() {
         }
         if (m_upload_thread.joinable()) {
             m_upload_thread.join();
+        }
+        if (m_schedule_thread.joinable()) {
+            m_schedule_thread.join();
         }
     }
 
@@ -452,4 +489,124 @@ bool NVRManager::cleanTempFiles() {
     }
 
     return true;
+}
+
+// ==================== 调度相关方法 ====================
+
+void NVRManager::scheduleLoop() {
+    LOG_INFO("Schedule loop started");
+
+    while (m_running) {
+        checkAndUpdateSchedule();
+
+        // 计算下次检查时间
+        int sleep_seconds = m_config.record.schedule.check_interval_seconds;
+        if (sleep_seconds < 10) sleep_seconds = 10;    // 最小10秒
+        if (sleep_seconds > 300) sleep_seconds = 300;  // 最大5分钟
+
+        std::unique_lock<std::mutex> lock(m_schedule_mutex);
+        if (m_schedule_cv.wait_for(lock, std::chrono::seconds(sleep_seconds),
+                                   [this] { return !m_running; })) {
+            break;  // 收到停止信号
+        }
+    }
+
+    LOG_INFO("Schedule loop stopped");
+}
+
+void NVRManager::checkAndUpdateSchedule() {
+    // 获取当前时间
+    std::time_t now = std::time(nullptr);
+    std::tm local_tm = *std::localtime(&now);
+
+    // 检查当前是否应该在录制时间段内
+    bool should_record = ScheduleUtils::isInRecordingTime(
+        m_config.record.schedule.time_ranges, local_tm);
+
+    LOG_DEBUG("Schedule check: current time {:02d}:{:02d}, should_record={}",
+              local_tm.tm_hour, local_tm.tm_min, should_record);
+
+    // 遍历所有配置的流
+    for (const auto& stream : m_config.streams) {
+        const std::string& stream_id = stream.id;
+
+        // 获取当前录制状态
+        bool is_recording = false;
+        {
+            std::lock_guard<std::mutex> rec_lock(m_recorders_mutex);
+            auto it = m_recorders.find(stream_id);
+            if (it != m_recorders.end() && it->second) {
+                is_recording = it->second->getStatus().is_recording;
+            }
+        }
+
+        if (should_record && !is_recording) {
+            // 进入录制时间段，启动录制
+            LOG_INFO("Schedule: Starting recording for stream {}", stream_id);
+            startStreamRecording(stream_id);
+        } else if (!should_record && is_recording) {
+            // 离开录制时间段，停止录制
+            LOG_INFO("Schedule: Stopping recording for stream {}", stream_id);
+            stopStreamRecording(stream_id);
+        }
+    }
+}
+
+void NVRManager::startStreamRecording(const std::string& stream_id) {
+    // 查找流配置
+    StreamConfig stream_config;
+    bool found = false;
+    for (const auto& stream : m_config.streams) {
+        if (stream.id == stream_id) {
+            stream_config = stream;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        LOG_ERROR("Schedule: Stream {} not found in config", stream_id);
+        return;
+    }
+
+    std::lock_guard<std::mutex> rec_lock(m_recorders_mutex);
+
+    auto it = m_recorders.find(stream_id);
+    if (it != m_recorders.end() && it->second) {
+        // 录制器已存在，检查状态
+        // 由于 IPCRecorder 没有 getStatus 方法，我们假设需要重新创建
+        it->second->stop();
+        m_recorders.erase(it);
+    }
+
+    // 创建新的录制器
+    auto recorder = std::make_unique<IPCRecorder>(
+        stream_config.id, stream_config.url,
+        m_config.record.output_dir,
+        m_config.record.temp_dir,
+        m_config.record.segment_duration_seconds,
+        m_config.record.filename_template,
+        m_config.record.enable_audio,
+        stream_config.auto_reconnect,
+        stream_config.reconnect_interval_seconds,
+        stream_config.max_reconnect_attempts,
+        stream_config.timeout_seconds,
+        m_config.shop.id,
+        stream_config.name);
+    recorder->start();
+
+    m_recorders[stream_id] = std::move(recorder);
+    LOG_INFO("Schedule: Started recording for stream {}", stream_id);
+}
+
+void NVRManager::stopStreamRecording(const std::string& stream_id) {
+    std::lock_guard<std::mutex> rec_lock(m_recorders_mutex);
+
+    auto it = m_recorders.find(stream_id);
+    if (it != m_recorders.end() && it->second) {
+        it->second->stop();
+        // 注意：保留录制器对象以便后续恢复，但需要释放 FFmpeg 资源
+        // 所以这里选择 erase 来完全清理
+        m_recorders.erase(it);
+        LOG_INFO("Schedule: Stopped recording for stream {}", stream_id);
+    }
 }

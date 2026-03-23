@@ -5,6 +5,24 @@
 #include <optional>
 #include <map>
 
+// 时间段配置（支持跨午夜）
+struct TimeRange {
+    int start_hour = 0;       // 开始小时 (0-23)
+    int start_minute = 0;     // 开始分钟 (0-59)
+    int end_hour = 0;         // 结束小时 (0-23)
+    int end_minute = 0;       // 结束分钟 (0-59)
+
+    // 检查指定时间是否在时间段内（支持跨午夜，如 22:00-02:00）
+    bool contains(int hour, int minute) const;
+};
+
+// 调度配置
+struct ScheduleConfig {
+    bool enabled = false;                      // 是否启用调度
+    int check_interval_seconds = 60;           // 调度检查间隔（秒）
+    std::vector<TimeRange> time_ranges;        // 录制时间段列表
+};
+
 struct StreamConfig {
     std::string id;
     std::string name;               // 流名称（可选，用于文件名显示）
@@ -50,6 +68,7 @@ struct RecordConfig {
     int segment_duration_seconds; // 录制分段时长（秒）
     std::string filename_template; // 文件名模板，支持变量: {stream_id}, {start_datetime}, {segment_index} 等
     bool enable_audio;            // 是否启用音频录制
+    ScheduleConfig schedule;      // 录制时间段配置
 };
 
 struct Config {

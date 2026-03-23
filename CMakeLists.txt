@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.27)
-project(NVR VERSION 1.1.6 LANGUAGES CXX)
+project(NVR VERSION 1.1.7 LANGUAGES CXX)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -18,6 +18,12 @@ find_package(httplib REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
 add_subdirectory(src)
+
+# IPC Scan 工具（可选）
+option(BUILD_IPC_SCAN_TOOL "Build ipc_scan ONVIF device scanner tool" OFF)
+if(EXISTS "${CMAKE_SOURCE_DIR}/tools/ipc_scan/CMakeLists.txt")
+  add_subdirectory(tools/ipc_scan)
+endif()
 
 # Project metadata for packaging
 set(PROJECT_DISPLAY_NAME "NVR Service")

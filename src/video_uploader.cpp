@@ -160,7 +160,7 @@ void VideoUploader::workerLoop(size_t thread_id) {
                 } else if (item.status == UploadStatus::Failed) {
                     auto now = std::chrono::system_clock::now();
                     auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - record.updated_at);
-                    if (duration.count() >= config_.retry_delay_seconds) {
+                    if (duration.count() >= config_.retry_delay_seconds * item.retry_count) {
                         found = true;
                         break;
                     }
@@ -179,6 +179,7 @@ void VideoUploader::workerLoop(size_t thread_id) {
             // fast fail
             if (!std::filesystem::exists(task.file_path)) {
                 LOG_WARN("upload task error: file not found - {}", task.file_path);
+                progress_manager_->cleanRecords();
                 continue;
             }
         }

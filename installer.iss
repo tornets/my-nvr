@@ -50,15 +50,8 @@ Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion; Attribs: readonly
 Name: "{app}\recordings"
 Name: "{app}\recordings\.temp"
 
-[Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{group}\Uninstall"; Filename: "{uninstallexe}"
-Name: "{group}\Service Manager"; Filename: "{app}\{#MyAppExeName}"; Parameters: "service"
-Name: "{group}\Config File"; Filename: "{app}\config.yaml.example"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
-
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Parameters: "service install -- --config """"{app}\config.yaml"""" "; StatusMsg: "Installing Windows Service..."
+Filename: "{app}\{#MyAppExeName}"; Parameters: "service install -- --config ""{app}\config.yaml"" "; StatusMsg: "Installing Windows Service..."
 
 [UninstallRun]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "service stop"; RunOnceId: "StopService"; StatusMsg: "Stopping service..."
@@ -95,11 +88,11 @@ begin
     RecordingsDir := ExpandConstant('{app}\recordings');
 
     if FileExists(ConfigFile) then
-      if MsgBox('Delete configuration file?', mbConfirmation, MB_YESNO) = IDYES then
+      if MsgBox('删除配置文件?', mbConfirmation, MB_YESNO) = IDYES then
         DeleteFile(ConfigFile);
 
     if DirExists(RecordingsDir) then
-      if MsgBox('Delete all recording files?', mbConfirmation, IDNO) = IDYES then
+      if MsgBox('删除录像文件?', mbConfirmation, IDNO) = IDYES then
         DelTree(RecordingsDir, True, True, True);
   end;
 end;

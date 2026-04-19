@@ -7,7 +7,8 @@ class CompressorRecipe(ConanFile):
     generators = "CMakeToolchain", "CMakeDeps"
 
     def requirements(self):
-        self.requires("ffmpeg/8.0.1")
+        if self.settings.os == "Windows":
+            self.requires("ffmpeg/8.0.1")
         self.requires("spdlog/1.15.1")
         self.requires("zlib/1.3.1")
         self.requires("yaml-cpp/0.8.0")
@@ -16,7 +17,6 @@ class CompressorRecipe(ConanFile):
         self.requires("nlohmann_json/3.11.3")
 
     def build_requirements(self):
-        self.tool_requires("gsoap/2.8.139")
         self.tool_requires("cmake/3.27.9")
 
     def build(self):

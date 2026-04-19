@@ -8,6 +8,13 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+
+// av_err2str 在 FFmpeg 新版本中返回临时数组，不能直接传给 fmt::format
+static std::string av_err_to_string(int errnum) {
+    char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
+    av_make_error_string(buf, sizeof(buf), errnum);
+    return buf;
+}
 #include <filesystem>
 #include <random>
 #include <algorithm>
@@ -68,7 +75,7 @@ std::atomic<uint64_t> IPCRecorder::m_global_sequence{1};
 std::mutex IPCRecorder::m_global_mutex;
 
 // 中断回调函数（用于超时检测）
-static int interrupt_callback(void* ctx) {
+int interrupt_callback(void* ctx) {
     IPCRecorder* recorder = static_cast<IPCRecorder*>(ctx);
     if (!recorder) {
         return 0;
@@ -313,7 +320,7 @@ bool IPCRecorder::connectAndRecord() {
             } else if (ret == AVERROR_EOF) {
                 LOG_WARN("End of stream (error count: {})", consecutive_errors);
             } else {
-                LOG_ERROR("Error reading frame: {} (error count: {})", av_err2str(ret), consecutive_errors);
+                LOG_ERROR("Error reading frame: {} (error count: {})", av_err_to_string(ret), consecutive_errors);
             }
 
             // 连续错误过多，认为连接已断开
@@ -558,7 +565,7 @@ bool IPCRecorder::openInput() {
         if (ret == AVERROR_EXIT) {
             LOG_ERROR("Cannot open input: timeout after {}s", m_timeout_seconds);
         } else {
-            LOG_ERROR("Cannot open input: {}", av_err2str(ret));
+            LOG_ERROR("Cannot open input: {}", av_err_to_string(ret));
         }
         m_input_ctx = nullptr;
         return false;
@@ -566,7 +573,7 @@ bool IPCRecorder::openInput() {
 
     ret = avformat_find_stream_info(m_input_ctx, nullptr);
     if (ret < 0) {
-        LOG_ERROR("Cannot find stream info: {}", av_err2str(ret));
+        LOG_ERROR("Cannot find stream info: {}", av_err_to_string(ret));
         avformat_close_input(&m_input_ctx);
         m_input_ctx = nullptr;
         return false;
@@ -586,7 +593,7 @@ bool IPCRecorder::openOutput(const std::string& filename) {
     // 动态创建输出上下文，使用解析的格式
     int ret = avformat_alloc_output_context2(&m_output_ctx, nullptr, m_output_format.c_str(), full_path.c_str());
     if (ret < 0) {
-        LOG_ERROR("Cannot create output context for format {}: {}", m_output_format, av_err2str(ret));
+        LOG_ERROR("Cannot create output context for format {}: {}", m_output_format, av_err_to_string(ret));
         return false;
     }
 
@@ -742,13 +749,13 @@ bool IPCRecorder::openOutput(const std::string& filename) {
 #endif
 
     if (ret < 0) {
-        LOG_ERROR("Cannot open output file: {}", av_err2str(ret));
+        LOG_ERROR("Cannot open output file: {}", av_err_to_string(ret));
         return false;
     }
 
     ret = avformat_write_header(m_output_ctx, nullptr);
     if (ret < 0) {
-        LOG_ERROR("Cannot write header: {}", av_err2str(ret));
+        LOG_ERROR("Cannot write header: {}", av_err_to_string(ret));
         return false;
     }
 
@@ -949,7 +956,7 @@ bool IPCRecorder::setupAudioTranscoding() {
         // 打开编码器
         int ret = avcodec_open2(m_audio_encoder_ctx, encoder, nullptr);
         if (ret < 0) {
-            LOG_WARN("Failed to open {} encoder: {}, trying next codec", codec_names[attempt], av_err2str(ret));
+            LOG_WARN("Failed to open {} encoder: {}, trying next codec", codec_names[attempt], av_err_to_string(ret));
             avcodec_free_context(&m_audio_encoder_ctx);
             m_audio_encoder_ctx = nullptr;
             continue;
@@ -984,14 +991,14 @@ bool IPCRecorder::setupAudioTranscoding() {
     // 复制解码器参数
     int ret = avcodec_parameters_to_context(m_audio_decoder_ctx, audio_par);
     if (ret < 0) {
-        LOG_ERROR("Failed to copy audio decoder parameters: {}", av_err2str(ret));
+        LOG_ERROR("Failed to copy audio decoder parameters: {}", av_err_to_string(ret));
         return false;
     }
 
     // 打开解码器
     ret = avcodec_open2(m_audio_decoder_ctx, decoder, nullptr);
     if (ret < 0) {
-        LOG_ERROR("Failed to open audio decoder: {}", av_err2str(ret));
+        LOG_ERROR("Failed to open audio decoder: {}", av_err_to_string(ret));
         return false;
     }
 
@@ -1049,7 +1056,7 @@ bool IPCRecorder::writePacket(AVPacket* packet) {
 
     int ret = av_interleaved_write_frame(m_output_ctx, packet);
     if (ret < 0) {
-        LOG_ERROR("Error writing packet: {}", av_err2str(ret));
+        LOG_ERROR("Error writing packet: {}", av_err_to_string(ret));
         return false;
     }
     return true;
@@ -1152,7 +1159,7 @@ bool IPCRecorder::encodeAndFlushAudioFrames() {
 
         int ret = av_frame_get_buffer(enc_frame, 0);
         if (ret < 0) {
-            LOG_ERROR("Failed to allocate encoder frame buffer: {}", av_err2str(ret));
+            LOG_ERROR("Failed to allocate encoder frame buffer: {}", av_err_to_string(ret));
             av_frame_free(&enc_frame);
             return false;
         }
@@ -1171,7 +1178,7 @@ bool IPCRecorder::encodeAndFlushAudioFrames() {
         av_frame_free(&enc_frame);  // 释放帧，编码器已经保留了一份拷贝
 
         if (ret < 0) {
-            LOG_ERROR("Error sending frame to audio encoder: {}", av_err2str(ret));
+            LOG_ERROR("Error sending frame to audio encoder: {}", av_err_to_string(ret));
             return false;
         }
 
@@ -1184,7 +1191,7 @@ bool IPCRecorder::encodeAndFlushAudioFrames() {
                 break;
             }
             if (ret < 0) {
-                LOG_ERROR("Error encoding audio frame: {}", av_err2str(ret));
+                LOG_ERROR("Error encoding audio frame: {}", av_err_to_string(ret));
                 av_packet_free(&encoded_packet);
                 break;
             }
@@ -1225,7 +1232,7 @@ bool IPCRecorder::decodeAndProcessAudioPackets(AVPacket* packet) {
             break;  // 没有更多帧了
         }
         if (ret < 0) {
-            LOG_ERROR("Error decoding audio frame: {}", av_err2str(ret));
+            LOG_ERROR("Error decoding audio frame: {}", av_err_to_string(ret));
             av_frame_free(&frame);
             return false;
         }
@@ -1290,7 +1297,7 @@ bool IPCRecorder::transcodeAudio(AVPacket* packet) {
     // 5. 发送包到解码器
     int ret = avcodec_send_packet(m_audio_decoder_ctx, packet);
     if (ret < 0) {
-        LOG_ERROR("Error sending audio packet to decoder: {}", av_err2str(ret));
+        LOG_ERROR("Error sending audio packet to decoder: {}", av_err_to_string(ret));
         return false;
     }
 

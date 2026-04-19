@@ -29,7 +29,7 @@ Imported Target
 include(FindPackageHandleStandardArgs)
 
 # Required FFmpeg components
-set(_ffmpeg_components avformat avcodec avutil swresample)
+set(_ffmpeg_components avformat avcodec avutil swresample swscale)
 
 find_package(PkgConfig)
 

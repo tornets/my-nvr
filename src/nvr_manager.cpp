@@ -72,6 +72,18 @@ bool NVRManager::addStreamWithConfig(const std::string& stream_id, const std::st
         return false;
     }
 
+    // 查找流的配置（包括智能录制配置）
+    const SmartRecordingConfig* smart_recording_config = nullptr;
+    for (const auto& stream : m_config.streams) {
+        if (stream.id == stream_id) {
+            if (stream.smart_recording.enabled) {
+                smart_recording_config = &stream.smart_recording;
+                LOG_INFO("Smart recording enabled for stream: {}", stream_id);
+            }
+            break;
+        }
+    }
+
     auto recorder = std::make_unique<IPCRecorder>(stream_id, stream_url,
                                                       m_config.record.output_dir,
                                                       m_config.record.temp_dir,
@@ -83,7 +95,11 @@ bool NVRManager::addStreamWithConfig(const std::string& stream_id, const std::st
                                                       max_reconnect_attempts,
                                                       timeout_seconds,
                                                       m_config.shop.id,
-                                                      stream_name);
+                                                      stream_name
+#ifdef ENABLE_RKNN_SMART_RECORDING
+                                                      , smart_recording_config
+#endif
+    );
 
     // 检查是否应该启动录制
     bool should_start = true;

@@ -4,6 +4,11 @@
 
 #include "log.h"
 #include "ipc_recorder.h"
+#include "config_loader.h"
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+#include "smart_recording_manager.h"
+#endif
 
 #include <chrono>
 #include <iomanip>
@@ -81,18 +86,22 @@ int interrupt_callback(void* ctx) {
         return 0;
     }
 
+    // 如果正在停止，立即中断所有 IO 操作
+    if (!recorder->m_running) {
+        return 1;
+    }
+
     auto now = std::chrono::steady_clock::now();
     auto last_read = std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(
         recorder->m_last_read_time.load()));
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_read).count();
 
-    // 如果超过超时时间，返回 1 中断操作
     int timeout_ms = recorder->m_timeout_seconds * 1000;
     if (elapsed > timeout_ms) {
-        return 1;  // 中断
+        return 1;
     }
 
-    return 0;  // 继续
+    return 0;
 }
 
 IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream_url,
@@ -105,7 +114,11 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
                          int max_reconnect_attempts,
                          int timeout_seconds,
                          int shop_id,
-                         const std::string& stream_name)
+                         const std::string& stream_name
+#ifdef ENABLE_RKNN_SMART_RECORDING
+                         , const SmartRecordingConfig* smart_recording_config
+#endif
+    )
     : m_stream_id(stream_id)
     , m_stream_name(stream_name.empty() ? stream_id : stream_name)
     , m_stream_url(stream_url)
@@ -144,6 +157,13 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
     , m_current_dts(0)
     , m_pts_offset(0)
 {
+#ifdef ENABLE_RKNN_SMART_RECORDING
+    m_smart_recording = nullptr;
+    m_smart_recording_enabled = false;
+    m_last_detection_pts = 0;
+    m_video_decoder_ctx = nullptr;
+    m_decoded_frame = nullptr;
+#endif
     m_logger = spdlog::get("recorder");
     if (!m_logger) {
         m_logger = spdlog::default_logger()->clone("recorder");
@@ -160,6 +180,24 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
 #else
     fs::create_directories(m_output_dir);
     fs::create_directories(m_temp_dir);
+#endif
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+    // 初始化智能录制
+    if (smart_recording_config && smart_recording_config->enabled) {
+        m_smart_recording_enabled = true;
+        m_smart_recording = std::make_unique<nvr::SmartRecordingManager>(
+            *smart_recording_config, m_stream_id);
+
+        if (m_smart_recording->initialize()) {
+            m_smart_recording->start();
+            LOG_INFO("Smart recording enabled for stream: {}", m_stream_id);
+        } else {
+            LOG_WARN("Failed to initialize smart recording for stream: {}", m_stream_id);
+            m_smart_recording_enabled = false;
+            m_smart_recording.reset();
+        }
+    }
 #endif
 }
 
@@ -180,9 +218,22 @@ void IPCRecorder::stop() {
         return;
     }
     m_running = false;
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+    // 先停止智能录制管理器（释放检测线程）
+    if (m_smart_recording) {
+        m_smart_recording->shutdown();
+    }
+#endif
+
     if (m_thread.joinable()) {
         m_thread.join();
     }
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+    closeHardwareDecoder();
+    m_smart_recording.reset();
+#endif
 
     if (m_output_ctx) {
         av_write_trailer(m_output_ctx);
@@ -250,6 +301,97 @@ void IPCRecorder::recordingLoop() {
     LOG_INFO("Recording loop ended: {} (reconnect count: {})", m_stream_url, m_reconnect_count.load());
 }
 
+#ifdef ENABLE_RKNN_SMART_RECORDING
+bool IPCRecorder::initHardwareDecoder() {
+    if (m_video_stream_idx < 0) return false;
+
+    AVStream* video_stream = m_input_ctx->streams[m_video_stream_idx];
+    AVCodecID codec_id = video_stream->codecpar->codec_id;
+
+    const char* decoder_name = nullptr;
+    if (codec_id == AV_CODEC_ID_H264) {
+        decoder_name = "h264_rkmpp";
+    } else if (codec_id == AV_CODEC_ID_H265 || codec_id == AV_CODEC_ID_HEVC) {
+        decoder_name = "hevc_rkmpp";
+    } else {
+        LOG_WARN("No rkmpp decoder for codec {}, smart recording disabled", avcodec_get_name(codec_id));
+        return false;
+    }
+
+    const AVCodec* decoder = avcodec_find_decoder_by_name(decoder_name);
+    if (!decoder) {
+        LOG_WARN("Decoder {} not found, smart recording disabled", decoder_name);
+        return false;
+    }
+
+    m_video_decoder_ctx = avcodec_alloc_context3(decoder);
+    if (!m_video_decoder_ctx) return false;
+
+    int ret = avcodec_parameters_to_context(m_video_decoder_ctx, video_stream->codecpar);
+    if (ret < 0) {
+        LOG_ERROR("Failed to copy decoder parameters: {}", av_err_to_string(ret));
+        avcodec_free_context(&m_video_decoder_ctx);
+        return false;
+    }
+
+    // 设置 get_format 回调，选择 DRM_PRIME 输出
+    m_video_decoder_ctx->get_format = [](AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts) -> AVPixelFormat {
+        for (const enum AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+            if (*p == AV_PIX_FMT_DRM_PRIME) return *p;
+        }
+        return AV_PIX_FMT_NONE;
+    };
+
+    ret = avcodec_open2(m_video_decoder_ctx, decoder, nullptr);
+    if (ret < 0) {
+        LOG_ERROR("Failed to open hardware decoder: {}", av_err_to_string(ret));
+        avcodec_free_context(&m_video_decoder_ctx);
+        return false;
+    }
+
+    m_decoded_frame = av_frame_alloc();
+    if (!m_decoded_frame) {
+        avcodec_free_context(&m_video_decoder_ctx);
+        return false;
+    }
+
+    LOG_INFO("Hardware decoder initialized: {} -> DRM_PRIME", decoder_name);
+    return true;
+}
+
+void IPCRecorder::closeHardwareDecoder() {
+    if (m_decoded_frame) {
+        av_frame_free(&m_decoded_frame);
+    }
+    if (m_video_decoder_ctx) {
+        avcodec_free_context(&m_video_decoder_ctx);
+    }
+}
+
+AVFrame* IPCRecorder::decodeVideoFrame(AVPacket* packet) {
+    if (!m_video_decoder_ctx) return nullptr;
+
+    int ret = avcodec_send_packet(m_video_decoder_ctx, packet);
+    if (ret < 0) {
+        LOG_DEBUG("hw decoder send_packet failed: {}", av_err_to_string(ret));
+        return nullptr;
+    }
+
+    ret = avcodec_receive_frame(m_video_decoder_ctx, m_decoded_frame);
+    if (ret < 0) {
+        return nullptr;
+    }
+
+    if (m_decoded_frame->format != AV_PIX_FMT_DRM_PRIME) {
+        LOG_DEBUG("Expected DRM_PRIME, got format {}", m_decoded_frame->format);
+        av_frame_unref(m_decoded_frame);
+        return nullptr;
+    }
+
+    return m_decoded_frame;
+}
+#endif
+
 bool IPCRecorder::connectAndRecord() {
     // 清理之前的连接
     if (m_input_ctx) {
@@ -285,6 +427,17 @@ bool IPCRecorder::connectAndRecord() {
     }
 
     LOG_INFO("Connection established, starting recording loop");
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+    // 初始化硬件解码器（用于检测）
+    if (m_smart_recording_enabled) {
+        if (initHardwareDecoder()) {
+            LOG_INFO("Hardware decoder ready for smart recording");
+        } else {
+            LOG_WARN("Hardware decoder init failed, detection will be limited");
+        }
+    }
+#endif
 
     AVPacket* packet = av_packet_alloc();
     auto last_activity_time = std::chrono::steady_clock::now();
@@ -352,28 +505,61 @@ bool IPCRecorder::connectAndRecord() {
 
         // 如果输出文件还未打开，必须等待关键帧
         // 这确保录制从完整画面开始，避免花屏
-        if (m_output_ctx == nullptr) {
-            if (!(packet->flags & AV_PKT_FLAG_KEY)) {
-                LOG_DEBUG("Waiting for key frame before starting recording...");
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+        // 智能录制门控模式
+        if (m_smart_recording_enabled && m_smart_recording) {
+            // 检查延迟停止（POST_RECORDING 超时）
+            if (m_output_ctx && m_smart_recording->shouldStopRecording()) {
+                LOG_INFO("Smart recording: post-recording delay expired, closing segment");
+                closeOutput();
+                m_smart_recording->clearCache();
+            }
+
+            // 不在录制中且门控未开启 → 跳过此包
+            if (!m_output_ctx && !m_smart_recording->shouldWritePacket()) {
+                // IDLE：缓存所有视频帧，仅关键帧触发检测
+                if (packet->stream_index == m_video_stream_idx) {
+                    bool is_key_frame = (packet->flags & AV_PKT_FLAG_KEY) != 0;
+                    AVFrame* decoded = nullptr;
+                    if (m_video_decoder_ctx && is_key_frame) {
+                        decoded = decodeVideoFrame(packet);
+                    }
+                    m_smart_recording->processVideoFrame(packet, decoded, packet->pts, packet->dts, is_key_frame);
+                    if (decoded) {
+                        av_frame_unref(m_decoded_frame);
+                    }
+                }
+                av_packet_unref(packet);
                 continue;
             }
-            LOG_INFO("Key frame received, starting new segment");
-        }
 
-        /*
-        if (m_output_ctx) {
-            auto ts = (double)av_rescale_q(packet->pts - m_segment_start_pts, m_output_ctx->streams[0]->time_base, AV_TIME_BASE_Q)/ AV_TIME_BASE;
-            if (ts > 10 && packet->flags & AV_PKT_FLAG_KEY) {
-                closeOutput();
+            // 门控刚开启（IDLE→RECORDING）且未打开输出 → 开始录制
+            if (!m_output_ctx && m_smart_recording->shouldWritePacket()) {
+                // 等待关键帧才开始新文件
+                if (!(packet->flags & AV_PKT_FLAG_KEY) || packet->stream_index != m_video_stream_idx) {
+                    av_packet_unref(packet);
+                    continue;
+                }
+                LOG_INFO("Smart recording: opening new file, player detected");
+                // 打开新文件（下面的 !m_output_ctx 块会处理）
+            }
+        } else
+#endif
+        {
+            // 常规模式：等待关键帧
+            if (m_output_ctx == nullptr) {
+                if (!(packet->flags & AV_PKT_FLAG_KEY)) {
+                    LOG_DEBUG("Waiting for key frame before starting recording...");
+                    continue;
+                }
+                LOG_INFO("Key frame received, starting new segment");
             }
 
-            //LOG_DEBUG("Writing packet: original_pts={}, original_dts={}, ts={}",
-            //                packet->pts, packet->dts, ts);
-        }
-        */
-
-        if (shouldSwitchSegment(packet)) {
-            closeOutput();
+            // 常规分段切换
+            if (shouldSwitchSegment(packet)) {
+                closeOutput();
+            }
         }
 
         if (packet->stream_index == m_video_stream_idx) {
@@ -422,11 +608,25 @@ bool IPCRecorder::connectAndRecord() {
                 }
                 LOG_INFO("Temp file opened successfully");
 
+#ifdef ENABLE_RKNN_SMART_RECORDING
+                // 设置智能录制管理器的输出上下文
+                if (m_smart_recording_enabled && m_smart_recording) {
+                    m_smart_recording->setOutputContext(m_output_ctx, 0);  // 视频流在输出的第一个位置
+                    m_smart_recording->setTimeBase(m_video_time_base);
+                }
+#endif
+
                 if (packet->pts > 0) {
                     m_segment_start_pts = packet->pts;
                     // 使用相同帧的 DTS 作为起始 DTS
                     m_segment_start_dts = packet->dts >= 0 ? packet->dts : packet->pts;
                     LOG_DEBUG("Segment start: pts={}, dts={}", m_segment_start_pts, m_segment_start_dts);
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+                    if (m_smart_recording_enabled && m_smart_recording) {
+                        m_smart_recording->setSegmentStartTime(m_segment_start_pts);
+                    }
+#endif
                 }
 
                 // 重置音频起始 PTS 和帧计数
@@ -471,6 +671,26 @@ bool IPCRecorder::connectAndRecord() {
             // 转换到输出流的时间基准
             av_packet_rescale_ts(packet, in_stream->time_base, out_stream->time_base);
             packet->stream_index = 0;  // 设置为输出视频流索引
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+            // 智能录制处理
+            if (m_smart_recording_enabled && m_smart_recording) {
+                bool is_key_frame = (packet->flags & AV_PKT_FLAG_KEY) != 0;
+
+                // 关键帧时触发硬件解码 + 检测
+                if (is_key_frame && m_video_decoder_ctx) {
+                    AVFrame* decoded = decodeVideoFrame(packet);
+                    if (decoded) {
+                        m_smart_recording->processVideoFrame(packet, decoded, packet->pts, packet->dts, is_key_frame);
+                        av_frame_unref(m_decoded_frame);
+                    } else {
+                        m_smart_recording->processVideoFrame(packet, nullptr, packet->pts, packet->dts, is_key_frame);
+                    }
+                } else {
+                    m_smart_recording->processVideoFrame(packet, nullptr, packet->pts, packet->dts, is_key_frame);
+                }
+            }
+#endif
 
             writePacket(packet);
         } else if (packet->stream_index == m_audio_stream_idx && m_output_ctx) {
@@ -517,6 +737,10 @@ bool IPCRecorder::connectAndRecord() {
 
     av_packet_free(&packet);
     closeOutput();
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+    closeHardwareDecoder();
+#endif
 
     LOG_INFO("Recording stopped: {}", m_stream_url);
     return true;  // 正常结束

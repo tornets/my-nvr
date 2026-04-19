@@ -173,6 +173,52 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
                         }
                     }
 
+                    // 解析智能录制配置
+                    if (stream["smart_recording"]) {
+                        const auto& sr = stream["smart_recording"];
+                        if (sr["enabled"]) {
+                            stream_config.smart_recording.enabled = sr["enabled"].as<bool>();
+                        }
+                        if (sr["prebuffer_duration_seconds"]) {
+                            stream_config.smart_recording.prebuffer_duration_seconds = sr["prebuffer_duration_seconds"].as<int>();
+                        }
+                        if (sr["segment_duration_seconds"]) {
+                            stream_config.smart_recording.segment_duration_seconds = sr["segment_duration_seconds"].as<int>();
+                        }
+                        if (sr["min_recording_duration"]) {
+                            stream_config.smart_recording.min_recording_duration = sr["min_recording_duration"].as<int>();
+                        }
+                        if (sr["post_recording_delay_seconds"]) {
+                            stream_config.smart_recording.post_recording_delay_seconds = sr["post_recording_delay_seconds"].as<int>();
+                        }
+
+                        // 解析 RKNN 配置
+                        if (sr["rknn"]) {
+                            const auto& rknn = sr["rknn"];
+                            if (rknn["enabled"]) {
+                                stream_config.smart_recording.rknn.enabled = rknn["enabled"].as<bool>();
+                            }
+                            if (rknn["model_path"]) {
+                                stream_config.smart_recording.rknn.model_path = rknn["model_path"].as<std::string>();
+                            }
+                            if (rknn["detection_interval_keyframes"]) {
+                                stream_config.smart_recording.rknn.detection_interval_keyframes = rknn["detection_interval_keyframes"].as<int>();
+                            }
+                            if (rknn["player_class_id"]) {
+                                stream_config.smart_recording.rknn.player_class_id = rknn["player_class_id"].as<int>();
+                            }
+                            if (rknn["npc_class_id"]) {
+                                stream_config.smart_recording.rknn.npc_class_id = rknn["npc_class_id"].as<int>();
+                            }
+                            if (rknn["confidence_threshold"]) {
+                                stream_config.smart_recording.rknn.confidence_threshold = rknn["confidence_threshold"].as<float>();
+                            }
+                            if (rknn["zero_copy_enabled"]) {
+                                stream_config.smart_recording.rknn.zero_copy_enabled = rknn["zero_copy_enabled"].as<bool>();
+                            }
+                        }
+                    }
+
                     config.streams.push_back(stream_config);
                 }
             }

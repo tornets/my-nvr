@@ -13,6 +13,10 @@
 
 #include <spdlog/spdlog.h>
 
+#ifdef ENABLE_RKNN_SMART_RECORDING
+#include "config_loader.h"
+#endif
+
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -23,6 +27,12 @@ extern "C" {
 
 // 前向声明
 class IPCRecorder;
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+namespace nvr {
+class SmartRecordingManager;
+}
+#endif
 
 // 中断回调函数（用于超时检测）
 int interrupt_callback(void* ctx);
@@ -41,7 +51,11 @@ public:
                 int max_reconnect_attempts = -1,
                 int timeout_seconds = 30,
                 int shop_id = 0,
-                const std::string& stream_name = "");
+                const std::string& stream_name = ""
+#ifdef ENABLE_RKNN_SMART_RECORDING
+                , const SmartRecordingConfig* smart_recording_config = nullptr
+#endif
+    );
     ~IPCRecorder();
 
     void start();
@@ -151,6 +165,21 @@ private:
     // 全局计数器
     static std::atomic<uint64_t> m_global_sequence;      // 全局序列号
     static std::mutex m_global_mutex;
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+    // 智能录制管理器
+    std::unique_ptr<nvr::SmartRecordingManager> m_smart_recording;
+    bool m_smart_recording_enabled;                     // 是否启用智能录制
+    int64_t m_last_detection_pts;                       // 上次检测的 PTS
+
+    // 硬件解码器（仅用于检测，不影响 stream copy 录制）
+    AVCodecContext* m_video_decoder_ctx;
+    AVFrame* m_decoded_frame;
+
+    bool initHardwareDecoder();
+    void closeHardwareDecoder();
+    AVFrame* decodeVideoFrame(AVPacket* packet);
+#endif
 
     std::shared_ptr<spdlog::logger> m_logger;
 };

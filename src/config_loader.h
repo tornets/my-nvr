@@ -23,6 +23,27 @@ struct ScheduleConfig {
     std::vector<TimeRange> time_ranges;        // 录制时间段列表
 };
 
+// RKNN 检测配置
+struct RKNNConfig {
+    bool enabled = false;                      // 是否启用 RKNN 检测
+    std::string model_path = "";               // RKNN 模型路径
+    int detection_interval_keyframes = 30;     // 检测间隔（关键帧数）
+    int player_class_id = 0;                   // 玩家类别 ID
+    int npc_class_id = 1;                      // NPC 类别 ID
+    float confidence_threshold = 0.5f;         // 置信度阈值
+    bool zero_copy_enabled = true;             // 零拷贝开关
+};
+
+// 智能录制配置
+struct SmartRecordingConfig {
+    bool enabled = false;                      // 是否启用智能录制
+    int prebuffer_duration_seconds = 5;        // 预缓存时长（秒）
+    int segment_duration_seconds = 60;         // 分段时长（秒）
+    int min_recording_duration = 10;           // 最小录制时长（秒）
+    int post_recording_delay_seconds = 5;      // 玩家消失后延迟停止秒数
+    RKNNConfig rknn;                           // RKNN 检测配置
+};
+
 struct StreamConfig {
     std::string id;
     std::string name;               // 流名称（可选，用于文件名显示）
@@ -32,6 +53,7 @@ struct StreamConfig {
     int reconnect_interval_seconds; // 重连间隔（秒）
     int max_reconnect_attempts;     // 最大重连尝试次数（-1表示无限重连）
     int timeout_seconds;            // 流超时时间（秒），无数据超过此时长视为离线
+    SmartRecordingConfig smart_recording;  // 智能录制配置
 };
 
 struct AutoCleanConfig {

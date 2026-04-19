@@ -17,7 +17,7 @@ class CompressorRecipe(ConanFile):
         self.requires("nlohmann_json/3.11.3")
 
     def build_requirements(self):
-        self.tool_requires("cmake/3.27.9")
+        self.tool_requires("cmake/[>=3.12]")
 
     def build(self):
         cmake = CMake(self)

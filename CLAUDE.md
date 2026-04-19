@@ -4,43 +4,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-MyNVR 是一个用 C++17 编写的 Windows 网络视频录制服务，可以从 RTSP 摄像头录制视频流并自动上传到服务器。它作为 Windows 后台服务运行，支持多个同时连接的摄像头。
+MyNVR 是一个用 C++17 编写的跨平台网络视频录制服务，可以从 RTSP 摄像头录制视频流并自动上传到服务器。支持多个同时连接的摄像头。
 
-## 构建命令
+## 技术栈
+- 视频拉流: ffmpeg
+- 依赖管理: conan
 
-```cmd
-# Debug 构建
-build.bat debug
+## 常用命令
 
-# Release 构建
-build.bat release
-
-# 构建安装程序（支持 WiX 4.x 和 Inno Setup 6.x）
-build_installer.bat          # 默认：WiX
-build_installer.bat --wix
-build_installer.bat --innosetup
-build_installer.bat --skip-build    # 跳过构建，仅创建安装程序
-
-# 输出位置：
-# - 可执行文件：build\src\Debug\nvr.exe 或 build\src\Release\nvr.exe
-# - 安装程序（WiX）：build\*.msi
-# - 安装程序（Inno）：installer_output\nvr-service-setup-1.0.0.exe
 ```
+# 构建
+conan build . -of=build -s build_type=Debug -s compiler.cppstd=17 --build=missing
 
-**前置要求：**
-- Visual Studio 2022 (17.x)
-- CMake 3.27+
-- Conan 包管理器
-- WiX Toolset 4.x 或 Inno Setup 6.x（用于安装程序）
+# 运行 
+build\src\nvr --config config.yaml
+```
 
 ## 开发工作流
 
-**控制台模式（用于调试）：**
-```cmd
-build\src\Debug\nvr.exe --config config.yaml
-```
-
-**服务模式：**
+**Windows 服务模式：**
 ```cmd
 nvr.exe service install -- --config config.yaml
 nvr.exe service start

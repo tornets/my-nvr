@@ -871,7 +871,7 @@ bool IPCRecorder::setupAudioTranscoding() {
 
     LOG_INFO("Found audio stream: codec={}, sample_rate={}, channels={}",
                    avcodec_get_name(audio_par->codec_id), audio_par->sample_rate,
-                   audio_par->ch_layout.nb_channels);
+                   audio_par->channels);
 
     // 检查是否需要转码（已在 openOutput 中检查）
     // 这里直接获取目标编码器并设置转码
@@ -918,14 +918,16 @@ bool IPCRecorder::setupAudioTranscoding() {
 
         // 设置编码器参数
         m_audio_encoder_ctx->sample_rate = audio_par->sample_rate > 0 ? audio_par->sample_rate : 44100;
-        m_audio_encoder_ctx->ch_layout = audio_par->ch_layout;
-        if (m_audio_encoder_ctx->ch_layout.nb_channels == 0) {
-            av_channel_layout_default(&m_audio_encoder_ctx->ch_layout, 2);
+        m_audio_encoder_ctx->channel_layout = audio_par->channel_layout;
+        m_audio_encoder_ctx->channels = audio_par->channels;
+        if (m_audio_encoder_ctx->channels == 0) {
+            m_audio_encoder_ctx->channels = 2;
+            m_audio_encoder_ctx->channel_layout = av_get_default_channel_layout(2);
         }
         m_audio_encoder_ctx->sample_fmt = encoder->sample_fmts ? encoder->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
 
         // 设置比特率（根据采样率和通道数调整）
-        int channels = m_audio_encoder_ctx->ch_layout.nb_channels;
+        int channels = m_audio_encoder_ctx->channels;
         if (try_codec == AV_CODEC_ID_AAC) {
             // AAC: 根据采样率和通道数设置合理的比特率
             // 8000 Hz: 32-64 kbps per channel
@@ -1072,11 +1074,11 @@ bool IPCRecorder::initAudioResampleAndFifo() {
     }
 
     // 初始化重采样器
-    int ret = swr_alloc_set_opts2(&m_swr_ctx,
-                                  &m_audio_encoder_ctx->ch_layout,
+    m_swr_ctx = swr_alloc_set_opts(m_swr_ctx,
+                                  m_audio_encoder_ctx->channel_layout,
                                   m_audio_encoder_ctx->sample_fmt,
                                   m_audio_encoder_ctx->sample_rate,
-                                  &m_audio_decoder_ctx->ch_layout,
+                                  m_audio_decoder_ctx->channel_layout,
                                   m_audio_decoder_ctx->sample_fmt,
                                   m_audio_decoder_ctx->sample_rate,
                                   0, nullptr);
@@ -1088,7 +1090,7 @@ bool IPCRecorder::initAudioResampleAndFifo() {
 
     // 创建 FIFO 缓冲区
     m_audio_fifo = av_audio_fifo_alloc(m_audio_encoder_ctx->sample_fmt,
-                                      m_audio_encoder_ctx->ch_layout.nb_channels,
+                                      m_audio_encoder_ctx->channels,
                                       1);
     if (!m_audio_fifo) {
         LOG_ERROR("Failed to allocate audio FIFO");
@@ -1103,7 +1105,7 @@ bool IPCRecorder::resampleAndStoreAudioFrame(AVFrame* frame) {
     // 分配重采样后的数据缓冲区
     uint8_t** converted_data = nullptr;
     int aligned_samples = av_samples_alloc_array_and_samples(&converted_data, nullptr,
-                                                             m_audio_encoder_ctx->ch_layout.nb_channels,
+                                                             m_audio_encoder_ctx->channels,
                                                              frame->nb_samples,
                                                              m_audio_encoder_ctx->sample_fmt,
                                                              0);
@@ -1153,7 +1155,8 @@ bool IPCRecorder::encodeAndFlushAudioFrames() {
     while (av_audio_fifo_size(m_audio_fifo) >= m_audio_encoder_ctx->frame_size) {
         AVFrame* enc_frame = av_frame_alloc();
         enc_frame->nb_samples = m_audio_encoder_ctx->frame_size;
-        enc_frame->ch_layout = m_audio_encoder_ctx->ch_layout;
+        enc_frame->channel_layout = m_audio_encoder_ctx->channel_layout;
+        enc_frame->channels = m_audio_encoder_ctx->channels;
         enc_frame->format = m_audio_encoder_ctx->sample_fmt;
         enc_frame->sample_rate = m_audio_encoder_ctx->sample_rate;
 

@@ -8,7 +8,7 @@ class CompressorRecipe(ConanFile):
 
     def requirements(self):
         if self.settings.os == "Windows":
-            self.requires("ffmpeg/8.0.1")
+            self.requires("ffmpeg/4.4.6")
         self.requires("spdlog/1.15.1")
         self.requires("zlib/1.3.1")
         self.requires("yaml-cpp/0.8.0")

@@ -23,7 +23,7 @@ namespace nvr::detection {
 class DMABufferWrapper {
 public:
     DMABufferWrapper();
-    explicit DMABufferWrapper(int fd, size_t size, int width, int height, int format, int stride = 0);
+    explicit DMABufferWrapper(int fd, size_t size, int width, int height, int format, int stride = 0, int height_stride = 0);
     ~DMABufferWrapper();
 
     // 禁止拷贝

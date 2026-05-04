@@ -16,9 +16,11 @@ namespace nvr {
 
 SmartRecordingManager::SmartRecordingManager(
     const SmartRecordingConfig& config,
-    const std::string& stream_id)
+    const std::string& stream_id,
+    detection::DetectionPool& detection_pool)
     : config_(config)
     , stream_id_(stream_id)
+    , detection_pool_(detection_pool)
     , initialized_(false)
     , running_(false)
     , current_state_(SmartRecordingState::IDLE)
@@ -59,25 +61,6 @@ bool SmartRecordingManager::initialize() {
     if (!config_.rknn.enabled) {
         logger_->warn("RKNN detection disabled, smart recording will not work properly");
         return false;
-    }
-
-    // 创建 RKNN 检测器
-    detection::DetectionConfig det_config;
-    det_config.model_path = config_.rknn.model_path;
-    det_config.player_class_id = config_.rknn.player_class_id;
-    det_config.npc_class_id = config_.rknn.npc_class_id;
-    det_config.confidence_threshold = config_.rknn.confidence_threshold;
-    det_config.detection_interval_keyframes = config_.rknn.detection_interval_keyframes;
-    det_config.zero_copy_enabled = config_.rknn.zero_copy_enabled;
-    rknn_detector_ = std::make_unique<detection::RKNNDetector>(det_config);
-    if (!rknn_detector_->initialize()) {
-        logger_->error("Failed to initialize RKNN detector for stream: {}", stream_id_);
-        return false;
-    }
-
-    // 预热模型
-    if (!rknn_detector_->warmup()) {
-        logger_->warn("RKNN detector warmup failed for stream: {}", stream_id_);
     }
 
     // 创建帧缓冲区
@@ -129,7 +112,6 @@ void SmartRecordingManager::shutdown() {
     }
 
     // 清理资源
-    rknn_detector_.reset();
     frame_buffer_.reset();
     detection_cache_.reset();
     segment_decision_.reset();
@@ -272,42 +254,37 @@ void SmartRecordingManager::detectionWorkerThread() {
         }
 
         // 执行检测
-        if (!task.frame || !rknn_detector_) {
+        if (!task.frame) {
             continue;
         }
 
-        detection::DetectionResult result;
-        bool success = false;
+#if DUMP_DECTECT_IMAGE
+        int frame_idx = debug_decode_frame_index_++;
+        saveDecodedFrame(task.frame, frame_idx);
+#endif
 
-        if (task.frame->format == AV_PIX_FMT_DRM_PRIME) {
-            // DRM_PRIME 帧：只能用零拷贝路径
-            auto wrapper = detection::DMABufferExtractor::extractFromAVFrame(task.frame);
-            if (wrapper && wrapper->isValid()) {
-                success = rknn_detector_->detectFrameZeroCopy(wrapper->getInfo(), result);
-            }
-            if (!success) {
-                logger_->warn("Zero-copy detection failed for DRM_PRIME frame");
-            }
+        // 提交到 NPU 推理池（同步等待结果）
+        auto pool_result = detection_pool_.detect(task.frame);
+
+        if (pool_result.success) {
+            detection_count_++;
+            const auto& result = pool_result.detection;
+            logger_->debug("[{}] Detection #{}: {} boxes, has_player={}, player_conf={:.2f}, time={:.1f}ms",
+                           stream_id_, detection_count_.load(), result.boxes.size(),
+                           result.has_player, result.player_confidence,
+                           result.processing_time_ms);
+            handleDetectionResult(result);
+#if DUMP_DECTECT_IMAGE
+            saveDetectionImage(pool_result, frame_idx);
+#endif
         } else {
-            // 非 DRM_PRIME 帧：CPU 路径
-            success = rknn_detector_->detectFrame(task.frame, result);
+            logger_->warn("Detection failed for frame pts={}", task.pts);
         }
 
         // 释放帧
         if (task.frame) {
             av_frame_free(&task.frame);
         }  // clone 的帧需要 av_frame_free
-
-        if (success) {
-            detection_count_++;
-            logger_->debug("Detection #{}: {} boxes, has_player={}, player_conf={:.2f}, time={:.1f}ms",
-                           detection_count_.load(), result.boxes.size(),
-                           result.has_player, result.player_confidence,
-                           result.processing_time_ms);
-            handleDetectionResult(result);
-        } else {
-            logger_->warn("Detection failed for frame pts={}", task.pts);
-        }
     }
 
     logger_->debug("Detection worker thread stopped for stream: {}", stream_id_);
@@ -487,16 +464,10 @@ void SmartRecordingManager::setTimeBase(AVRational time_base) {
 }
 
 DetectionStats SmartRecordingManager::getDetectionStats() const {
-    if (rknn_detector_) {
-        return rknn_detector_->getStats();
-    }
     return DetectionStats();
 }
 
 void SmartRecordingManager::resetDetectionStats() {
-    if (rknn_detector_) {
-        rknn_detector_->resetStats();
-    }
     keyframe_count_ = 0;
     detection_count_ = 0;
     player_detected_count_ = 0;
@@ -545,3 +516,395 @@ void SmartRecordingManager::cleanupOldDetections() {
 }
 
 } // namespace nvr
+
+// ============================================================================
+// DUMP_DECTECT_IMAGE 调试图像导出
+// ============================================================================
+#if DUMP_DECTECT_IMAGE
+
+#include <filesystem>
+#include <iomanip>
+#include <sstream>
+#include <ctime>
+#include <cstdio>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+#include <libavutil/hwcontext.h>
+}
+
+namespace {
+
+// 5×7 位图字体（每个字符 7 字节，每字节低 5 位为一行）
+struct Glyph5x7 { char ch; uint8_t rows[7]; };
+
+static const Glyph5x7 FONT[] = {
+    {'0',{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}},
+    {'1',{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}},
+    {'2',{0x0E,0x11,0x01,0x06,0x08,0x10,0x1F}},
+    {'3',{0x0E,0x11,0x01,0x06,0x01,0x11,0x0E}},
+    {'4',{0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}},
+    {'5',{0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}},
+    {'6',{0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}},
+    {'7',{0x1F,0x01,0x02,0x04,0x08,0x08,0x08}},
+    {'8',{0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}},
+    {'9',{0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}},
+    {'.',{0x00,0x00,0x00,0x00,0x00,0x06,0x06}},
+    {':',{0x00,0x00,0x06,0x00,0x06,0x00,0x00}},
+    {'-',{0x00,0x00,0x00,0x1F,0x1F,0x00,0x00}},
+    {'P',{0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}},
+    {'N',{0x11,0x19,0x15,0x13,0x11,0x11,0x11}},
+    {'C',{0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}},
+    {'a',{0x00,0x00,0x0E,0x01,0x0F,0x11,0x0F}},
+    {'e',{0x00,0x00,0x0E,0x11,0x1E,0x10,0x0E}},
+    {'l',{0x08,0x08,0x08,0x08,0x08,0x08,0x08}},
+    {'r',{0x00,0x00,0x0E,0x11,0x1E,0x10,0x10}},
+    {'y',{0x00,0x00,0x11,0x11,0x0F,0x01,0x0E}},
+    {' ',{0x00,0x00,0x00,0x00,0x00,0x00,0x00}},
+};
+
+const Glyph5x7* findGlyph(char c) {
+    for (const auto& g : FONT) {
+        if (g.ch == c) return &g;
+    }
+    return nullptr;
+}
+
+// 以 scale 倍率绘制文字（scale=2 即 10×14 像素/字符）
+void drawText(std::vector<uint8_t>& rgb, int img_w, int img_h,
+              const std::string& text, int x, int y, int scale,
+              uint8_t r, uint8_t g, uint8_t b) {
+    int cx = x;
+    for (char c : text) {
+        const Glyph5x7* gl = findGlyph(c);
+        if (!gl) { cx += (6 * scale); continue; }
+        for (int row = 0; row < 7; row++) {
+            for (int col = 0; col < 5; col++) {
+                if (gl->rows[row] & (0x10 >> col)) {
+                    for (int sy = 0; sy < scale; sy++) {
+                        for (int sx = 0; sx < scale; sx++) {
+                            int px = cx + col * scale + sx;
+                            int py = y + row * scale + sy;
+                            if (px >= 0 && px < img_w && py >= 0 && py < img_h) {
+                                int idx = (py * img_w + px) * 3;
+                                rgb[idx] = r;
+                                rgb[idx+1] = g;
+                                rgb[idx+2] = b;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cx += 6 * scale;
+    }
+}
+
+// 测量文字像素宽度
+int measureText(const std::string& text, int scale) {
+    return static_cast<int>(text.size()) * 6 * scale;
+}
+
+void drawRect(std::vector<uint8_t>& rgb, int img_w, int img_h,
+              int rx, int ry, int rw, int rh, int thickness,
+              uint8_t r, uint8_t g, uint8_t b) {
+    for (int t = 0; t < thickness; t++) {
+        // 上边
+        for (int x = rx; x < rx + rw && x < img_w; x++) {
+            int py = ry + t;
+            if (py >= 0 && py < img_h && x >= 0) {
+                int idx = (py * img_w + x) * 3;
+                rgb[idx] = r; rgb[idx+1] = g; rgb[idx+2] = b;
+            }
+        }
+        // 下边
+        for (int x = rx; x < rx + rw && x < img_w; x++) {
+            int py = ry + rh - 1 - t;
+            if (py >= 0 && py < img_h && x >= 0) {
+                int idx = (py * img_w + x) * 3;
+                rgb[idx] = r; rgb[idx+1] = g; rgb[idx+2] = b;
+            }
+        }
+        // 左边
+        for (int y = ry; y < ry + rh && y < img_h; y++) {
+            int px = rx + t;
+            if (px >= 0 && px < img_w && y >= 0) {
+                int idx = (y * img_w + px) * 3;
+                rgb[idx] = r; rgb[idx+1] = g; rgb[idx+2] = b;
+            }
+        }
+        // 右边
+        for (int y = ry; y < ry + rh && y < img_h; y++) {
+            int px = rx + rw - 1 - t;
+            if (px >= 0 && px < img_w && y >= 0) {
+                int idx = (y * img_w + px) * 3;
+                rgb[idx] = r; rgb[idx+1] = g; rgb[idx+2] = b;
+            }
+        }
+    }
+}
+
+// 填充矩形
+void fillRect(std::vector<uint8_t>& rgb, int img_w, int img_h,
+              int rx, int ry, int rw, int rh,
+              uint8_t r, uint8_t g, uint8_t b) {
+    for (int y = ry; y < ry + rh && y < img_h; y++) {
+        if (y < 0) continue;
+        for (int x = rx; x < rx + rw && x < img_w; x++) {
+            if (x < 0) continue;
+            int idx = (y * img_w + x) * 3;
+            rgb[idx] = r; rgb[idx+1] = g; rgb[idx+2] = b;
+        }
+    }
+}
+
+bool saveJpeg(const std::string& path, const uint8_t* rgb_data, int width, int height) {
+    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+    if (!codec) return false;
+
+    AVCodecContext* ctx = avcodec_alloc_context3(codec);
+    ctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
+    ctx->width = width;
+    ctx->height = height;
+    ctx->time_base = {1, 25};
+    ctx->qmin = 2;
+    ctx->qmax = 10;
+    if (avcodec_open2(ctx, codec, nullptr) < 0) {
+        avcodec_free_context(&ctx);
+        return false;
+    }
+
+    SwsContext* sws = sws_getContext(width, height, AV_PIX_FMT_RGB24,
+                                      width, height, AV_PIX_FMT_YUVJ420P,
+                                      SWS_FULL_CHR_H_INP, nullptr, nullptr, nullptr);
+    if (!sws) {
+        avcodec_free_context(&ctx);
+        return false;
+    }
+
+    AVFrame* frame = av_frame_alloc();
+    frame->format = AV_PIX_FMT_YUVJ420P;
+    frame->width = width;
+    frame->height = height;
+    av_frame_get_buffer(frame, 0);
+
+    const uint8_t* src_data[1] = { rgb_data };
+    int src_stride[1] = { width * 3 };
+    sws_scale(sws, src_data, src_stride, 0, height, frame->data, frame->linesize);
+
+    avcodec_send_frame(ctx, frame);
+
+    bool ok = false;
+    AVPacket* pkt = av_packet_alloc();
+    if (avcodec_receive_packet(ctx, pkt) >= 0) {
+        FILE* f = fopen(path.c_str(), "wb");
+        if (f) {
+            fwrite(pkt->data, 1, pkt->size, f);
+            fclose(f);
+            ok = true;
+        }
+        av_packet_unref(pkt);
+    }
+
+    av_packet_free(&pkt);
+    av_frame_free(&frame);
+    sws_freeContext(sws);
+    avcodec_free_context(&ctx);
+    return ok;
+}
+
+} // anonymous namespace
+
+namespace nvr {
+
+// 调试图像旋转校正（逆时针度数）
+// 当摄像头传感器旋转导致调试图像方向不对时设置
+// 0=不旋转，90=逆时针90度（修正顺时针90度的摄像头）
+// 对方形图像（640x640）旋转不改变尺寸
+constexpr int kDebugImageRotation = 0;  // RGA 修复后不再需要旋转补偿
+
+// 逆时针旋转 RGB 图像 90 度：pixel(x,y) → pixel(y, W-1-x)
+void rotateCCW90(const std::vector<uint8_t>& src, std::vector<uint8_t>& dst, int w, int h) {
+    dst.resize(src.size());
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            int nx = y;
+            int ny = w - 1 - x;
+            int si = (y * w + x) * 3;
+            int di = (ny * w + nx) * 3;
+            dst[di]     = src[si];
+            dst[di + 1] = src[si + 1];
+            dst[di + 2] = src[si + 2];
+        }
+    }
+}
+
+} // anonymous namespace
+
+namespace nvr {
+
+void SmartRecordingManager::saveDetectionImage(const detection::PoolDetectionResult& pool_result, int detect_count) {
+    if (debug_output_dir_.empty()) return;
+
+    const auto& rgb_src = pool_result.debug_rgb;
+    int w = pool_result.debug_w;
+    int h = pool_result.debug_h;
+    if (rgb_src.empty() || w <= 0 || h <= 0) return;
+
+    // 先旋转 RGB 数据（如果需要）
+    std::vector<uint8_t> img;
+    bool rotated = (kDebugImageRotation == 90 || kDebugImageRotation == 270);
+    if (kDebugImageRotation == 90) {
+        rotateCCW90(rgb_src, img, w, h);
+    } else {
+        img = rgb_src;
+    }
+
+    const int font_scale = 2;          // 字体缩放 2x（10×14 px/字符）
+    const int box_thickness = 3;       // 框线粗细
+    const int label_pad = 2;           // 标签内边距
+
+    // 画图例（左上角）
+    {
+        const int legend_x = 4;
+        int legend_y = 4;
+        const int legend_font_scale = 2;
+        const int box_size = 10;
+
+        // Player 图例（绿色方块 + 文字）
+        fillRect(img, w, h, legend_x, legend_y, box_size, box_size, 0, 255, 0);
+        drawRect(img, w, h, legend_x, legend_y, box_size, box_size, 1, 200, 200, 200);
+        drawText(img, w, h, " Player", legend_x + box_size + 2, legend_y + 1, legend_font_scale, 255, 255, 255);
+
+        // NPC 图例（红色方块 + 文字）
+        int npc_y = legend_y + box_size + 4 + 2;
+        fillRect(img, w, h, legend_x, npc_y, box_size, box_size, 255, 0, 0);
+        drawRect(img, w, h, legend_x, npc_y, box_size, box_size, 1, 200, 200, 200);
+        drawText(img, w, h, " NPC", legend_x + box_size + 2, npc_y + 1, legend_font_scale, 255, 255, 255);
+    }
+
+    // 画 box 和 label（坐标需要随旋转变换）
+    for (const auto& box : pool_result.detection.boxes) {
+        int bx = static_cast<int>(box.x);
+        int by = static_cast<int>(box.y);
+        int bw = static_cast<int>(box.width);
+        int bh = static_cast<int>(box.height);
+
+        // 旋转坐标：逆时针90度 (bx,by,bw,bh) → (by, W-1-bx-bw, bh, bw)
+        if (kDebugImageRotation == 90) {
+            int new_bx = by;
+            int new_by = w - 1 - bx - bw;
+            int new_bw = bh;
+            int new_bh = bw;
+            bx = new_bx; by = new_by; bw = new_bw; bh = new_bh;
+        }
+
+        bool is_player = (box.class_id == config_.rknn.player_class_id);
+        bool is_npc = (box.class_id == config_.rknn.npc_class_id);
+        if (!is_player && !is_npc) continue;
+
+        uint8_t cr = is_player ? 0 : 255;
+        uint8_t cg = is_player ? 255 : 0;
+        uint8_t cb = 0;
+
+        drawRect(img, w, h, bx, by, bw, bh, box_thickness, cr, cg, cb);
+
+        // label: "P:0.57" 或 "N:0.42"
+        char label[16];
+        snprintf(label, sizeof(label), "%c:%.2f", is_player ? 'P' : 'N', box.confidence);
+
+        int label_w = measureText(label, font_scale) + label_pad * 2;
+        int label_h = 7 * font_scale + label_pad * 2;
+        int label_y = by - label_h - 2;
+        if (label_y < 0) label_y = by + bh + 2;
+
+        fillRect(img, w, h, bx, label_y, label_w, label_h, 0, 0, 0);
+        drawText(img, w, h, label, bx + label_pad, label_y + label_pad, font_scale, cr, cg, cb);
+    }
+
+    // 构造输出路径: {output_dir}/debug/detect/{date}/{stream_id}_{count}_{player}P_{npc}N.jpg
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_t = std::chrono::system_clock::to_time_t(now);
+    std::tm* tm = std::localtime(&now_t);
+    char date_str[16];
+    std::strftime(date_str, sizeof(date_str), "%Y%m%d", tm);
+
+    int player_count = 0, npc_count = 0;
+    for (const auto& box : pool_result.detection.boxes) {
+        if (box.class_id == config_.rknn.player_class_id) player_count++;
+        else if (box.class_id == config_.rknn.npc_class_id) npc_count++;
+    }
+
+    char fname[256];
+    snprintf(fname, sizeof(fname), "%s_%d_%dP_%dN.jpg",
+             stream_id_.c_str(), detect_count,
+             player_count, npc_count);
+
+    std::filesystem::path dir = std::filesystem::path(debug_output_dir_) / "debug" / "detect" / date_str;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+
+    std::string path = (dir / fname).string();
+    saveJpeg(path, img.data(), w, h);
+}
+
+void SmartRecordingManager::saveDecodedFrame(AVFrame* frame, int frame_idx) {
+    if (!frame || debug_output_dir_.empty()) return;
+
+    int width = frame->width;
+    int height = frame->height;
+    if (width <= 0 || height <= 0) return;
+
+    // 创建日期目录: {output_dir}/debug/decode/{date}
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_t = std::chrono::system_clock::to_time_t(now);
+    std::tm* tm = std::localtime(&now_t);
+    char date_str[16];
+    std::strftime(date_str, sizeof(date_str), "%Y%m%d", tm);
+
+    std::filesystem::path dir = std::filesystem::path(debug_output_dir_) / "debug" / "decode" / date_str;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+
+    char fname[256];
+    snprintf(fname, sizeof(fname), "%s_%d.jpg", stream_id_.c_str(), frame_idx);
+    std::string path = (dir / fname).string();
+
+    // DRM_PRIME → CPU 帧
+    AVFrame* cpu_frame = av_frame_alloc();
+    int ret = av_hwframe_transfer_data(cpu_frame, frame, 0);
+    if (ret < 0) {
+        logger_->debug("saveDecodedFrame: hwframe transfer failed ({})", ret);
+        av_frame_free(&cpu_frame);
+        return;
+    }
+    av_frame_copy_props(cpu_frame, frame);
+    cpu_frame->width = width;
+    cpu_frame->height = height;
+
+    // 转换为 RGB
+    SwsContext* sws = sws_getContext(
+        width, height, static_cast<AVPixelFormat>(cpu_frame->format),
+        width, height, AV_PIX_FMT_RGB24,
+        SWS_BILINEAR | SWS_FULL_CHR_H_INP, nullptr, nullptr, nullptr);
+    if (!sws) {
+        av_frame_free(&cpu_frame);
+        return;
+    }
+
+    std::vector<uint8_t> rgb(width * height * 3);
+    uint8_t* dst_data[1] = { rgb.data() };
+    int dst_stride[1] = { width * 3 };
+    sws_scale(sws, cpu_frame->data, cpu_frame->linesize, 0, height, dst_data, dst_stride);
+    sws_freeContext(sws);
+    av_frame_free(&cpu_frame);
+
+    saveJpeg(path, rgb.data(), width, height);
+
+    logger_->debug("Exported decoded frame: {}", path);
+}
+
+} // namespace nvr
+
+#endif // DUMP_DECTECT_IMAGE

@@ -27,7 +27,7 @@ DMABufferWrapper::DMABufferWrapper()
     info_.format = 0;
 }
 
-DMABufferWrapper::DMABufferWrapper(int fd, size_t size, int width, int height, int format, int stride)
+DMABufferWrapper::DMABufferWrapper(int fd, size_t size, int width, int height, int format, int stride, int height_stride)
     : info_()
 {
     info_.fd = fd;
@@ -36,9 +36,10 @@ DMABufferWrapper::DMABufferWrapper(int fd, size_t size, int width, int height, i
     info_.height = height;
     info_.format = format;
     info_.stride = stride;
+    info_.height_stride = height_stride;
 
-    spdlog::trace("DMABufferWrapper created: fd={}, size={}x{}, format={}, stride={}",
-                  fd, width, height, format, stride);
+    spdlog::trace("DMABufferWrapper created: fd={}, size={}x{}, format={}, stride={}, height_stride={}",
+                  fd, width, height, format, stride, height_stride);
 }
 
 DMABufferWrapper::~DMABufferWrapper() {
@@ -55,6 +56,7 @@ DMABufferWrapper::DMABufferWrapper(DMABufferWrapper&& other) noexcept
     other.info_.height = 0;
     other.info_.format = 0;
     other.info_.stride = 0;
+    other.info_.height_stride = 0;
 }
 
 DMABufferWrapper& DMABufferWrapper::operator=(DMABufferWrapper&& other) noexcept {
@@ -69,6 +71,7 @@ DMABufferWrapper& DMABufferWrapper::operator=(DMABufferWrapper&& other) noexcept
         other.info_.height = 0;
         other.info_.format = 0;
         other.info_.stride = 0;
+        other.info_.height_stride = 0;
     }
     return *this;
 }
@@ -117,14 +120,45 @@ std::unique_ptr<DMABufferWrapper> DMABufferExtractor::extractFromAVFrame(AVFrame
         // 只取第一层第一个平面的 fd 和 stride（NV12 两个平面共享同一 fd）
         const AVDRMObjectDescriptor& object = drm_desc->objects[layer_desc.planes[0].object_index];
         int stride = static_cast<int>(layer_desc.planes[0].pitch);
+        int uv_offset = 0;
+        int uv_stride = 0;
+
+        // 如果有第二个平面（UV平面），获取其偏移和stride
+        if (layer_desc.nb_planes >= 2) {
+            uv_offset = static_cast<int>(layer_desc.planes[1].offset);
+            uv_stride = static_cast<int>(layer_desc.planes[1].pitch);
+
+            spdlog::debug("DMA buffer has 2 planes: plane[0] pitch={}, plane[1] offset={}, pitch={}",
+                         stride, uv_offset, uv_stride);
+        }
+
+        // 计算 height_stride：NV12 UV 平面紧跟在 Y 平面后面
+        // 优先使用 UV offset 精确定位，否则从 buffer 总大小推算
+        int calc_height_stride = frame->height;
+        if (uv_offset > 0 && stride > 0) {
+            // UV offset / stride = Y 平面实际行数（含对齐）
+            calc_height_stride = uv_offset / stride;
+            if (calc_height_stride < frame->height) {
+                calc_height_stride = frame->height;
+            }
+        } else if (stride > 0 && object.size > 0) {
+            calc_height_stride = static_cast<int>(object.size * 2 / (static_cast<size_t>(stride) * 3));
+            if (calc_height_stride < frame->height) {
+                calc_height_stride = frame->height;
+            }
+        }
+
+        spdlog::info("DMA buffer: {}x{}, stride={}, height_stride={}, uv_offset={}, size={}, calc_hs={}, drm_format=0x{:x}",
+                     frame->width, frame->height, stride, calc_height_stride, uv_offset, object.size, calc_height_stride, layer_desc.format);
 
         auto wrapper = std::make_unique<DMABufferWrapper>(
             object.fd,
             object.size,
             frame->width,
             frame->height,
-            frame->format,
-            stride
+            layer_desc.format,  // 使用 DRM 层的实际格式（FOURCC），而非 frame->format
+            stride,
+            calc_height_stride
         );
 
         if (wrapper && wrapper->isValid()) {

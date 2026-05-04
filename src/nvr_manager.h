@@ -22,6 +22,10 @@
 #include "config_loader.h"
 #include "schedule_utils.h"
 
+#ifdef ENABLE_RKNN_SMART_RECORDING
+#include "detection_pool.h"
+#endif
+
 class NVRManager {
 public:
     NVRManager(const Config& config);
@@ -70,6 +74,10 @@ private:
 
     std::shared_ptr<VideoUploader> m_uploader;
     std::shared_ptr<UploadProgressManager> m_upload_progress;  // 上传进度管理器
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+    std::unique_ptr<nvr::detection::DetectionPool> m_detection_pool;
+#endif
 };
 
 #endif //NVR_NVR_MANAGER_H

@@ -15,6 +15,7 @@
 
 #ifdef ENABLE_RKNN_SMART_RECORDING
 #include "config_loader.h"
+#include "detection_pool.h"
 #endif
 
 extern "C" {
@@ -22,7 +23,9 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
 #include <libavutil/audio_fifo.h>
+#include <libavutil/imgutils.h>
 #include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
 }
 
 // 前向声明
@@ -54,6 +57,7 @@ public:
                 const std::string& stream_name = ""
 #ifdef ENABLE_RKNN_SMART_RECORDING
                 , const SmartRecordingConfig* smart_recording_config = nullptr
+                , nvr::detection::DetectionPool* detection_pool = nullptr
 #endif
     );
     ~IPCRecorder();

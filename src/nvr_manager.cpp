@@ -27,6 +27,30 @@ NVRManager::NVRManager(const Config& config)
     // 清理可能残留的临时文件（例如程序异常退出后）
     cleanTempFiles();
 
+#ifdef ENABLE_RKNN_SMART_RECORDING
+    // 创建 NPU 推理池（在添加流之前）
+    for (const auto& stream : m_config.streams) {
+        if (stream.smart_recording.enabled && stream.smart_recording.rknn.enabled) {
+            nvr::detection::DetectionConfig det_config;
+            det_config.model_path = stream.smart_recording.rknn.model_path;
+            det_config.player_class_id = stream.smart_recording.rknn.player_class_id;
+            det_config.npc_class_id = stream.smart_recording.rknn.npc_class_id;
+            det_config.confidence_threshold = stream.smart_recording.rknn.confidence_threshold;
+            det_config.detection_interval_keyframes = stream.smart_recording.rknn.detection_interval_keyframes;
+            det_config.zero_copy_enabled = stream.smart_recording.rknn.zero_copy_enabled;
+
+            m_detection_pool = std::make_unique<nvr::detection::DetectionPool>(3, det_config);
+            if (m_detection_pool->initialize()) {
+                LOG_INFO("Detection pool initialized with {} workers", m_detection_pool->getNumWorkers());
+            } else {
+                LOG_ERROR("Failed to initialize detection pool");
+                m_detection_pool.reset();
+            }
+            break;  // 使用第一个启用的流的配置创建池
+        }
+    }
+#endif
+
     // 启动后台服务线程
     m_running = true;
 
@@ -45,8 +69,6 @@ NVRManager::NVRManager(const Config& config)
                      range.start_hour, range.start_minute,
                      range.end_hour, range.end_minute);
         }
-        // 先执行一次检查
-        checkAndUpdateSchedule();
         // 启动调度线程
         m_schedule_thread = std::thread(&NVRManager::scheduleLoop, this);
         LOG_INFO("Schedule thread started");
@@ -69,7 +91,7 @@ bool NVRManager::addStreamWithConfig(const std::string& stream_id, const std::st
 
     if (m_recorders.find(stream_id) != m_recorders.end()) {
         LOG_WARN("Stream {} already exists", stream_id);
-        return false;
+        return true;
     }
 
     // 查找流的配置（包括智能录制配置）
@@ -98,6 +120,7 @@ bool NVRManager::addStreamWithConfig(const std::string& stream_id, const std::st
                                                       stream_name
 #ifdef ENABLE_RKNN_SMART_RECORDING
                                                       , smart_recording_config
+                                                      , m_detection_pool.get()
 #endif
     );
 
@@ -149,6 +172,13 @@ void NVRManager::stopAll() {
         pair.second->stop();
     }
     m_recorders.clear();
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+    if (m_detection_pool) {
+        m_detection_pool->shutdown();
+        m_detection_pool.reset();
+    }
+#endif
 
     if (m_running) {
         m_running = false;
@@ -594,6 +624,18 @@ void NVRManager::startStreamRecording(const std::string& stream_id) {
         m_recorders.erase(it);
     }
 
+    // 查找流的配置（包括智能录制配置）
+    const SmartRecordingConfig* smart_recording_config = nullptr;
+    for (const auto& stream : m_config.streams) {
+        if (stream.id == stream_id) {
+            if (stream.smart_recording.enabled) {
+                smart_recording_config = &stream.smart_recording;
+                LOG_INFO("Smart recording enabled for stream: {}", stream_id);
+            }
+            break;
+        }
+    }
+
     // 创建新的录制器
     auto recorder = std::make_unique<IPCRecorder>(
         stream_config.id, stream_config.url,
@@ -607,7 +649,12 @@ void NVRManager::startStreamRecording(const std::string& stream_id) {
         stream_config.max_reconnect_attempts,
         stream_config.timeout_seconds,
         m_config.shop.id,
-        stream_config.name);
+        stream_config.name
+#ifdef ENABLE_RKNN_SMART_RECORDING
+        , smart_recording_config
+        , m_detection_pool.get()
+#endif
+    );
     recorder->start();
 
     m_recorders[stream_id] = std::move(recorder);

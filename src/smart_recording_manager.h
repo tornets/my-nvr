@@ -9,9 +9,9 @@
 #include "detection_types.h"
 #include "detection_result_cache.h"
 #include "frame_buffer.h"
-#include "rknn_detector.h"
-#include "dma_buffer_extractor.h"
+#include "detection_pool.h"
 #include "config_loader.h"
+#include <spdlog/spdlog.h>
 #include <memory>
 #include <mutex>
 #include <atomic>
@@ -31,7 +31,8 @@ using detection::DetectionResult;
 using detection::DetectionConfig;
 using detection::DetectionResultCache;
 using detection::SmartSegmentDecision;
-using detection::RKNNDetector;
+using detection::DetectionPool;
+using detection::PoolDetectionResult;
 
 // 录制状态
 enum class SmartRecordingState {
@@ -65,7 +66,8 @@ class SmartRecordingManager {
 public:
     SmartRecordingManager(
         const SmartRecordingConfig& config,
-        const std::string& stream_id);
+        const std::string& stream_id,
+        detection::DetectionPool& detection_pool);
     ~SmartRecordingManager();
 
     // 禁止拷贝
@@ -133,6 +135,10 @@ public:
     // 获取分段时长（秒）
     double getSegmentDurationSeconds() const;
 
+#if DUMP_DECTECT_IMAGE
+    void setDebugOutputDir(const std::string& dir) { debug_output_dir_ = dir; }
+#endif
+
 private:
     // 检测线程工作函数
     void detectionWorkerThread();
@@ -164,8 +170,8 @@ private:
     std::atomic<bool> running_;
     std::atomic<SmartRecordingState> current_state_;
 
-    // RKNN 检测器
-    std::unique_ptr<detection::RKNNDetector> rknn_detector_;
+    // NPU 推理池
+    detection::DetectionPool& detection_pool_;
 
     // 帧缓冲区
     std::unique_ptr<FrameBuffer> frame_buffer_;
@@ -205,6 +211,13 @@ private:
     // 线程安全
     mutable std::mutex state_mutex_;
     mutable std::mutex output_mutex_;
+
+#if DUMP_DECTECT_IMAGE
+    std::string debug_output_dir_;
+    int debug_decode_frame_index_ = 0;
+    void saveDetectionImage(const detection::PoolDetectionResult& pool_result, int detect_count);
+    void saveDecodedFrame(AVFrame* frame, int frame_idx);
+#endif
 };
 
 } // namespace nvr

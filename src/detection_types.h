@@ -21,8 +21,9 @@ struct DMABufferInfo {
     int height;           // 高度
     int format;           // 格式
     int stride;           // 行字节数（stride/pitch），0 表示等于 width
+    int height_stride;    // 高度方向 stride（含对齐填充），0 表示等于 height
 
-    DMABufferInfo() : fd(-1), size(0), width(0), height(0), format(0), stride(0) {}
+    DMABufferInfo() : fd(-1), size(0), width(0), height(0), format(0), stride(0), height_stride(0) {}
 };
 
 // 边界框
@@ -215,5 +216,10 @@ struct DetectionConfig {
 };
 
 } // namespace nvr::detection
+
+// 调试宏：启用推理图像导出（可通过 CMake -DDUMP_DECTECT_IMAGE=1 覆盖）
+#ifndef DUMP_DECTECT_IMAGE
+#define DUMP_DECTECT_IMAGE 0
+#endif
 
 #endif // NVR_DETECTION_TYPES_H

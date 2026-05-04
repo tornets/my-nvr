@@ -4,10 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-MyNVR 是一个用 C++17 编写的跨平台网络视频录制服务，可以从 RTSP 摄像头录制视频流并自动上传到服务器。支持多个同时连接的摄像头。
+MyNVR 是一个用 C++17 编写的跨平台网络视频录制服务，可以从 RTSP 摄像头录制视频流并自动上传到服务器。支持多个同时连接的摄像头。在 RK3588 平台上支持基于 YOLO11 的智能录制——仅录制检测到玩家的视频段。
 
 ## 技术栈
-- 视频拉流: ffmpeg
+- 视频: ffmpeg（RK3588 上使用 ffmpeg-rockchip 硬件加速）
+- AI 推理: RKNN (rknpu2) + YOLO11
+- 硬件预处理: RGA (Raster Graphics Accelerator)
+- 零拷贝: DRM DMA-BUF
 - 依赖管理: conan
 
 ## 常用命令
@@ -16,8 +19,8 @@ MyNVR 是一个用 C++17 编写的跨平台网络视频录制服务，可以从 
 # 构建
 conan build . -of=build -s build_type=Debug -s compiler.cppstd=17 --build=missing
 
-# 运行 
-build\src\nvr --config config.yaml
+# 运行
+build/src/nvr --config config.yaml
 ```
 
 ## 开发工作流
@@ -56,7 +59,24 @@ IPCRecorder (ipc_recorder.cpp) - RTSP 录制引擎
     ├── FFmpeg 集成（RTSP/解码/编码）
     ├── 自动重连与超时检测
     ├── 分段分割（默认：10 分钟）
-    └── 两阶段录制（临时目录 → 最终目录）
+    ├── 两阶段录制（临时目录 → 最终目录）
+    └── [RK3588] SmartRecordingManager 集成
+
+SmartRecordingManager (smart_recording_manager.cpp) - 智能录制决策引擎
+    ├── 三态状态机 (IDLE → RECORDING → POST_RECORDING)
+    ├── 帧预缓存 (FrameBuffer 环形缓冲区)
+    ├── 独立检测线程 (生产者-消费者模式)
+    └── 延迟停止机制
+
+RKNNDetector (rknn_detector.cpp) - YOLO11 目标检测
+    ├── RKNN 模型加载与推理
+    ├── 零拷贝路径 (DMA-BUF → RGA → RKNN)
+    └── CPU 路径 (AVFrame → RKNN)
+
+DMABufferExtractor (dma_buffer_extractor.cpp) - DMA 缓冲区提取
+RgaPreprocessor (rga_preprocessor.cpp) - RGA 硬件预处理
+FrameBuffer (frame_buffer.cpp) - 帧环形缓冲区
+DetectionResultCache (detection_result_cache.cpp) - 检测结果滑动窗口
 
 VideoUploader (video_uploader.cpp)
     └── 基于队列的 HTTP 多部分上传，支持重试
@@ -64,19 +84,60 @@ VideoUploader (video_uploader.cpp)
 
 ## 主要依赖
 
-- **FFmpeg 8.0.1** - 视频/音频编码和 RTSP 流
+### 跨平台依赖（conan 管理）
+- **FFmpeg** - 视频/音频编码和 RTSP 流（Windows: 4.4.6，Linux: 系统/ffmpeg-rockchip）
 - **spdlog 1.15.1** - 日志记录
 - **yaml-cpp 0.8.0** - 配置文件解析
 - **cpp-httplib 0.30.1** - HTTP 上传（含 OpenSSL）
 - **nlohmann_json 3.11.3** - JSON 序列化
 
+### RK3588 平台依赖（系统库）
+- **librknnrt** - RKNN 运行时，模型推理
+- **rockchip_mpp** - Media Process Platform，硬件编解码
+- **rga** - Raster Graphics Accelerator，硬件图像缩放/格式转换
+- **drm** - Direct Rendering Manager，GPU/DMA-BUF 管理
+
+## 条件编译
+
+智能录制通过 `ENABLE_RKNN_SMART_RECORDING` 宏控制，仅在 aarch64（RK3588）平台自动启用。所有智能录制相关代码使用 `#ifdef ENABLE_RKNN_SMART_RECORDING` 包裹，确保在其他平台编译不受影响。
+
 ## 线程模型
 
 - **主线程：** 应用程序生命周期循环（100ms 休眠间隔）
 - **每个 RTSP 流一个线程** (IPCRecorder::run())
+- **[RK3588] 每个流的检测线程** (SmartRecordingManager::detectionWorkerThread())
 - **清理线程**（如果启用自动清理）
 - **上传扫描线程**（如果启用上传，每 10 秒扫描一次）
 - **上传工作线程**（如果启用上传）
+
+## 智能录制详解
+
+### 状态机
+```
+IDLE (预缓存) ──检测到玩家──> RECORDING (录制中)
+  ↑                                │
+  │                          玩家消失 + 延迟到期
+  │                                ↓
+  └──────────────────── POST_RECORDING (延迟停止)
+                              │
+                        玩家重新出现 → 回到 RECORDING
+```
+
+### 预缓存机制
+IDLE 状态时，FrameBuffer 维护一个环形缓冲区（默认 5 秒），缓存所有视频帧。当检测到玩家开始录制时，从最近关键帧开始提取预缓存帧写入文件，确保视频从玩家出现前就开始。
+
+### 延迟停止
+玩家消失后进入 POST_RECORDING 状态，等待配置的延迟时间（默认 5 秒）。如果延迟期间玩家重新出现，回到 RECORDING 状态；延迟到期则停止录制。
+
+### 检测流程
+1. IPCRecorder 对每个关键帧解码得到 AVFrame
+2. 调用 DMABufferExtractor 从 AVFrame 提取 DMA-BUF 信息（零拷贝路径）
+3. RgaPreprocessor 使用 RGA 硬件将 NV12 缩放/转换为模型输入尺寸
+4. RKNNDetector 执行 YOLO11 推理，NMS 后处理
+5. 区分玩家（class_id=0）和 NPC（class_id=1）
+
+### 分段决策
+DetectionResultCache 维护滑动窗口记录检测结果。分段结束时根据窗口内玩家出现比例决定是否保存该段视频。
 
 ## 关键实现细节
 
@@ -94,6 +155,8 @@ VideoUploader (video_uploader.cpp)
 ### 文件名模板
 录制文件名使用模板变量：
 - `{stream_id}` - 摄像头/流标识符
+- `{stream_name}` - 流名称
+- `{shop_id}` - 店铺 ID
 - `{start_datetime}` - 录制开始时间
 - `{segment_index}` - 该流的段编号
 - `{duration}` - 录制时长
@@ -104,6 +167,10 @@ VideoUploader (video_uploader.cpp)
 主配置文件是 `config.yaml`（模板见 `config.yaml.example`）：
 
 - **streams[]** - RTSP 流配置（url、timeout、reconnect 设置）
+  - **streams[].smart_recording** - 智能录制配置（仅 RK3588）
+    - enabled, prebuffer_duration_seconds, segment_duration_seconds
+    - min_recording_duration, post_recording_delay_seconds
+    - **rknn** - RKNN 推理配置（model_path, confidence_threshold, detection_interval_keyframes, zero_copy_enabled）
 - **record** - 输出目录、分段时长、文件名模板
 - **autoclean** - 文件时长限制、磁盘使用限制
 - **upload** - HTTP URL、超时、重试设置
@@ -114,12 +181,20 @@ VideoUploader (video_uploader.cpp)
 
 - `src/main.cpp` - 入口点、服务命令
 - `src/application.cpp` - 应用初始化和主循环
-- `src/nvr_manager.cpp` - 核心管理器（446 行）
-- `src/ipc_recorder.cpp` - RTSP 录制引擎（900+ 行）
+- `src/nvr_manager.cpp` - 核心管理器
+- `src/ipc_recorder.cpp` - RTSP 录制引擎
 - `src/video_uploader.cpp` - 上传功能
-- `src/win32_service.cpp` - Windows 服务包装器
 - `src/config_loader.cpp` - YAML 配置解析
 - `src/cmdline_parser.cpp` - CLI 参数解析
+- `src/win32_service.cpp` - Windows 服务包装器
+- `src/smart_recording_manager.cpp` - 智能录制决策引擎（RK3588）
+- `src/rknn_detector.cpp` - YOLO11 RKNN 检测器（RK3588）
+- `src/dma_buffer_extractor.cpp` - DMA 缓冲区提取（RK3588）
+- `src/rga_preprocessor.cpp` - RGA 硬件预处理（RK3588）
+- `src/frame_buffer.cpp` - 帧环形缓冲区（RK3588）
+- `src/detection_result_cache.cpp` - 检测结果缓存（RK3588）
+- `src/detection_types.h` - 检测相关类型定义
+- `models/yolo11.rknn` - YOLO11 RKNN 模型文件
 
 ## Windows 服务集成
 
@@ -136,3 +211,4 @@ VideoUploader (video_uploader.cpp)
 - 基于异常的错误处理
 - 需要的地方使用互斥锁进行线程安全操作
 - 日志使用 spdlog，格式：`[YYYY-MM-DD HH:MM::SS.mmm] [logger] [LEVEL] message`
+- RK3588 相关代码使用 `#ifdef ENABLE_RKNN_SMART_RECORDING` 条件编译

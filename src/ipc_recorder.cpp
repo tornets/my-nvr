@@ -8,6 +8,7 @@
 
 #ifdef ENABLE_RKNN_SMART_RECORDING
 #include "smart_recording_manager.h"
+#include "frame_buffer.h"
 #endif
 
 #include <chrono>
@@ -117,6 +118,7 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
                          const std::string& stream_name
 #ifdef ENABLE_RKNN_SMART_RECORDING
                          , const SmartRecordingConfig* smart_recording_config
+                         , nvr::detection::DetectionPool* detection_pool
 #endif
     )
     : m_stream_id(stream_id)
@@ -184,13 +186,16 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
 
 #ifdef ENABLE_RKNN_SMART_RECORDING
     // 初始化智能录制
-    if (smart_recording_config && smart_recording_config->enabled) {
+    if (smart_recording_config && smart_recording_config->enabled && detection_pool) {
         m_smart_recording_enabled = true;
         m_smart_recording = std::make_unique<nvr::SmartRecordingManager>(
-            *smart_recording_config, m_stream_id);
+            *smart_recording_config, m_stream_id, *detection_pool);
 
         if (m_smart_recording->initialize()) {
             m_smart_recording->start();
+#if DUMP_DECTECT_IMAGE
+            m_smart_recording->setDebugOutputDir(m_output_dir);
+#endif
             LOG_INFO("Smart recording enabled for stream: {}", m_stream_id);
         } else {
             LOG_WARN("Failed to initialize smart recording for stream: {}", m_stream_id);
@@ -516,6 +521,13 @@ bool IPCRecorder::connectAndRecord() {
                 m_smart_recording->clearCache();
             }
 
+            // 分段时长检查（智能录制也按配置时长切片）
+            if (m_output_ctx && shouldSwitchSegment(packet)) {
+                LOG_INFO("Smart recording: segment duration reached, starting new segment");
+                closeOutput();
+                m_smart_recording->clearCache();
+            }
+
             // 不在录制中且门控未开启 → 跳过此包
             if (!m_output_ctx && !m_smart_recording->shouldWritePacket()) {
                 // IDLE：缓存所有视频帧，仅关键帧触发检测
@@ -534,15 +546,74 @@ bool IPCRecorder::connectAndRecord() {
                 continue;
             }
 
-            // 门控刚开启（IDLE→RECORDING）且未打开输出 → 开始录制
+            // 门控刚开启（IDLE→RECORDING）且未打开输出 → 用预缓存帧立即开始录制
             if (!m_output_ctx && m_smart_recording->shouldWritePacket()) {
-                // 等待关键帧才开始新文件
-                if (!(packet->flags & AV_PKT_FLAG_KEY) || packet->stream_index != m_video_stream_idx) {
-                    av_packet_unref(packet);
-                    continue;
+                auto prebuffer = m_smart_recording->getPrebufferFrames();
+
+                if (!prebuffer.empty() && prebuffer[0].is_key_frame) {
+                    // 预缓存中有完整 GOP（从关键帧开始），立即打开文件并写入
+                    LOG_INFO("Smart recording: opening new file with {} prebuffer frames", prebuffer.size());
+
+                    m_segment_index++;
+                    std::time(&m_segment_start_time);
+
+                    // 生成临时文件名
+                    static const char charset[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+                    static std::random_device rd;
+                    static std::mt19937 gen(rd());
+                    static std::uniform_int_distribution<> dis(0, sizeof(charset) - 2);
+                    std::string random_str;
+                    random_str.reserve(16);
+                    for (int i = 0; i < 16; i++) random_str += charset[dis(gen)];
+
+                    std::string ext = ".mp4";
+                    if (m_output_format == "matroska") ext = ".mkv";
+                    else if (m_output_format == "avi") ext = ".avi";
+                    else if (m_output_format == "mov") ext = ".mov";
+                    else if (m_output_format == "flv") ext = ".flv";
+                    else if (m_output_format == "webm") ext = ".webm";
+                    else if (m_output_format == "mpegts") ext = ".ts";
+
+                    std::string filename = "temp_" + random_str + ext;
+                    if (!openOutput(filename)) {
+                        LOG_ERROR("Failed to open temp file for prebuffer: {}", filename);
+                        av_packet_unref(packet);
+                        continue;
+                    }
+
+                    // 设置智能录制管理器的输出上下文
+                    m_smart_recording->setOutputContext(m_output_ctx, 0);
+                    m_smart_recording->setTimeBase(m_video_time_base);
+
+                    // 分段起始 PTS 使用预缓存首帧
+                    m_segment_start_pts = prebuffer[0].pts;
+                    m_segment_start_dts = prebuffer[0].dts >= 0 ? prebuffer[0].dts : prebuffer[0].pts;
+                    m_smart_recording->setSegmentStartTime(m_segment_start_pts);
+
+                    // 重置音频状态
+                    m_audio_start_pts = 0;
+                    m_audio_frame_count = 0;
+                    m_last_video_pts = 0;
+                    m_last_video_dts = 0;
+
+                    // 写入预缓存帧（PTS 偏移到从 0 开始）
+                    nvr::FrameBufferWriter writer(m_output_ctx, 0);
+                    writer.setTimeBase(m_video_time_base);
+                    writer.setPTSOffset(m_segment_start_pts, m_segment_start_dts);
+                    if (!writer.writeFrames(prebuffer)) {
+                        LOG_WARN("Failed to write some prebuffer frames");
+                    }
+
+                    LOG_INFO("Smart recording: prebuffer written ({} frames, start_pts={})", prebuffer.size(), m_segment_start_pts);
+                    // 当前包继续往下走正常写入流程
+                } else {
+                    // 无预缓存或无关键帧，等待下一个关键帧
+                    if (!(packet->flags & AV_PKT_FLAG_KEY) || packet->stream_index != m_video_stream_idx) {
+                        av_packet_unref(packet);
+                        continue;
+                    }
+                    LOG_INFO("Smart recording: opening new file (no prebuffer), player detected");
                 }
-                LOG_INFO("Smart recording: opening new file, player detected");
-                // 打开新文件（下面的 !m_output_ctx 块会处理）
             }
         } else
 #endif
@@ -1142,11 +1213,10 @@ bool IPCRecorder::setupAudioTranscoding() {
 
         // 设置编码器参数
         m_audio_encoder_ctx->sample_rate = audio_par->sample_rate > 0 ? audio_par->sample_rate : 44100;
+        m_audio_encoder_ctx->channels = audio_par->channels > 0 ? audio_par->channels : 1;
         m_audio_encoder_ctx->channel_layout = audio_par->channel_layout;
-        m_audio_encoder_ctx->channels = audio_par->channels;
-        if (m_audio_encoder_ctx->channels == 0) {
-            m_audio_encoder_ctx->channels = 2;
-            m_audio_encoder_ctx->channel_layout = av_get_default_channel_layout(2);
+        if (m_audio_encoder_ctx->channel_layout == 0) {
+            m_audio_encoder_ctx->channel_layout = av_get_default_channel_layout(m_audio_encoder_ctx->channels);
         }
         m_audio_encoder_ctx->sample_fmt = encoder->sample_fmts ? encoder->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
 
@@ -1297,12 +1367,22 @@ bool IPCRecorder::initAudioResampleAndFifo() {
         return true;  // 已经初始化过了
     }
 
+    // 确保 channel_layout 有效
+    uint64_t dst_layout = m_audio_encoder_ctx->channel_layout;
+    if (dst_layout == 0) {
+        dst_layout = av_get_default_channel_layout(m_audio_encoder_ctx->channels);
+    }
+    uint64_t src_layout = m_audio_decoder_ctx->channel_layout;
+    if (src_layout == 0) {
+        src_layout = av_get_default_channel_layout(m_audio_decoder_ctx->channels);
+    }
+
     // 初始化重采样器
     m_swr_ctx = swr_alloc_set_opts(m_swr_ctx,
-                                  m_audio_encoder_ctx->channel_layout,
+                                  dst_layout,
                                   m_audio_encoder_ctx->sample_fmt,
                                   m_audio_encoder_ctx->sample_rate,
-                                  m_audio_decoder_ctx->channel_layout,
+                                  src_layout,
                                   m_audio_decoder_ctx->sample_fmt,
                                   m_audio_decoder_ctx->sample_rate,
                                   0, nullptr);
@@ -1523,6 +1603,14 @@ bool IPCRecorder::transcodeAudio(AVPacket* packet) {
 
     // 5. 发送包到解码器
     int ret = avcodec_send_packet(m_audio_decoder_ctx, packet);
+    if (ret == AVERROR(EAGAIN)) {
+        // 解码器缓冲区满，先取出已解码的帧再重试
+        if (!m_audio_fifo_initialized && !initAudioResampleAndFifo()) {
+            return false;
+        }
+        decodeAndProcessAudioPackets(nullptr);
+        ret = avcodec_send_packet(m_audio_decoder_ctx, packet);
+    }
     if (ret < 0) {
         LOG_ERROR("Error sending audio packet to decoder: {}", av_err_to_string(ret));
         return false;

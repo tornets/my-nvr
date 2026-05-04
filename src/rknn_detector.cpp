@@ -78,14 +78,27 @@ bool RKNNDetector::initialize() {
     logger_->info("RKNNDetector initialized successfully");
     logger_->info("Model input: {}x{}x{}", model_info_.input_width, model_info_.input_height, model_info_.input_channels);
 
-    // 初始化 RGA 预处理器（零拷贝模式）
+    // 零拷贝模式：设置持久化 IO 内存和 RGA 预处理器
+#ifdef ENABLE_RKNN_SMART_RECORDING
     if (config_.zero_copy_enabled) {
-        rga_preprocessor_ = std::make_unique<RGAPreprocessor>();
-        if (!rga_preprocessor_->initialize(rknn_ctx_, model_info_.input_width, model_info_.input_height)) {
-            logger_->warn("RGA preprocessor init failed, will use CPU fallback");
-            rga_preprocessor_.reset();
+        // 设置零拷贝 IO
+        if (!setupZeroCopyIO()) {
+            logger_->error("Failed to setup zero-copy IO, falling back to non-zero-copy mode");
+            config_.zero_copy_enabled = false;
+        } else {
+            // 初始化 RGA 预处理器（使用持久化的 RKNN 输入内存 fd）
+            int dst_wstride = native_input_attrs_[0].w_stride;
+            if (dst_wstride == 0) dst_wstride = model_info_.input_width;
+
+            rga_preprocessor_ = std::make_unique<RGAPreprocessor>();
+            if (!rga_preprocessor_->initialize(input_mem_->fd, model_info_.input_width,
+                                                    model_info_.input_height, dst_wstride)) {
+                logger_->warn("RGA preprocessor init failed, will use CPU fallback");
+                rga_preprocessor_.reset();
+            }
         }
     }
+#endif
 
     return true;
 }
@@ -100,6 +113,20 @@ void RKNNDetector::shutdown() {
     logger_->info("Shutting down RKNNDetector");
     releaseResources();
     initialized_ = false;
+}
+
+bool RKNNDetector::setCoreMask(uint32_t core_mask) {
+    if (!initialized_) {
+        logger_->error("Cannot set core mask: detector not initialized");
+        return false;
+    }
+    int ret = rknn_set_core_mask(rknn_ctx_, static_cast<rknn_core_mask>(core_mask));
+    if (ret != RKNN_SUCC) {
+        logger_->error("rknn_set_core_mask failed: {}", ret);
+        return false;
+    }
+    logger_->info("Set NPU core mask to {}", core_mask);
+    return true;
 }
 
 bool RKNNDetector::loadModel() {
@@ -159,8 +186,9 @@ bool RKNNDetector::queryModelInfo() {
 
     logger_->debug("Input: {}x{}x{}", model_info_.input_width, model_info_.input_height, model_info_.input_channels);
 
-    // 查询输出属性
+    // 查询输出属性（用户面 NCHW 逻辑尺寸）
     model_info_.output_sizes.clear();
+    output_attrs_.resize(io_num_attr.n_output);
     for (uint32_t i = 0; i < io_num_attr.n_output; i++) {
         rknn_tensor_attr output_attr;
         output_attr.index = i;
@@ -170,8 +198,47 @@ bool RKNNDetector::queryModelInfo() {
             return false;
         }
         model_info_.output_sizes.push_back(output_attr.n_elems);
-        logger_->debug("Output {}: size = {}", i, output_attr.n_elems);
+        output_attrs_[i] = output_attr;
+        logger_->debug("Output {}: size = {}, dims = [{},{},{},{}]",
+                      i, output_attr.n_elems,
+                      output_attr.dims[0], output_attr.dims[1],
+                      output_attr.dims[2], output_attr.dims[3]);
     }
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+    // 查询 NATIVE 输入属性（NC1HWC2 格式，含 stride）
+    native_input_attrs_.resize(io_num_attr.n_input);
+    for (uint32_t i = 0; i < io_num_attr.n_input; i++) {
+        native_input_attrs_[i].index = i;
+        ret = rknn_query(rknn_ctx_, RKNN_QUERY_NATIVE_INPUT_ATTR, &native_input_attrs_[i], sizeof(native_input_attrs_[i]));
+        if (ret < 0) {
+            logger_->error("rknn_query RKNN_QUERY_NATIVE_INPUT_ATTR failed: {}", ret);
+            return false;
+        }
+        logger_->info("Native input[{}]: w_stride={}, size_with_stride={}, fmt={}",
+                     i, native_input_attrs_[i].w_stride, native_input_attrs_[i].size_with_stride,
+                     static_cast<int>(native_input_attrs_[i].fmt));
+    }
+
+    // 查询 NATIVE 输出属性（NC1HWC2 int8 格式）
+    native_output_attrs_.resize(io_num_attr.n_output);
+    for (uint32_t i = 0; i < io_num_attr.n_output; i++) {
+        native_output_attrs_[i].index = i;
+        ret = rknn_query(rknn_ctx_, RKNN_QUERY_NATIVE_OUTPUT_ATTR, &native_output_attrs_[i], sizeof(native_output_attrs_[i]));
+        if (ret < 0) {
+            logger_->error("rknn_query RKNN_QUERY_NATIVE_OUTPUT_ATTR failed: {}", ret);
+            return false;
+        }
+        logger_->info("Native output[{}]: size_with_stride={}, fmt={}, zp={}, scale={:.6f}",
+                     i, native_output_attrs_[i].size_with_stride, static_cast<int>(native_output_attrs_[i].fmt),
+                     native_output_attrs_[i].zp, native_output_attrs_[i].scale);
+    }
+
+    // 判断是否为量化模型
+    is_quant_ = (native_output_attrs_[0].fmt == RKNN_TENSOR_NC1HWC2 &&
+                  native_output_attrs_[0].type == RKNN_TENSOR_INT8);
+    logger_->info("Model is {}quantized", is_quant_ ? "" : "not ");
+#endif
 
     return true;
 }
@@ -197,7 +264,15 @@ bool RKNNDetector::setupInputsOutputs() {
 }
 
 void RKNNDetector::releaseResources() {
-    // 只销毁 RKNN 上下文（不需要手动 release 未 get 的输出）
+    // 先释放 RGA 预处理器（会释放持久化 RGA 句柄）
+    rga_preprocessor_.reset();
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+    // 释放零拷贝内存
+    releaseZeroCopyMem();
+#endif
+
+    // 销毁 RKNN 上下文
     if (rknn_ctx_ != 0) {
         rknn_destroy(rknn_ctx_);
         rknn_ctx_ = 0;
@@ -235,6 +310,12 @@ bool RKNNDetector::detectFrame(AVFrame* frame, DetectionResult& result) {
         logger_->error("rknn_inputs_set failed: {}", ret);
         return false;
     }
+
+#if DUMP_DECTECT_IMAGE
+    last_input_rgb_.assign(input_data.begin(), input_data.end());
+    last_input_w_ = model_info_.input_width;
+    last_input_h_ = model_info_.input_height;
+#endif
 
     // 执行推理
     ret = rknn_run(rknn_ctx_, nullptr);
@@ -278,73 +359,38 @@ bool RKNNDetector::detectFrameZeroCopy(const DMABufferInfo& dma_info, DetectionR
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    int dst_width = model_info_.input_width;
-    int dst_height = model_info_.input_height;
-
-    // mmap NV12 DMA buffer → CPU NV12→RGB 缩放转换
-    // TODO: 后续改用 RGA 硬件加速 NV12→RGB 转换
-    std::vector<uint8_t> rgb_data(dst_width * dst_height * 3);
-
-    size_t nv12_size = dma_info.size > 0 ? dma_info.size
-        : static_cast<size_t>(dma_info.stride * dma_info.height * 3 / 2);
-
-    void* mapped = mmap(nullptr, nv12_size, PROT_READ, MAP_SHARED, dma_info.fd, 0);
-    if (mapped == MAP_FAILED) {
-        logger_->error("mmap DMA fd {} failed", dma_info.fd);
-        return false;
+    // 1. RGA 硬件预处理：DMA fd → RGB 直接写入持久化 RKNN 输入内存
+    bool rga_ok = false;
+    if (rga_preprocessor_ && rga_preprocessor_->isInitialized()) {
+        rga_ok = rga_preprocessor_->resizeNV12toRGB(
+            dma_info.fd, dma_info.width, dma_info.height,
+            dma_info.format, dma_info.stride, dma_info.height_stride);
     }
 
-    const uint8_t* y_plane = static_cast<const uint8_t*>(mapped);
-    const uint8_t* uv_plane = y_plane + dma_info.stride * dma_info.height;
-    int src_stride = dma_info.stride > 0 ? dma_info.stride : dma_info.width;
-
-    for (int dy = 0; dy < dst_height; dy++) {
-        int sy = dy * dma_info.height / dst_height;
-        for (int dx = 0; dx < dst_width; dx++) {
-            int sx = dx * dma_info.width / dst_width;
-
-            uint8_t y  = y_plane[sy * src_stride + sx];
-            uint8_t u  = uv_plane[(sy / 2) * src_stride + (sx & ~1)];
-            uint8_t v  = uv_plane[(sy / 2) * src_stride + (sx & ~1) + 1];
-
-            // BT.601 full range YUV→RGB
-            float rf = y + 1.402f * (v - 128.0f);
-            float gf = y - 0.344f * (u - 128.0f) - 0.714f * (v - 128.0f);
-            float bf = y + 1.772f * (u - 128.0f);
-
-            int idx = (dy * dst_width + dx) * 3;
-            rgb_data[idx]     = static_cast<uint8_t>(std::clamp(static_cast<int>(rf), 0, 255));
-            rgb_data[idx + 1] = static_cast<uint8_t>(std::clamp(static_cast<int>(gf), 0, 255));
-            rgb_data[idx + 2] = static_cast<uint8_t>(std::clamp(static_cast<int>(bf), 0, 255));
-        }
+    if (!rga_ok) {
+        // 2. CPU fallback：直接写入 RKNN 输入内存
+        logger_->debug("RGA preprocess failed, using CPU fallback");
+        cpuFallbackNV12toRGB(dma_info);
     }
 
-    munmap(mapped, nv12_size);
+#if DUMP_DECTECT_IMAGE
+    // 保存调试图像（从持久化输入内存拷贝实际 RGB 数据）
+    int image_size = model_info_.input_width * model_info_.input_height * model_info_.input_channels;
+    last_input_rgb_.assign(static_cast<const uint8_t*>(input_mem_->virt_addr),
+                           static_cast<const uint8_t*>(input_mem_->virt_addr) + image_size);
+    last_input_w_ = model_info_.input_width;
+    last_input_h_ = model_info_.input_height;
+#endif
 
-    inputs_[0].buf = rgb_data.data();
-    inputs_[0].size = dst_width * dst_height * 3;
-    int ret = rknn_inputs_set(rknn_ctx_, 1, inputs_);
-    if (ret < 0) {
-        logger_->error("rknn_inputs_set failed: {}", ret);
-        return false;
-    }
-
-    ret = rknn_run(rknn_ctx_, nullptr);
+    // 3. RKNN 推理（无需 rknn_inputs_set，已通过 rknn_set_io_mem 绑定）
+    int ret = rknn_run(rknn_ctx_, nullptr);
     if (ret < 0) {
         logger_->error("rknn_run failed: {}", ret);
         return false;
     }
 
-    ret = rknn_outputs_get(rknn_ctx_, outputs_.size(), outputs_.data(), nullptr);
-    if (ret < 0) {
-        logger_->error("rknn_outputs_get failed: {}", ret);
-        return false;
-    }
-
-    bool parse_ok = parseDetectionOutputs(outputs_.data(), result);
-    rknn_outputs_release(rknn_ctx_, outputs_.size(), outputs_.data());
-
-    if (!parse_ok) {
+    // 4. 从持久化输出内存解析检测结果（NC1HWC2 → NCHW 反量化）
+    if (!parseDetectionOutputsZeroCopy(result)) {
         logger_->error("Failed to parse detection outputs");
         return false;
     }
@@ -576,37 +622,246 @@ bool RKNNDetector::warmup(int iterations) {
 
     logger_->info("Warming up RKNN detector with {} iterations...", iterations);
 
-    // 创建虚拟输入
-    std::vector<uint8_t> dummy_input(
-        model_info_.input_width * model_info_.input_height * model_info_.input_channels,
-        128);
+#ifdef ENABLE_RKNN_SMART_RECORDING
+    if (config_.zero_copy_enabled && input_mem_) {
+        // 零拷贝预热：直接写入持久化输入内存
+        int input_size = native_input_attrs_[0].size_with_stride;
+        std::memset(input_mem_->virt_addr, 128, input_size);
 
-    for (int i = 0; i < iterations; i++) {
-        inputs_[0].buf = dummy_input.data();
-
-        int ret = rknn_inputs_set(rknn_ctx_, 1, inputs_);
-        if (ret < 0) {
-            logger_->error("Warmup failed at iteration {}", i);
-            return false;
+        for (int i = 0; i < iterations; i++) {
+            int ret = rknn_run(rknn_ctx_, nullptr);
+            if (ret < 0) {
+                logger_->error("Warmup failed at iteration {}", i);
+                return false;
+            }
         }
+    } else {
+#endif
+        // 非零拷贝预热：使用传统 API
+        std::vector<uint8_t> dummy_input(
+            model_info_.input_width * model_info_.input_height * model_info_.input_channels,
+            128);
 
-        ret = rknn_run(rknn_ctx_, nullptr);
-        if (ret < 0) {
-            logger_->error("Warmup failed at iteration {}", i);
-            return false;
+        for (int i = 0; i < iterations; i++) {
+            inputs_[0].buf = dummy_input.data();
+
+            int ret = rknn_inputs_set(rknn_ctx_, 1, inputs_);
+            if (ret < 0) {
+                logger_->error("Warmup failed at iteration {}", i);
+                return false;
+            }
+
+            ret = rknn_run(rknn_ctx_, nullptr);
+            if (ret < 0) {
+                logger_->error("Warmup failed at iteration {}", i);
+                return false;
+            }
+
+            ret = rknn_outputs_get(rknn_ctx_, outputs_.size(), outputs_.data(), nullptr);
+            if (ret < 0) {
+                logger_->error("Warmup failed at iteration {}", i);
+                return false;
+            }
+
+            rknn_outputs_release(rknn_ctx_, outputs_.size(), outputs_.data());
         }
-
-        ret = rknn_outputs_get(rknn_ctx_, outputs_.size(), outputs_.data(), nullptr);
-        if (ret < 0) {
-            logger_->error("Warmup failed at iteration {}", i);
-            return false;
-        }
-
-        rknn_outputs_release(rknn_ctx_, outputs_.size(), outputs_.data());
+#ifdef ENABLE_RKNN_SMART_RECORDING
     }
+#endif
 
     logger_->info("Warmup completed successfully");
     return true;
 }
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+// ============================================================================
+// 零拷贝方法实现
+// ============================================================================
+
+bool RKNNDetector::setupZeroCopyIO() {
+    // 覆盖输入类型为 UINT8（融合量化和反量化）
+    native_input_attrs_[0].type = RKNN_TENSOR_UINT8;
+
+    // 分配并绑定输入内存
+    input_mem_ = rknn_create_mem(rknn_ctx_, native_input_attrs_[0].size_with_stride);
+    if (!input_mem_) {
+        logger_->error("setupZeroCopyIO: rknn_create_mem(input) failed");
+        return false;
+    }
+
+    int ret = rknn_set_io_mem(rknn_ctx_, input_mem_, &native_input_attrs_[0]);
+    if (ret < 0) {
+        logger_->error("setupZeroCopyIO: rknn_set_io_mem(input) failed: {}", ret);
+        rknn_destroy_mem(rknn_ctx_, input_mem_);
+        input_mem_ = nullptr;
+        return false;
+    }
+
+    logger_->info("RKNN input zero-copy: size={}, size_with_stride={}, w_stride={}",
+                 native_input_attrs_[0].size, native_input_attrs_[0].size_with_stride,
+                 native_input_attrs_[0].w_stride);
+
+    // 分配并绑定输出内存
+    output_mems_.resize(model_info_.num_outputs);
+    float_outputs_.resize(model_info_.num_outputs);
+
+    for (uint32_t i = 0; i < model_info_.num_outputs; ++i) {
+        output_mems_[i] = rknn_create_mem(rknn_ctx_, native_output_attrs_[i].size_with_stride);
+        if (!output_mems_[i]) {
+            logger_->error("setupZeroCopyIO: rknn_create_mem(output[{}]) failed", i);
+            // 清理已分配的内存
+            for (uint32_t j = 0; j < i; ++j) {
+                rknn_destroy_mem(rknn_ctx_, output_mems_[j]);
+            }
+            rknn_destroy_mem(rknn_ctx_, input_mem_);
+            input_mem_ = nullptr;
+            output_mems_.clear();
+            return false;
+        }
+
+        ret = rknn_set_io_mem(rknn_ctx_, output_mems_[i], &native_output_attrs_[i]);
+        if (ret < 0) {
+            logger_->error("setupZeroCopyIO: rknn_set_io_mem(output[{}]) failed: {}", i, ret);
+            // 清理
+            for (uint32_t j = 0; j <= i; ++j) {
+                rknn_destroy_mem(rknn_ctx_, output_mems_[j]);
+            }
+            rknn_destroy_mem(rknn_ctx_, input_mem_);
+            input_mem_ = nullptr;
+            output_mems_.clear();
+            return false;
+        }
+
+        // 预分配 float 转换缓冲区
+        int elem_count = output_attrs_[i].n_elems;
+        float_outputs_[i].resize(elem_count);
+
+        logger_->info("RKNN output[{}] zero-copy: size={}, size_with_stride={}, zp={}, scale={:.6f}",
+                     i, native_output_attrs_[i].size, native_output_attrs_[i].size_with_stride,
+                     native_output_attrs_[i].zp, native_output_attrs_[i].scale);
+    }
+
+    logger_->info("RKNN zero-copy IO setup completed");
+    return true;
+}
+
+void RKNNDetector::releaseZeroCopyMem() {
+    if (input_mem_) {
+        rknn_destroy_mem(rknn_ctx_, input_mem_);
+        input_mem_ = nullptr;
+    }
+
+    for (auto& mem : output_mems_) {
+        if (mem) {
+            rknn_destroy_mem(rknn_ctx_, mem);
+            mem = nullptr;
+        }
+    }
+    output_mems_.clear();
+    float_outputs_.clear();
+}
+
+void RKNNDetector::convertNC1HWC2ToFloat(int output_idx, std::vector<float>& out_buf) {
+    auto& native_attr = native_output_attrs_[output_idx];
+    auto& user_attr = output_attrs_[output_idx];
+
+    int8_t* src = static_cast<int8_t*>(output_mems_[output_idx]->virt_addr);
+    int zp = native_attr.zp;
+    float scale = native_attr.scale;
+
+    // NCHW 维度
+    int channel = user_attr.dims[1];
+    int h = user_attr.n_dims > 2 ? user_attr.dims[2] : 1;
+    int w = user_attr.n_dims > 3 ? user_attr.dims[3] : 1;
+
+    // NC1HWC2 维度
+    int C1 = native_attr.dims[1];
+    int C2 = native_attr.dims[4];
+    int H = native_attr.dims[2];
+    int W = native_attr.dims[3];
+
+    out_buf.resize(channel * h * w);
+
+    // NC1HWC2 → NCHW 转换 + 反量化
+    for (int c = 0; c < channel; ++c) {
+        int plane = c / C2;
+        int offset = c % C2;
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                int src_idx = (plane * H * W + y * W + x) * C2 + offset;
+                int dst_idx = c * H * W + y * W + x;
+                out_buf[dst_idx] = (static_cast<float>(src[src_idx]) - zp) * scale;
+            }
+        }
+    }
+}
+
+bool RKNNDetector::parseDetectionOutputsZeroCopy(DetectionResult& result) {
+    // 转换所有输出从 NC1HWC2 int8 到 NCHW float32
+    for (uint32_t i = 0; i < model_info_.num_outputs; ++i) {
+        if (is_quant_ && native_output_attrs_[i].fmt == RKNN_TENSOR_NC1HWC2) {
+            convertNC1HWC2ToFloat(i, float_outputs_[i]);
+        } else {
+            // 非量化或非NC1HWC2格式（不应发生在 RK3588）
+            logger_->warn("Output[{}] has unexpected format, skipping conversion", i);
+            return false;
+        }
+    }
+
+    // 构造 rknn_output 数组指向转换后的 float 数据
+    std::vector<rknn_output> outputs(model_info_.num_outputs);
+    for (uint32_t i = 0; i < model_info_.num_outputs; ++i) {
+        outputs[i].index = i;
+        outputs[i].buf = float_outputs_[i].data();
+        outputs[i].size = float_outputs_[i].size() * sizeof(float);
+    }
+
+    return parseDetectionOutputs(outputs.data(), result);
+}
+
+void RKNNDetector::cpuFallbackNV12toRGB(const DMABufferInfo& dma_info) {
+    if (!input_mem_ || !input_mem_->virt_addr) {
+        logger_->error("cpuFallbackNV12toRGB: input_mem_ not available");
+        return;
+    }
+
+    // 映射 DMA buffer
+    size_t total_size = static_cast<size_t>(dma_info.stride) * dma_info.height * 3 / 2;
+    void* mapped = mmap(nullptr, total_size, PROT_READ, MAP_SHARED, dma_info.fd, 0);
+    if (mapped == MAP_FAILED) {
+        logger_->error("cpuFallbackNV12toRGB: mmap failed, fd={}, size={}", dma_info.fd, total_size);
+        return;
+    }
+
+    const uint8_t* y_plane = static_cast<const uint8_t*>(mapped);
+    const uint8_t* uv_plane = y_plane + dma_info.stride * dma_info.height;
+
+    uint8_t* dst = static_cast<uint8_t*>(input_mem_->virt_addr);
+    int src_stride = dma_info.stride > 0 ? dma_info.stride : dma_info.width;
+
+    // 最近邻缩放 + NV12→RGB 转换，直接写入 RKNN 输入内存
+    for (int dy = 0; dy < model_info_.input_height; ++dy) {
+        int sy = dy * dma_info.height / model_info_.input_height;
+        for (int dx = 0; dx < model_info_.input_width; ++dx) {
+            int sx = dx * dma_info.width / model_info_.input_width;
+
+            uint8_t y = y_plane[sy * src_stride + sx];
+            uint8_t u = uv_plane[(sy / 2) * src_stride + (sx & ~1)];
+            uint8_t v = uv_plane[(sy / 2) * src_stride + (sx & ~1) + 1];
+
+            float rf = y + 1.402f * (v - 128.0f);
+            float gf = y - 0.344f * (u - 128.0f) - 0.714f * (v - 128.0f);
+            float bf = y + 1.772f * (u - 128.0f);
+
+            int idx = (dy * model_info_.input_width + dx) * 3;
+            dst[idx] = static_cast<uint8_t>(std::clamp(static_cast<int>(rf), 0, 255));
+            dst[idx + 1] = static_cast<uint8_t>(std::clamp(static_cast<int>(gf), 0, 255));
+            dst[idx + 2] = static_cast<uint8_t>(std::clamp(static_cast<int>(bf), 0, 255));
+        }
+    }
+
+    munmap(mapped, total_size);
+}
+#endif
 
 } // namespace nvr::detection

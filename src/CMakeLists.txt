@@ -41,6 +41,7 @@ if(RK3588_PLATFORM)
         frame_buffer.cpp
         detection_result_cache.cpp
         rga_preprocessor.cpp
+        detection_pool.cpp
     )
 
     # 添加 RKNN 包含路径

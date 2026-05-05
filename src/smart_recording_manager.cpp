@@ -374,10 +374,7 @@ bool SmartRecordingManager::shouldRunDetection(bool is_key_frame, int64_t pts) {
     }
 
     case DetectionMode::Sampled: {
-        // 关键帧始终检测（确保不漏），非关键帧按 PTS 时间间隔
-        if (is_key_frame) {
-            return true;
-        }
+        // 所有关键帧解码（用于预缓存），但检测按时间间隔进行
         float interval = config_.rknn.detection_interval_seconds;
         if (interval <= 0) {
             return false;

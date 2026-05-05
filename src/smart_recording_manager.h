@@ -11,7 +11,7 @@
 #include "frame_buffer.h"
 #include "detection_pool.h"
 #include "config_loader.h"
-#include <spdlog/spdlog.h>
+#include "log.h"
 #include <memory>
 
 // 前向声明

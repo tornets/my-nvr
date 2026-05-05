@@ -167,7 +167,7 @@ smart_recording:
 
     # 检测模式：keyframe | sampled | realtime
     # - keyframe: 只检测 I 帧，按 detection_interval_keyframes 跳帧（默认）
-    # - sampled:  按 PTS 时间间隔检查，关键帧始终检测
+    # - sampled:  按 PTS 时间间隔检查（所有帧统一按间隔，关键帧始终解码用于预缓存）
     # - realtime: 每一帧都检测（含非关键帧）
     detection_mode: keyframe
 
@@ -176,7 +176,7 @@ smart_recording:
     detection_interval_keyframes: 30
 
     # sampled 模式：检测间隔（秒）
-    # 每 N 秒检测一次，关键帧始终检测（确保不漏）
+    # 每 N 秒检测一次（所有帧统一按间隔，关键帧始终解码用于预缓存）
     detection_interval_seconds: 2.0
 
     # 玩家类别 ID（YOLO11 模型）

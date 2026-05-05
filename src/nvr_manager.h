@@ -14,7 +14,7 @@
 #include <atomic>
 #include <functional>
 
-#include <spdlog/spdlog.h>
+#include "log.h"
 
 #include "ipc_recorder.h"
 #include "video_uploader.h"

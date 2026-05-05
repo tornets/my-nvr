@@ -11,7 +11,7 @@
 #include <string>
 #include <memory>
 #include <mutex>
-#include <spdlog/spdlog.h>
+#include "log.h"
 
 extern "C" {
 #include <rknn_api.h>

@@ -11,7 +11,7 @@
 #include <mutex>
 #include <memory>
 
-#include <spdlog/spdlog.h>
+#include "log.h"
 
 #ifdef ENABLE_RKNN_SMART_RECORDING
 #include "config_loader.h"

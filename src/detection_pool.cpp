@@ -14,12 +14,14 @@ extern "C" {
 
 namespace nvr::detection {
 
-DetectionPool::DetectionPool(int num_workers, const DetectionConfig& config)
+DetectionPool::DetectionPool(int num_workers, const DetectionConfig& config, int max_queue_size)
     : num_workers_(num_workers)
+    , max_queue_size_(max_queue_size)
     , config_(config)
     , running_(false)
 {
     if (num_workers_ <= 0) num_workers_ = 3;
+    if (max_queue_size_ <= 0) max_queue_size_ = 64;
 }
 
 DetectionPool::~DetectionPool() {
@@ -112,11 +114,13 @@ PoolDetectionResult DetectionPool::detect(AVFrame* frame) {
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        // 队列积压超过 worker 数量 × 2 时丢弃最旧任务
-        size_t max_queue = static_cast<size_t>(num_workers_ * 2);
+        // 队列积压超过最大容量时丢弃最旧任务
+        size_t max_queue = static_cast<size_t>(max_queue_size_);
         while (task_queue_.size() >= max_queue) {
             try {
-                task_queue_.front().promise.set_value({});
+                PoolDetectionResult dropped_result;
+                dropped_result.dropped = true;
+                task_queue_.front().promise.set_value(std::move(dropped_result));
             } catch (...) {}
             task_queue_.pop();
         }

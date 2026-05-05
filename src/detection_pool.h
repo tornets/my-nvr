@@ -25,6 +25,7 @@ class RKNNDetector;
 struct PoolDetectionResult {
     DetectionResult detection;
     bool success = false;
+    bool dropped = false;  // 队列过载时任务被丢弃
 
 #if DUMP_DECTECT_IMAGE
     std::vector<uint8_t> debug_rgb;
@@ -36,7 +37,7 @@ struct PoolDetectionResult {
 // NPU 推理线程池
 class DetectionPool {
 public:
-    DetectionPool(int num_workers, const DetectionConfig& config);
+    DetectionPool(int num_workers, const DetectionConfig& config, int max_queue_size = 64);
     ~DetectionPool();
 
     DetectionPool(const DetectionPool&) = delete;
@@ -60,6 +61,7 @@ private:
     void workerLoop(int index);
 
     int num_workers_;
+    int max_queue_size_;
     DetectionConfig config_;
 
     // 共享任务队列

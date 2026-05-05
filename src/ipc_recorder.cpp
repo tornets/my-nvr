@@ -376,28 +376,40 @@ void IPCRecorder::closeHardwareDecoder() {
 AVFrame* IPCRecorder::decodeVideoFrame(AVPacket* packet) {
     if (!m_video_decoder_ctx) return nullptr;
 
-    // 发送 packet 到解码器
+    auto t0 = std::chrono::steady_clock::now();
+
+    // 发送 packet 到解码器，EAGAIN 时先排空输出再重试
     int ret = avcodec_send_packet(m_video_decoder_ctx, packet);
     if (ret < 0) {
         if (ret == AVERROR(EAGAIN)) {
-            // 解码器输入缓冲区满
-            // 这说明解码速度跟不上发送速度，跳过这一帧继续处理下一帧
-            // 不阻塞等待，让解码器自行恢复
+            // 解码器输入缓冲区满，排空已解码帧后重试
+            while (avcodec_receive_frame(m_video_decoder_ctx, m_decoded_frame) == 0) {
+                av_frame_unref(m_decoded_frame);
+            }
+            ret = avcodec_send_packet(m_video_decoder_ctx, packet);
+            if (ret < 0) {
+                if (ret != AVERROR(EAGAIN)) {
+                    LOG_TRACE("[{}] hw decoder send_packet failed: {}", m_stream_id, av_err_to_string(ret));
+                }
+                return nullptr;
+            }
+        } else {
+            LOG_TRACE("[{}] hw decoder send_packet failed: {}", m_stream_id, av_err_to_string(ret));
             return nullptr;
         }
-        LOG_DEBUG("hw decoder send_packet failed: {}", av_err_to_string(ret));
-        return nullptr;
     }
 
     ret = avcodec_receive_frame(m_video_decoder_ctx, m_decoded_frame);
     if (ret < 0) {
-        if (ret == AVERROR(EAGAIN)) {
-            // 解码器正在处理，暂时没有可用帧
-            return nullptr;
+        if (ret != AVERROR(EAGAIN)) {
+            LOG_TRACE("[{}] hw decoder receive_frame failed: {}", m_stream_id, av_err_to_string(ret));
         }
-        LOG_DEBUG("hw decoder receive_frame failed: {}", av_err_to_string(ret));
         return nullptr;
     }
+
+    auto t1 = std::chrono::steady_clock::now();
+    auto decode_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    LOG_TRACE("[{}] hw decode ok: pts={}, time={:.1f}ms", m_stream_id, packet->pts, decode_ms);
 
     if (m_decoded_frame->format != AV_PIX_FMT_DRM_PRIME) {
         LOG_DEBUG("Expected DRM_PRIME, got format {}", m_decoded_frame->format);

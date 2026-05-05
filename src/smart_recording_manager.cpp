@@ -7,6 +7,7 @@
 #include "config_loader.h"
 #include "log.h"
 #include <chrono>
+#include <climits>
 
 namespace nvr {
 
@@ -281,8 +282,10 @@ void SmartRecordingManager::detectionWorkerThread() {
 #if DUMP_DECTECT_IMAGE
             saveDetectionImage(pool_result, frame_idx);
 #endif
+        } else if (pool_result.dropped) {
+            LOG_DEBUG("[{}] Detection dropped #{}: (pool overloaded), pts={}", stream_id_, detection_count_.load(), task.pts);
         } else {
-            LOG_WARN("Detection failed for frame pts={}", task.pts);
+            LOG_WARN("[{}] Detection failed #{}:, pts={}", stream_id_, detection_count_.load(), task.pts);
         }
 
         // 释放帧
@@ -379,6 +382,9 @@ bool SmartRecordingManager::shouldRunDetection(bool is_key_frame, int64_t pts) {
         if (interval <= 0) {
             return false;
         }
+        if (last_detection_pts_ == 0) {
+            return true;  // 首帧始终检测
+        }
         AVRational tb = time_base_;
         int64_t interval_pts = static_cast<int64_t>(interval * tb.den / tb.num);
         return (pts - last_detection_pts_) >= interval_pts;
@@ -402,23 +408,9 @@ bool SmartRecordingManager::shouldDecodeForDetection(bool is_key_frame, int64_t 
         return is_key_frame;  // 只解码关键帧
 
     case DetectionMode::Sampled:
-        // 关键帧始终解码，非关键帧按时间间隔判断
-        if (is_key_frame) {
-            return true;
-        }
-        // 对于非关键帧，检查是否到了检测间隔
-        // 如果间隔到了，返回 true 让解码器解码，然后 shouldRunDetection 会返回 true 进行检测
-        {
-            float interval = config_.rknn.detection_interval_seconds;
-            if (interval <= 0) {
-                return false;
-            }
-            AVRational tb = time_base_;
-            int64_t interval_pts = static_cast<int64_t>(interval * tb.den / tb.num);
-            // 注意：这里需要修改 last_detection_pts_，所以不能是 const
-            // 暂时移除 const 限定，或者在调用方处理
-            return (pts - last_detection_pts_) >= interval_pts;
-        }
+        // 所有关键帧 + 非关键帧都解码（维护解码器参考帧缓冲）
+        // 检测按时间间隔进行（在 processVideoFrame 中判断）
+        return true;
 
     case DetectionMode::Realtime:
         return true;  // 每帧都解码

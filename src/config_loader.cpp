@@ -62,6 +62,10 @@ Config Config::getDefault() {
     // 店铺默认配置
     config.shop.id = 0;                              // 默认店铺ID为0
 
+    // NPU 检测池默认配置
+    config.detection_pool.workers = 3;               // RK3588 有 3 个 NPU 核心
+    config.detection_pool.queue_size = 64;            // 32 路流场景足够
+
     return config;
 }
 
@@ -350,6 +354,27 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
             const auto& shop = yaml["shop"];
             if (shop["id"]) {
                 config.shop.id = shop["id"].as<int>();
+            }
+        }
+
+        // 解析 NPU 检测池配置
+        if (yaml["detection_pool"]) {
+            const auto& dp = yaml["detection_pool"];
+            if (dp["workers"]) {
+                int workers = dp["workers"].as<int>();
+                if (workers < 1 || workers > 8) {
+                    std::cerr << "Warning: detection_pool.workers must be 1-8, using default (3)" << std::endl;
+                } else {
+                    config.detection_pool.workers = workers;
+                }
+            }
+            if (dp["queue_size"]) {
+                int queue_size = dp["queue_size"].as<int>();
+                if (queue_size < 1 || queue_size > 256) {
+                    std::cerr << "Warning: detection_pool.queue_size must be 1-256, using default (64)" << std::endl;
+                } else {
+                    config.detection_pool.queue_size = queue_size;
+                }
             }
         }
 

@@ -87,6 +87,11 @@ struct ShopConfig {
     int id;                       // 店铺ID
 };
 
+struct DetectionPoolConfig {
+    int workers = 3;              // NPU worker 数量（对应 NPU 核心数）
+    int queue_size = 64;          // 最大排队任务数（建议 >= 流数量 × 2）
+};
+
 struct UploadTask {
     std::string file_path;
     std::string stream_id;
@@ -109,6 +114,7 @@ struct Config {
     UploadConfig upload;           // 上传配置
     RecordConfig record;           // 录制配置
     ShopConfig shop;               // 店铺配置
+    DetectionPoolConfig detection_pool;  // NPU 检测池配置
 
     // 获取默认配置
     static Config getDefault();

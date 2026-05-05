@@ -13,6 +13,9 @@
 #include "config_loader.h"
 #include <spdlog/spdlog.h>
 #include <memory>
+
+// 前向声明
+enum class DetectionMode;
 #include <mutex>
 #include <atomic>
 #include <thread>
@@ -98,6 +101,9 @@ public:
     // 返回从最近关键帧开始的所有帧
     std::vector<CachedFrame> getPrebufferFrames() const;
 
+    // 检查是否需要解码帧进行检测（sampled/realtime 模式需要解码非关键帧）
+    bool shouldDecodeForDetection(bool is_key_frame, int64_t pts);
+
     // 获取状态名称
     static const char* getStateName(SmartRecordingState state);
 
@@ -150,7 +156,7 @@ private:
     void transitionTo(SmartRecordingState new_state);
 
     // 检查是否需要执行检测
-    bool shouldRunDetection(bool is_key_frame);
+    bool shouldRunDetection(bool is_key_frame, int64_t pts);
 
     // 清理旧的检测结果
     void cleanupOldDetections();
@@ -197,6 +203,7 @@ private:
 
     // 分段时间管理
     int64_t segment_start_pts_;
+    int64_t last_detection_pts_;      // sampled 模式上次检测的 PTS
     AVRational time_base_;
 
     // 输出上下文

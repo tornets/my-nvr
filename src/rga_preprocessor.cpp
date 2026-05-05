@@ -3,7 +3,7 @@
 //
 
 #include "rga_preprocessor.h"
-#include <spdlog/spdlog.h>
+#include "log.h"
 
 namespace nvr::detection {
 
@@ -16,7 +16,7 @@ int RGAPreprocessor::drmToRGAFormat(int drm_format) {
         case DRM_FORMAT_NV12:
             return RK_FORMAT_YCbCr_420_SP;
         default:
-            spdlog::warn("Unknown DRM format: 0x{:x}, defaulting to NV12", drm_format);
+            LOG_WARN("Unknown DRM format: 0x{:x}, defaulting to NV12", drm_format);
             return RK_FORMAT_YCbCr_420_SP;
     }
 }
@@ -32,7 +32,7 @@ RGAPreprocessor::~RGAPreprocessor() {
 
 bool RGAPreprocessor::initialize(int dst_fd, int model_width, int model_height, int dst_wstride) {
     if (dst_fd <= 0) {
-        spdlog::error("RGAPreprocessor: invalid dst_fd");
+        LOG_ERROR("RGAPreprocessor: invalid dst_fd");
         return false;
     }
 
@@ -49,7 +49,7 @@ bool RGAPreprocessor::initialize(int dst_fd, int model_width, int model_height, 
 
     dst_handle_ = importbuffer_fd(dst_fd_, &dst_param);
     if (dst_handle_ == 0) {
-        spdlog::error("RGAPreprocessor: importbuffer_fd(dst) failed, fd={}, {}x{}",
+        LOG_ERROR("RGAPreprocessor: importbuffer_fd(dst) failed, fd={}, {}x{}",
                        dst_fd_, model_width_, model_height_);
         return false;
     }
@@ -59,7 +59,7 @@ bool RGAPreprocessor::initialize(int dst_fd, int model_width, int model_height, 
                                     dst_wstride_, model_height_, RK_FORMAT_RGB_888);
 
     initialized_ = true;
-    spdlog::info("RGAPreprocessor initialized: dst_fd={}, {}x{}, dst_wstride={}",
+    LOG_INFO("RGAPreprocessor initialized: dst_fd={}, {}x{}, dst_wstride={}",
                  dst_fd_, model_width_, model_height_, dst_wstride_);
     return true;
 }
@@ -81,7 +81,7 @@ bool RGAPreprocessor::resizeNV12toRGB(int src_fd, int src_width, int src_height,
 
     rga_buffer_handle_t src_handle = importbuffer_fd(src_fd, &src_param);
     if (src_handle == 0) {
-        spdlog::error("RGAPreprocessor: importbuffer_fd(src) failed, fd={}, img={}x{}, format=0x{:x}",
+        LOG_ERROR("RGAPreprocessor: importbuffer_fd(src) failed, fd={}, img={}x{}, format=0x{:x}",
                        src_fd, src_width, src_height, rga_format);
         return false;
     }
@@ -97,7 +97,7 @@ bool RGAPreprocessor::resizeNV12toRGB(int src_fd, int src_width, int src_height,
     releasebuffer_handle(src_handle);
 
     if (status != IM_STATUS_SUCCESS) {
-        spdlog::error("RGAPreprocessor: imresize failed, status={}, src={}x{}, dst={}x{}",
+        LOG_ERROR("RGAPreprocessor: imresize failed, status={}, src={}x{}, dst={}x{}",
                        static_cast<int>(status), src_width, src_height,
                        model_width_, model_height_);
         return false;

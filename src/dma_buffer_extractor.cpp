@@ -4,7 +4,7 @@
 //
 
 #include "dma_buffer_extractor.h"
-#include <spdlog/spdlog.h>
+#include "log.h"
 #include <cstring>
 
 extern "C" {
@@ -91,18 +91,18 @@ void DMABufferWrapper::release() {
 
 std::unique_ptr<DMABufferWrapper> DMABufferExtractor::extractFromAVFrame(AVFrame* frame) {
     if (!frame) {
-        spdlog::error("Cannot extract DMA buffer: frame is null");
+        LOG_ERROR("Cannot extract DMA buffer: frame is null");
         return nullptr;
     }
 
     if (!hasDMABuffer(frame)) {
-        spdlog::warn("Frame does not contain DMA buffer");
+        LOG_WARN("Frame does not contain DMA buffer");
         return nullptr;
     }
 
     AVDRMFrameDescriptor* drm_desc = getDRMDescriptor(frame);
     if (!drm_desc) {
-        spdlog::error("Failed to get DRM descriptor");
+        LOG_ERROR("Failed to get DRM descriptor");
         return nullptr;
     }
 
@@ -113,7 +113,7 @@ std::unique_ptr<DMABufferWrapper> DMABufferExtractor::extractFromAVFrame(AVFrame
         for (int plane = 0; plane < layer_desc.nb_planes; ++plane) {
             const AVDRMObjectDescriptor& object = drm_desc->objects[layer_desc.planes[plane].object_index];
 
-            spdlog::debug("Extracted DMA buffer: layer={}, plane={}, fd={}, size={} bytes",
+            LOG_DEBUG("Extracted DMA buffer: layer={}, plane={}, fd={}, size={} bytes",
                          layer, plane, object.fd, object.size);
         }
 
@@ -128,7 +128,7 @@ std::unique_ptr<DMABufferWrapper> DMABufferExtractor::extractFromAVFrame(AVFrame
             uv_offset = static_cast<int>(layer_desc.planes[1].offset);
             uv_stride = static_cast<int>(layer_desc.planes[1].pitch);
 
-            spdlog::debug("DMA buffer has 2 planes: plane[0] pitch={}, plane[1] offset={}, pitch={}",
+            LOG_DEBUG("DMA buffer has 2 planes: plane[0] pitch={}, plane[1] offset={}, pitch={}",
                          stride, uv_offset, uv_stride);
         }
 
@@ -148,7 +148,7 @@ std::unique_ptr<DMABufferWrapper> DMABufferExtractor::extractFromAVFrame(AVFrame
             }
         }
 
-        spdlog::info("DMA buffer: {}x{}, stride={}, height_stride={}, uv_offset={}, size={}, calc_hs={}, drm_format=0x{:x}",
+        LOG_INFO("DMA buffer: {}x{}, stride={}, height_stride={}, uv_offset={}, size={}, calc_hs={}, drm_format=0x{:x}",
                      frame->width, frame->height, stride, calc_height_stride, uv_offset, object.size, calc_height_stride, layer_desc.format);
 
         auto wrapper = std::make_unique<DMABufferWrapper>(
@@ -166,7 +166,7 @@ std::unique_ptr<DMABufferWrapper> DMABufferExtractor::extractFromAVFrame(AVFrame
         }
     }
 
-    spdlog::error("Failed to extract valid DMA buffer from frame");
+    LOG_ERROR("Failed to extract valid DMA buffer from frame");
     return nullptr;
 }
 
@@ -189,7 +189,7 @@ AVDRMFrameDescriptor* DMABufferExtractor::getDRMDescriptor(AVFrame* frame) {
 
 void DMABufferExtractor::printDMABufferInfo(AVFrame* frame) {
     if (!hasDMABuffer(frame)) {
-        spdlog::info("Frame does not contain DMA buffer");
+        LOG_INFO("Frame does not contain DMA buffer");
         return;
     }
 
@@ -198,26 +198,26 @@ void DMABufferExtractor::printDMABufferInfo(AVFrame* frame) {
         return;
     }
 
-    spdlog::info("DMA Buffer Info:");
-    spdlog::info("  Format: {}", av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame->format)));
-    spdlog::info("  Width: {}", frame->width);
-    spdlog::info("  Height: {}", frame->height);
-    spdlog::info("  Layers: {}", drm_desc->nb_layers);
-    spdlog::info("  Objects: {}", drm_desc->nb_objects);
+    LOG_INFO("DMA Buffer Info:");
+    LOG_INFO("  Format: {}", av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame->format)));
+    LOG_INFO("  Width: {}", frame->width);
+    LOG_INFO("  Height: {}", frame->height);
+    LOG_INFO("  Layers: {}", drm_desc->nb_layers);
+    LOG_INFO("  Objects: {}", drm_desc->nb_objects);
 
     for (int i = 0; i < drm_desc->nb_objects; ++i) {
         const auto& obj = drm_desc->objects[i];
-        spdlog::info("    Object[{}]: fd={}, size={}, format_modifier=0x{:x}",
+        LOG_INFO("    Object[{}]: fd={}, size={}, format_modifier=0x{:x}",
                      i, obj.fd, obj.size, obj.format_modifier);
     }
 
     for (int i = 0; i < drm_desc->nb_layers; ++i) {
         const auto& layer = drm_desc->layers[i];
-        spdlog::info("    Layer[{}]: nb_planes={}, format={}",
+        LOG_INFO("    Layer[{}]: nb_planes={}, format={}",
                      i, layer.nb_planes, layer.format);
 
         for (int j = 0; j < layer.nb_planes; ++j) {
-            spdlog::info("      Plane[{}]: offset={}, pitch={}",
+            LOG_INFO("      Plane[{}]: offset={}, pitch={}",
                          j, layer.planes[j].offset, layer.planes[j].pitch);
         }
     }
@@ -225,17 +225,17 @@ void DMABufferExtractor::printDMABufferInfo(AVFrame* frame) {
 
 bool DMABufferExtractor::validateDMABuffer(const DMABufferInfo& info) {
     if (info.fd < 0) {
-        spdlog::error("Invalid DMA buffer: fd < 0");
+        LOG_ERROR("Invalid DMA buffer: fd < 0");
         return false;
     }
 
     if (info.size == 0) {
-        spdlog::error("Invalid DMA buffer: size == 0");
+        LOG_ERROR("Invalid DMA buffer: size == 0");
         return false;
     }
 
     if (info.width <= 0 || info.height <= 0) {
-        spdlog::error("Invalid DMA buffer: invalid dimensions {}x{}", info.width, info.height);
+        LOG_ERROR("Invalid DMA buffer: invalid dimensions {}x{}", info.width, info.height);
         return false;
     }
 
@@ -280,7 +280,7 @@ bool DMABufferExporter::prepareForRKNN(const DMABufferInfo& info, rknn_tensor_me
     mem_desc.size = info.size;
     mem_desc.virt_addr = nullptr;  // 零拷贝模式，虚拟地址为空
 
-    spdlog::debug("Prepared DMA buffer for RKNN: fd={}, size={}", info.fd, info.size);
+    LOG_DEBUG("Prepared DMA buffer for RKNN: fd={}, size={}", info.fd, info.size);
 
     return true;
 }

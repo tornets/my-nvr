@@ -5,7 +5,7 @@
 #include "detection_pool.h"
 #include "rknn_detector.h"
 #include "dma_buffer_extractor.h"
-#include <spdlog/spdlog.h>
+#include "log.h"
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -27,7 +27,7 @@ DetectionPool::~DetectionPool() {
 }
 
 bool DetectionPool::initialize() {
-    spdlog::info("DetectionPool: initializing {} workers", num_workers_);
+    LOG_INFO("DetectionPool: initializing {} workers", num_workers_);
 
     // NPU 核心掩码：RKNN_NPU_CORE_0=1, CORE_1=2, CORE_2=4
     static const uint32_t core_masks[] = {1, 2, 4};
@@ -38,23 +38,23 @@ bool DetectionPool::initialize() {
         // 创建 detector
         w->detector = std::make_unique<RKNNDetector>(config_);
         if (!w->detector->initialize()) {
-            spdlog::error("DetectionPool: worker {} detector init failed", i);
+            LOG_ERROR("DetectionPool: worker {} detector init failed", i);
             return false;
         }
 
         // 绑定 NPU 核心
         uint32_t mask = (i < 3) ? core_masks[i] : 1;
         if (!w->detector->setCoreMask(mask)) {
-            spdlog::error("DetectionPool: worker {} set core mask failed", i);
+            LOG_ERROR("DetectionPool: worker {} set core mask failed", i);
             return false;
         }
 
         // 预热
         if (!w->detector->warmup()) {
-            spdlog::warn("DetectionPool: worker {} warmup failed", i);
+            LOG_WARN("DetectionPool: worker {} warmup failed", i);
         }
 
-        spdlog::info("DetectionPool: worker {} initialized, NPU core mask={}", i, mask);
+        LOG_INFO("DetectionPool: worker {} initialized, NPU core mask={}", i, mask);
 
         workers_.push_back(std::move(w));
     }
@@ -66,7 +66,7 @@ bool DetectionPool::initialize() {
         workers_[i]->thread = std::thread(&DetectionPool::workerLoop, this, i);
     }
 
-    spdlog::info("DetectionPool: started with {} workers", num_workers_);
+    LOG_INFO("DetectionPool: started with {} workers", num_workers_);
     return true;
 }
 
@@ -98,7 +98,7 @@ void DetectionPool::shutdown() {
         w->detector.reset();
     }
     workers_.clear();
-    spdlog::info("DetectionPool: shutdown complete");
+    LOG_INFO("DetectionPool: shutdown complete");
 }
 
 PoolDetectionResult DetectionPool::detect(AVFrame* frame) {
@@ -129,7 +129,7 @@ PoolDetectionResult DetectionPool::detect(AVFrame* frame) {
 
 void DetectionPool::workerLoop(int index) {
     auto& detector = workers_[index]->detector;
-    spdlog::debug("DetectionPool worker {} started", index);
+    LOG_DEBUG("DetectionPool worker {} started", index);
 
     while (running_) {
         Task task;
@@ -170,7 +170,7 @@ void DetectionPool::workerLoop(int index) {
         task.promise.set_value(std::move(result));
     }
 
-    spdlog::debug("DetectionPool worker {} stopped", index);
+    LOG_DEBUG("DetectionPool worker {} stopped", index);
 }
 
 } // namespace nvr::detection

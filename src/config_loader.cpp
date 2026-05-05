@@ -204,6 +204,19 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
                             if (rknn["detection_interval_keyframes"]) {
                                 stream_config.smart_recording.rknn.detection_interval_keyframes = rknn["detection_interval_keyframes"].as<int>();
                             }
+                            if (rknn["detection_mode"]) {
+                                std::string mode = rknn["detection_mode"].as<std::string>();
+                                if (mode == "sampled") {
+                                    stream_config.smart_recording.rknn.detection_mode = DetectionMode::Sampled;
+                                } else if (mode == "realtime") {
+                                    stream_config.smart_recording.rknn.detection_mode = DetectionMode::Realtime;
+                                } else {
+                                    stream_config.smart_recording.rknn.detection_mode = DetectionMode::Keyframe;
+                                }
+                            }
+                            if (rknn["detection_interval_seconds"]) {
+                                stream_config.smart_recording.rknn.detection_interval_seconds = rknn["detection_interval_seconds"].as<float>();
+                            }
                             if (rknn["player_class_id"]) {
                                 stream_config.smart_recording.rknn.player_class_id = rknn["player_class_id"].as<int>();
                             }

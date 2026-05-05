@@ -5,7 +5,7 @@
 
 #include "smart_recording_manager.h"
 #include "config_loader.h"
-#include <spdlog/spdlog.h>
+#include "log.h"
 #include <chrono>
 
 namespace nvr {
@@ -25,6 +25,7 @@ SmartRecordingManager::SmartRecordingManager(
     , running_(false)
     , current_state_(SmartRecordingState::IDLE)
     , segment_start_pts_(0)
+    , last_detection_pts_(0)
     , time_base_{1, 90000}
     , output_ctx_(nullptr)
     , video_stream_index_(-1)
@@ -46,20 +47,20 @@ bool SmartRecordingManager::initialize() {
     std::lock_guard<std::mutex> lock(state_mutex_);
 
     if (initialized_) {
-        logger_->warn("SmartRecordingManager already initialized for stream: {}", stream_id_);
+        LOG_WARN("SmartRecordingManager already initialized for stream: {}", stream_id_);
         return true;
     }
 
-    logger_->info("Initializing SmartRecordingManager for stream: {}", stream_id_);
+    LOG_INFO("Initializing SmartRecordingManager for stream: {}", stream_id_);
 
     // 检查配置
     if (!config_.enabled) {
-        logger_->info("Smart recording disabled for stream: {}", stream_id_);
+        LOG_INFO("Smart recording disabled for stream: {}", stream_id_);
         return true;
     }
 
     if (!config_.rknn.enabled) {
-        logger_->warn("RKNN detection disabled, smart recording will not work properly");
+        LOG_WARN("RKNN detection disabled, smart recording will not work properly");
         return false;
     }
 
@@ -74,7 +75,7 @@ bool SmartRecordingManager::initialize() {
     segment_decision_ = std::make_unique<detection::SmartSegmentDecision>(config_);
 
     initialized_ = true;
-    logger_->info("SmartRecordingManager initialized successfully for stream: {}", stream_id_);
+    LOG_INFO("SmartRecordingManager initialized successfully for stream: {}", stream_id_);
 
     return true;
 }
@@ -85,7 +86,7 @@ void SmartRecordingManager::shutdown() {
         if (!initialized_) {
             return;
         }
-        logger_->info("Shutting down SmartRecordingManager for stream: {}", stream_id_);
+        LOG_INFO("Shutting down SmartRecordingManager for stream: {}", stream_id_);
         if (!running_) {
             initialized_ = false;
             return;
@@ -117,23 +118,23 @@ void SmartRecordingManager::shutdown() {
     segment_decision_.reset();
 
     initialized_ = false;
-    logger_->info("SmartRecordingManager shut down for stream: {}", stream_id_);
+    LOG_INFO("SmartRecordingManager shut down for stream: {}", stream_id_);
 }
 
 bool SmartRecordingManager::start() {
     std::lock_guard<std::mutex> lock(state_mutex_);
 
     if (!initialized_) {
-        logger_->error("Cannot start: SmartRecordingManager not initialized");
+        LOG_ERROR("Cannot start: SmartRecordingManager not initialized");
         return false;
     }
 
     if (running_) {
-        logger_->warn("SmartRecordingManager already running for stream: {}", stream_id_);
+        LOG_WARN("SmartRecordingManager already running for stream: {}", stream_id_);
         return true;
     }
 
-    logger_->info("Starting SmartRecordingManager for stream: {}", stream_id_);
+    LOG_INFO("Starting SmartRecordingManager for stream: {}", stream_id_);
 
     running_ = true;
     current_state_ = SmartRecordingState::IDLE;
@@ -144,7 +145,7 @@ bool SmartRecordingManager::start() {
     // 启动检测线程
     detection_thread_ = std::thread(&SmartRecordingManager::detectionWorkerThread, this);
 
-    logger_->info("SmartRecordingManager started successfully for stream: {}", stream_id_);
+    LOG_INFO("SmartRecordingManager started successfully for stream: {}", stream_id_);
 
     return true;
 }
@@ -158,7 +159,7 @@ void SmartRecordingManager::stop() {
         running_ = false;
     }
 
-    logger_->info("Stopping SmartRecordingManager for stream: {}", stream_id_);
+    LOG_INFO("Stopping SmartRecordingManager for stream: {}", stream_id_);
 
     // 在锁外停止检测线程（避免死锁：handleDetectionResult 也获取 state_mutex_）
     queue_cv_.notify_all();
@@ -178,7 +179,7 @@ void SmartRecordingManager::stop() {
         }
     }
 
-    logger_->info("SmartRecordingManager stopped for stream: {}", stream_id_);
+    LOG_INFO("SmartRecordingManager stopped for stream: {}", stream_id_);
 }
 
 bool SmartRecordingManager::processVideoFrame(
@@ -203,7 +204,10 @@ bool SmartRecordingManager::processVideoFrame(
     }
 
     // 检查是否需要运行检测
-    if (shouldRunDetection(is_key_frame) && decoded_frame) {
+    if (shouldRunDetection(is_key_frame, pts) && decoded_frame) {
+        // 更新上次检测 PTS
+        last_detection_pts_ = pts;
+
         // 将解码后的帧送入检测队列
         DetectionTask task;
         task.pts = pts;
@@ -229,7 +233,7 @@ bool SmartRecordingManager::processVideoFrame(
 }
 
 void SmartRecordingManager::detectionWorkerThread() {
-    logger_->debug("Detection worker thread started for stream: {}", stream_id_);
+    LOG_DEBUG("Detection worker thread started for stream: {}", stream_id_);
 
     while (running_) {
         DetectionTask task;
@@ -269,7 +273,7 @@ void SmartRecordingManager::detectionWorkerThread() {
         if (pool_result.success) {
             detection_count_++;
             const auto& result = pool_result.detection;
-            logger_->debug("[{}] Detection #{}: {} boxes, has_player={}, player_conf={:.2f}, time={:.1f}ms",
+            LOG_DEBUG("[{}] Detection #{}: {} boxes, has_player={}, player_conf={:.2f}, time={:.1f}ms",
                            stream_id_, detection_count_.load(), result.boxes.size(),
                            result.has_player, result.player_confidence,
                            result.processing_time_ms);
@@ -278,7 +282,7 @@ void SmartRecordingManager::detectionWorkerThread() {
             saveDetectionImage(pool_result, frame_idx);
 #endif
         } else {
-            logger_->warn("Detection failed for frame pts={}", task.pts);
+            LOG_WARN("Detection failed for frame pts={}", task.pts);
         }
 
         // 释放帧
@@ -287,7 +291,7 @@ void SmartRecordingManager::detectionWorkerThread() {
         }  // clone 的帧需要 av_frame_free
     }
 
-    logger_->debug("Detection worker thread stopped for stream: {}", stream_id_);
+    LOG_DEBUG("Detection worker thread stopped for stream: {}", stream_id_);
 }
 
 void SmartRecordingManager::handleDetectionResult(const detection::DetectionResult& result) {
@@ -308,7 +312,7 @@ void SmartRecordingManager::handleDetectionResult(const detection::DetectionResu
     switch (current_state_) {
         case SmartRecordingState::IDLE:
             if (result.has_player) {
-                logger_->info("Player detected, starting recording (stream: {})", stream_id_);
+                LOG_INFO("Player detected, starting recording (stream: {})", stream_id_);
                 should_write_ = true;
                 transitionTo(SmartRecordingState::RECORDING);
             }
@@ -319,7 +323,7 @@ void SmartRecordingManager::handleDetectionResult(const detection::DetectionResu
                 // 玩家消失，进入延迟停止状态
                 int delay = config_.post_recording_delay_seconds;
                 recording_stop_time_ = std::chrono::steady_clock::now() + std::chrono::seconds(delay);
-                logger_->info("Player disappeared, post-recording delay {}s (stream: {})", delay, stream_id_);
+                LOG_INFO("Player disappeared, post-recording delay {}s (stream: {})", delay, stream_id_);
                 transitionTo(SmartRecordingState::POST_RECORDING);
             }
             break;
@@ -327,7 +331,7 @@ void SmartRecordingManager::handleDetectionResult(const detection::DetectionResu
         case SmartRecordingState::POST_RECORDING:
             if (result.has_player) {
                 // 玩家重新出现，继续录制
-                logger_->info("Player reappeared, resuming recording (stream: {})", stream_id_);
+                LOG_INFO("Player reappeared, resuming recording (stream: {})", stream_id_);
                 recording_stop_time_ = std::chrono::steady_clock::time_point::max();
                 transitionTo(SmartRecordingState::RECORDING);
             }
@@ -340,7 +344,7 @@ void SmartRecordingManager::transitionTo(SmartRecordingState new_state) {
         return;
     }
 
-    logger_->info("State transition: {} -> {} (stream: {})",
+    LOG_INFO("State transition: {} -> {} (stream: {})",
                  getStateName(current_state_), getStateName(new_state), stream_id_);
 
     // 进入 IDLE 状态时停止写入
@@ -351,22 +355,80 @@ void SmartRecordingManager::transitionTo(SmartRecordingState new_state) {
     current_state_ = new_state;
 }
 
-bool SmartRecordingManager::shouldRunDetection(bool is_key_frame) {
-    if (!is_key_frame) {
-        return false;  // 只检测关键帧
-    }
-
+bool SmartRecordingManager::shouldRunDetection(bool is_key_frame, int64_t pts) {
     if (!config_.rknn.enabled) {
         return false;
     }
 
-    // 检查检测间隔
-    int interval = config_.rknn.detection_interval_keyframes;
-    if (interval <= 0) {
+    switch (config_.rknn.detection_mode) {
+    case DetectionMode::Keyframe: {
+        if (!is_key_frame) {
+            return false;  // 只检测关键帧
+        }
+        // 检查检测间隔
+        int interval = config_.rknn.detection_interval_keyframes;
+        if (interval <= 0) {
+            return false;
+        }
+        return (keyframe_count_ % interval) == 0;
+    }
+
+    case DetectionMode::Sampled: {
+        // 关键帧始终检测（确保不漏），非关键帧按 PTS 时间间隔
+        if (is_key_frame) {
+            return true;
+        }
+        float interval = config_.rknn.detection_interval_seconds;
+        if (interval <= 0) {
+            return false;
+        }
+        AVRational tb = time_base_;
+        int64_t interval_pts = static_cast<int64_t>(interval * tb.den / tb.num);
+        return (pts - last_detection_pts_) >= interval_pts;
+    }
+
+    case DetectionMode::Realtime:
+        return true;  // 每帧都检测
+
+    default:
+        return false;
+    }
+}
+
+bool SmartRecordingManager::shouldDecodeForDetection(bool is_key_frame, int64_t pts) {
+    if (!config_.rknn.enabled) {
         return false;
     }
 
-    return (keyframe_count_ % interval) == 0;
+    switch (config_.rknn.detection_mode) {
+    case DetectionMode::Keyframe:
+        return is_key_frame;  // 只解码关键帧
+
+    case DetectionMode::Sampled:
+        // 关键帧始终解码，非关键帧按时间间隔判断
+        if (is_key_frame) {
+            return true;
+        }
+        // 对于非关键帧，检查是否到了检测间隔
+        // 如果间隔到了，返回 true 让解码器解码，然后 shouldRunDetection 会返回 true 进行检测
+        {
+            float interval = config_.rknn.detection_interval_seconds;
+            if (interval <= 0) {
+                return false;
+            }
+            AVRational tb = time_base_;
+            int64_t interval_pts = static_cast<int64_t>(interval * tb.den / tb.num);
+            // 注意：这里需要修改 last_detection_pts_，所以不能是 const
+            // 暂时移除 const 限定，或者在调用方处理
+            return (pts - last_detection_pts_) >= interval_pts;
+        }
+
+    case DetectionMode::Realtime:
+        return true;  // 每帧都解码
+
+    default:
+        return false;
+    }
 }
 
 const char* SmartRecordingManager::getStateName(SmartRecordingState state) {
@@ -407,24 +469,27 @@ std::vector<CachedFrame> SmartRecordingManager::getPrebufferFrames() const {
 
     auto all_frames = frame_buffer_->getAllFrames();
 
-    // 找到最近的关键帧作为起始点
+    // 找到第一个关键帧作为起始点（必须从关键帧开始才能正确解码）
     size_t start_idx = 0;
     for (size_t i = 0; i < all_frames.size(); i++) {
         if (all_frames[i].is_key_frame) {
             start_idx = i;
+            break;  // 找到第一个关键帧就停止
         }
     }
 
-    // 从最近的关键帧开始返回
-    if (start_idx > 0) {
-        std::vector<CachedFrame> result;
-        for (size_t i = start_idx; i < all_frames.size(); i++) {
-            result.push_back(std::move(all_frames[i]));
-        }
-        return result;
+    // 如果没有找到关键帧，返回空（避免写入无法解码的帧）
+    if (start_idx == 0 && !all_frames.empty() && !all_frames[0].is_key_frame) {
+        LOG_WARN("No keyframe found in prebuffer, skipping prebuffer write");
+        return {};
     }
 
-    return all_frames;
+    // 从第一个关键帧开始返回
+    std::vector<CachedFrame> result;
+    for (size_t i = start_idx; i < all_frames.size(); i++) {
+        result.push_back(std::move(all_frames[i]));
+    }
+    return result;
 }
 
 bool SmartRecordingManager::shouldStopRecording() {
@@ -495,7 +560,7 @@ bool SmartRecordingManager::writeCachedFrames(const std::vector<CachedFrame>& fr
     std::lock_guard<std::mutex> lock(output_mutex_);
 
     if (!output_ctx_ || video_stream_index_ < 0) {
-        logger_->error("Output context not set, cannot write cached frames");
+        LOG_ERROR("Output context not set, cannot write cached frames");
         return false;
     }
 
@@ -875,7 +940,7 @@ void SmartRecordingManager::saveDecodedFrame(AVFrame* frame, int frame_idx) {
     AVFrame* cpu_frame = av_frame_alloc();
     int ret = av_hwframe_transfer_data(cpu_frame, frame, 0);
     if (ret < 0) {
-        logger_->debug("saveDecodedFrame: hwframe transfer failed ({})", ret);
+        LOG_DEBUG("saveDecodedFrame: hwframe transfer failed ({})", ret);
         av_frame_free(&cpu_frame);
         return;
     }
@@ -902,7 +967,7 @@ void SmartRecordingManager::saveDecodedFrame(AVFrame* frame, int frame_idx) {
 
     saveJpeg(path, rgb.data(), width, height);
 
-    logger_->debug("Exported decoded frame: {}", path);
+    LOG_DEBUG("Exported decoded frame: {}", path);
 }
 
 } // namespace nvr

@@ -376,14 +376,26 @@ void IPCRecorder::closeHardwareDecoder() {
 AVFrame* IPCRecorder::decodeVideoFrame(AVPacket* packet) {
     if (!m_video_decoder_ctx) return nullptr;
 
+    // 发送 packet 到解码器
     int ret = avcodec_send_packet(m_video_decoder_ctx, packet);
     if (ret < 0) {
+        if (ret == AVERROR(EAGAIN)) {
+            // 解码器输入缓冲区满
+            // 这说明解码速度跟不上发送速度，跳过这一帧继续处理下一帧
+            // 不阻塞等待，让解码器自行恢复
+            return nullptr;
+        }
         LOG_DEBUG("hw decoder send_packet failed: {}", av_err_to_string(ret));
         return nullptr;
     }
 
     ret = avcodec_receive_frame(m_video_decoder_ctx, m_decoded_frame);
     if (ret < 0) {
+        if (ret == AVERROR(EAGAIN)) {
+            // 解码器正在处理，暂时没有可用帧
+            return nullptr;
+        }
+        LOG_DEBUG("hw decoder receive_frame failed: {}", av_err_to_string(ret));
         return nullptr;
     }
 
@@ -530,11 +542,13 @@ bool IPCRecorder::connectAndRecord() {
 
             // 不在录制中且门控未开启 → 跳过此包
             if (!m_output_ctx && !m_smart_recording->shouldWritePacket()) {
-                // IDLE：缓存所有视频帧，仅关键帧触发检测
+                // IDLE：缓存所有视频帧，按检测模式决定是否解码
                 if (packet->stream_index == m_video_stream_idx) {
                     bool is_key_frame = (packet->flags & AV_PKT_FLAG_KEY) != 0;
                     AVFrame* decoded = nullptr;
-                    if (m_video_decoder_ctx && is_key_frame) {
+                    // 根据检测模式判断是否需要解码
+                    bool need_decode = m_smart_recording->shouldDecodeForDetection(is_key_frame, packet->pts);
+                    if (m_video_decoder_ctx && need_decode) {
                         decoded = decodeVideoFrame(packet);
                     }
                     m_smart_recording->processVideoFrame(packet, decoded, packet->pts, packet->dts, is_key_frame);
@@ -597,22 +611,29 @@ bool IPCRecorder::connectAndRecord() {
                     m_last_video_dts = 0;
 
                     // 写入预缓存帧（PTS 偏移到从 0 开始）
-                    nvr::FrameBufferWriter writer(m_output_ctx, 0);
-                    writer.setTimeBase(m_video_time_base);
-                    writer.setPTSOffset(m_segment_start_pts, m_segment_start_dts);
-                    if (!writer.writeFrames(prebuffer)) {
-                        LOG_WARN("Failed to write some prebuffer frames");
-                    }
+                    if (!prebuffer.empty() && prebuffer[0].is_key_frame) {
+                        nvr::FrameBufferWriter writer(m_output_ctx, 0);
+                        writer.setTimeBase(m_video_time_base);
+                        writer.setPTSOffset(m_segment_start_pts, m_segment_start_dts);
+                        if (!writer.writeFrames(prebuffer)) {
+                            LOG_WARN("Failed to write some prebuffer frames");
+                        }
 
-                    LOG_INFO("Smart recording: prebuffer written ({} frames, start_pts={})", prebuffer.size(), m_segment_start_pts);
-                    // 当前包继续往下走正常写入流程
-                } else {
-                    // 无预缓存或无关键帧，等待下一个关键帧
-                    if (!(packet->flags & AV_PKT_FLAG_KEY) || packet->stream_index != m_video_stream_idx) {
-                        av_packet_unref(packet);
-                        continue;
+                        // 不更新 m_segment_start_pts 和 m_segment_start_dts
+                        // 保持原来的值，这样当前帧的时间戳会相对于预缓存的第一帧，而不是最后一帧
+                        // 这确保了 DTS 的连续性
+
+                        LOG_INFO("Smart recording: prebuffer written ({} frames), start pts={} kept for continuity",
+                                 prebuffer.size(), m_segment_start_pts);
+                        // 当前包继续往下走正常写入流程
+                    } else {
+                        // 无预缓存或无关键帧，等待下一个关键帧
+                        if (!(packet->flags & AV_PKT_FLAG_KEY) || packet->stream_index != m_video_stream_idx) {
+                            av_packet_unref(packet);
+                            continue;
+                        }
+                        LOG_INFO("Smart recording: opening new file (no prebuffer), player detected");
                     }
-                    LOG_INFO("Smart recording: opening new file (no prebuffer), player detected");
                 }
             }
         } else
@@ -725,6 +746,12 @@ bool IPCRecorder::connectAndRecord() {
             AVStream* in_stream = m_input_ctx->streams[stream_index];
             AVStream* out_stream = m_output_ctx->streams[0];  // 视频流在输出的第一个位置
 
+#ifdef ENABLE_RKNN_SMART_RECORDING
+            // 保存原始 PTS/DTS 用于智能录制（在调整之前）
+            int64_t original_pts = packet->pts;
+            int64_t original_dts = packet->dts;
+#endif
+
             // 分别减去起始 PTS 和 DTS
             packet->pts -= m_segment_start_pts;
             packet->dts -= m_segment_start_dts;
@@ -744,21 +771,23 @@ bool IPCRecorder::connectAndRecord() {
             packet->stream_index = 0;  // 设置为输出视频流索引
 
 #ifdef ENABLE_RKNN_SMART_RECORDING
-            // 智能录制处理
+            // 智能录制处理（使用原始时间戳）
             if (m_smart_recording_enabled && m_smart_recording) {
                 bool is_key_frame = (packet->flags & AV_PKT_FLAG_KEY) != 0;
 
-                // 关键帧时触发硬件解码 + 检测
-                if (is_key_frame && m_video_decoder_ctx) {
+                // 根据检测模式判断是否需要解码
+                bool need_decode = m_smart_recording->shouldDecodeForDetection(is_key_frame, original_pts);
+
+                if (need_decode && m_video_decoder_ctx) {
                     AVFrame* decoded = decodeVideoFrame(packet);
                     if (decoded) {
-                        m_smart_recording->processVideoFrame(packet, decoded, packet->pts, packet->dts, is_key_frame);
+                        m_smart_recording->processVideoFrame(packet, decoded, original_pts, original_dts, is_key_frame);
                         av_frame_unref(m_decoded_frame);
                     } else {
-                        m_smart_recording->processVideoFrame(packet, nullptr, packet->pts, packet->dts, is_key_frame);
+                        m_smart_recording->processVideoFrame(packet, nullptr, original_pts, original_dts, is_key_frame);
                     }
                 } else {
-                    m_smart_recording->processVideoFrame(packet, nullptr, packet->pts, packet->dts, is_key_frame);
+                    m_smart_recording->processVideoFrame(packet, nullptr, original_pts, original_dts, is_key_frame);
                 }
             }
 #endif
@@ -1060,6 +1089,142 @@ bool IPCRecorder::openOutput(const std::string& filename) {
 
 void IPCRecorder::closeOutput() {
     if (m_output_ctx) {
+        // 刷新音频编码器中剩余的帧（如果启用了音频转码）
+        if (m_audio_encoder_ctx && m_audio_fifo_initialized > 0) {
+            LOG_INFO("Flushing audio encoder before closing output...");
+
+            // 步骤1: 编码 FIFO 中剩余的完整帧
+            encodeAndFlushAudioFrames();
+
+            // 步骤2: 处理 FIFO 中不足一个完整帧的剩余采样（用静音填充）
+            int remaining_samples = av_audio_fifo_size(m_audio_fifo);
+            if (remaining_samples > 0) {
+                LOG_INFO("Padding {} remaining audio samples with silence", remaining_samples);
+
+                AVFrame* silence_frame = av_frame_alloc();
+                silence_frame->nb_samples = m_audio_encoder_ctx->frame_size;
+                silence_frame->channel_layout = m_audio_encoder_ctx->channel_layout;
+                silence_frame->channels = m_audio_encoder_ctx->channels;
+                silence_frame->format = m_audio_encoder_ctx->sample_fmt;
+                silence_frame->sample_rate = m_audio_encoder_ctx->sample_rate;
+                silence_frame->pts = m_audio_frame_count;
+
+                int ret = av_frame_get_buffer(silence_frame, 0);
+                if (ret >= 0) {
+                    // 先从 FIFO 读取剩余采样
+                    int read_samples = av_audio_fifo_read(m_audio_fifo, (void**)silence_frame->data, remaining_samples);
+                    LOG_DEBUG("Read {} samples from FIFO", read_samples);
+
+                    // 填充剩余位置为静音
+                    int samples_to_silence = m_audio_encoder_ctx->frame_size - read_samples;
+                    if (samples_to_silence > 0) {
+                        // 计算每个声道的字节数
+                        int bytes_per_sample = av_get_bytes_per_sample(m_audio_encoder_ctx->sample_fmt);
+                        int silence_bytes = samples_to_silence * silence_frame->channels * bytes_per_sample;
+
+                        // 对每个平面填充静音（AV_AUDIO_PLANAR 格式需要分别填充）
+                        int planes = av_sample_fmt_is_planar(m_audio_encoder_ctx->sample_fmt) ?
+                                    silence_frame->channels : 1;
+
+                        for (int i = 0; i < planes; i++) {
+                            memset(silence_frame->data[i] + read_samples * bytes_per_sample *
+                                   (planes > 1 ? 1 : silence_frame->channels), 0, silence_bytes);
+                        }
+                        LOG_DEBUG("Filled {} samples with silence", samples_to_silence);
+                    }
+
+                    // 更新帧计数
+                    m_audio_frame_count += m_audio_encoder_ctx->frame_size;
+
+                    // 发送静音帧到编码器
+                    ret = avcodec_send_frame(m_audio_encoder_ctx, silence_frame);
+                    if (ret >= 0) {
+                        // 获取编码后的包
+                        while (ret >= 0) {
+                            AVPacket* encoded_packet = av_packet_alloc();
+                            ret = avcodec_receive_packet(m_audio_encoder_ctx, encoded_packet);
+                            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                                av_packet_free(&encoded_packet);
+                                break;
+                            }
+                            if (ret < 0) {
+                                LOG_WARN("Error encoding silence frame: {}", av_err_to_string(ret));
+                                av_packet_free(&encoded_packet);
+                                break;
+                            }
+
+                            // 找到输出流中的音频流索引
+                            int out_audio_idx = -1;
+                            for (unsigned i = 0; i < m_output_ctx->nb_streams; i++) {
+                                if (m_output_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                                    out_audio_idx = i;
+                                    break;
+                                }
+                            }
+
+                            if (out_audio_idx >= 0) {
+                                encoded_packet->stream_index = out_audio_idx;
+                                av_packet_rescale_ts(encoded_packet,
+                                                    m_audio_encoder_ctx->time_base,
+                                                    m_output_ctx->streams[out_audio_idx]->time_base);
+                                writePacket(encoded_packet);
+                                LOG_DEBUG("Wrote padded audio packet to stream {}", out_audio_idx);
+                            }
+
+                            av_packet_free(&encoded_packet);
+                        }
+                    } else {
+                        LOG_WARN("Error sending silence frame to encoder: {}", av_err_to_string(ret));
+                    }
+                } else {
+                    LOG_WARN("Failed to allocate silence frame buffer: {}", av_err_to_string(ret));
+                }
+
+                av_frame_free(&silence_frame);
+            }
+
+            // 步骤3: 发送 NULL 帧到编码器，告知没有更多输入
+            avcodec_send_frame(m_audio_encoder_ctx, nullptr);
+
+            // 步骤4: 接收所有剩余的编码包
+            while (true) {
+                AVPacket* encoded_packet = av_packet_alloc();
+                int ret = avcodec_receive_packet(m_audio_encoder_ctx, encoded_packet);
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                    av_packet_free(&encoded_packet);
+                    break;
+                }
+                if (ret < 0) {
+                    LOG_WARN("Error receiving flushed audio packet: {}", av_err_to_string(ret));
+                    av_packet_free(&encoded_packet);
+                    break;
+                }
+
+                // 找到输出流中的音频流索引
+                int out_audio_idx = -1;
+                for (unsigned i = 0; i < m_output_ctx->nb_streams; i++) {
+                    if (m_output_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                        out_audio_idx = i;
+                        break;
+                    }
+                }
+
+                if (out_audio_idx >= 0) {
+                    encoded_packet->stream_index = out_audio_idx;
+                    // 只进行时间基准转换
+                    av_packet_rescale_ts(encoded_packet,
+                                        m_audio_encoder_ctx->time_base,
+                                        m_output_ctx->streams[out_audio_idx]->time_base);
+                    writePacket(encoded_packet);
+                    LOG_DEBUG("Flushed audio packet to stream {}", out_audio_idx);
+                }
+
+                av_packet_free(&encoded_packet);
+            }
+
+            LOG_INFO("Audio encoder flushed");
+        }
+
         av_write_trailer(m_output_ctx);
         avio_closep(&m_output_ctx->pb);
         avformat_free_context(m_output_ctx);

@@ -10,6 +10,7 @@
 #include <chrono>
 #include <sys/mman.h>
 #include <cfloat>
+#include "log.h"
 
 extern "C" {
 #include <libavutil/pixfmt.h>
@@ -41,49 +42,49 @@ bool RKNNDetector::initialize() {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (initialized_) {
-        logger_->warn("RKNNDetector already initialized");
+        LOG_WARN("RKNNDetector already initialized");
         return true;
     }
 
-    logger_->info("Initializing RKNNDetector with model: {}", config_.model_path);
+    LOG_INFO("Initializing RKNNDetector with model: {}", config_.model_path);
 
     // 加载模型
     if (!loadModel()) {
-        logger_->error("Failed to load RKNN model");
+        LOG_ERROR("Failed to load RKNN model");
         return false;
     }
 
     // 初始化 RKNN 上下文
     if (!initRKNNContext()) {
-        logger_->error("Failed to initialize RKNN context");
+        LOG_ERROR("Failed to initialize RKNN context");
         releaseResources();
         return false;
     }
 
     // 查询模型信息
     if (!queryModelInfo()) {
-        logger_->error("Failed to query model info");
+        LOG_ERROR("Failed to query model info");
         releaseResources();
         return false;
     }
 
     // 设置输入输出
     if (!setupInputsOutputs()) {
-        logger_->error("Failed to setup inputs/outputs");
+        LOG_ERROR("Failed to setup inputs/outputs");
         releaseResources();
         return false;
     }
 
     initialized_ = true;
-    logger_->info("RKNNDetector initialized successfully");
-    logger_->info("Model input: {}x{}x{}", model_info_.input_width, model_info_.input_height, model_info_.input_channels);
+    LOG_INFO("RKNNDetector initialized successfully");
+    LOG_INFO("Model input: {}x{}x{}", model_info_.input_width, model_info_.input_height, model_info_.input_channels);
 
     // 零拷贝模式：设置持久化 IO 内存和 RGA 预处理器
 #ifdef ENABLE_RKNN_SMART_RECORDING
     if (config_.zero_copy_enabled) {
         // 设置零拷贝 IO
         if (!setupZeroCopyIO()) {
-            logger_->error("Failed to setup zero-copy IO, falling back to non-zero-copy mode");
+            LOG_ERROR("Failed to setup zero-copy IO, falling back to non-zero-copy mode");
             config_.zero_copy_enabled = false;
         } else {
             // 初始化 RGA 预处理器（使用持久化的 RKNN 输入内存 fd）
@@ -93,7 +94,7 @@ bool RKNNDetector::initialize() {
             rga_preprocessor_ = std::make_unique<RGAPreprocessor>();
             if (!rga_preprocessor_->initialize(input_mem_->fd, model_info_.input_width,
                                                     model_info_.input_height, dst_wstride)) {
-                logger_->warn("RGA preprocessor init failed, will use CPU fallback");
+                LOG_WARN("RGA preprocessor init failed, will use CPU fallback");
                 rga_preprocessor_.reset();
             }
         }
@@ -110,29 +111,29 @@ void RKNNDetector::shutdown() {
         return;
     }
 
-    logger_->info("Shutting down RKNNDetector");
+    LOG_INFO("Shutting down RKNNDetector");
     releaseResources();
     initialized_ = false;
 }
 
 bool RKNNDetector::setCoreMask(uint32_t core_mask) {
     if (!initialized_) {
-        logger_->error("Cannot set core mask: detector not initialized");
+        LOG_ERROR("Cannot set core mask: detector not initialized");
         return false;
     }
     int ret = rknn_set_core_mask(rknn_ctx_, static_cast<rknn_core_mask>(core_mask));
     if (ret != RKNN_SUCC) {
-        logger_->error("rknn_set_core_mask failed: {}", ret);
+        LOG_ERROR("rknn_set_core_mask failed: {}", ret);
         return false;
     }
-    logger_->info("Set NPU core mask to {}", core_mask);
+    LOG_INFO("Set NPU core mask to {}", core_mask);
     return true;
 }
 
 bool RKNNDetector::loadModel() {
     std::ifstream file(config_.model_path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
-        logger_->error("Failed to open model file: {}", config_.model_path);
+        LOG_ERROR("Failed to open model file: {}", config_.model_path);
         return false;
     }
 
@@ -141,22 +142,22 @@ bool RKNNDetector::loadModel() {
 
     model_data_.resize(size);
     if (!file.read(reinterpret_cast<char*>(model_data_.data()), size)) {
-        logger_->error("Failed to read model file");
+        LOG_ERROR("Failed to read model file");
         return false;
     }
 
-    logger_->info("Loaded RKNN model, size: {} bytes", size);
+    LOG_INFO("Loaded RKNN model, size: {} bytes", size);
     return true;
 }
 
 bool RKNNDetector::initRKNNContext() {
     int ret = rknn_init(&rknn_ctx_, model_data_.data(), model_data_.size(), 0, nullptr);
     if (ret != RKNN_SUCC) {
-        logger_->error("rknn_init failed: {}", ret);
+        LOG_ERROR("rknn_init failed: {}", ret);
         return false;
     }
 
-    logger_->debug("RKNN context initialized");
+    LOG_DEBUG("RKNN context initialized");
     return true;
 }
 
@@ -164,18 +165,18 @@ bool RKNNDetector::queryModelInfo() {
     rknn_input_output_num io_num_attr;
     int ret = rknn_query(rknn_ctx_, RKNN_QUERY_IN_OUT_NUM, &io_num_attr, sizeof(io_num_attr));
     if (ret < 0) {
-        logger_->error("rknn_query RKNN_QUERY_IN_OUT_NUM failed: {}", ret);
+        LOG_ERROR("rknn_query RKNN_QUERY_IN_OUT_NUM failed: {}", ret);
         return false;
     }
 
-    logger_->debug("Model input num: {}, output num: {}", io_num_attr.n_input, io_num_attr.n_output);
+    LOG_DEBUG("Model input num: {}, output num: {}", io_num_attr.n_input, io_num_attr.n_output);
 
     // 查询输入属性
     rknn_tensor_attr input_attr;
     input_attr.index = 0;
     ret = rknn_query(rknn_ctx_, RKNN_QUERY_INPUT_ATTR, &input_attr, sizeof(input_attr));
     if (ret < 0) {
-        logger_->error("rknn_query RKNN_QUERY_INPUT_ATTR failed: {}", ret);
+        LOG_ERROR("rknn_query RKNN_QUERY_INPUT_ATTR failed: {}", ret);
         return false;
     }
 
@@ -184,7 +185,7 @@ bool RKNNDetector::queryModelInfo() {
     model_info_.input_channels = input_attr.dims[3];
     model_info_.num_outputs = io_num_attr.n_output;
 
-    logger_->debug("Input: {}x{}x{}", model_info_.input_width, model_info_.input_height, model_info_.input_channels);
+    LOG_DEBUG("Input: {}x{}x{}", model_info_.input_width, model_info_.input_height, model_info_.input_channels);
 
     // 查询输出属性（用户面 NCHW 逻辑尺寸）
     model_info_.output_sizes.clear();
@@ -194,12 +195,12 @@ bool RKNNDetector::queryModelInfo() {
         output_attr.index = i;
         ret = rknn_query(rknn_ctx_, RKNN_QUERY_OUTPUT_ATTR, &output_attr, sizeof(output_attr));
         if (ret < 0) {
-            logger_->error("rknn_query RKNN_QUERY_OUTPUT_ATTR failed for output {}: {}", i, ret);
+            LOG_ERROR("rknn_query RKNN_QUERY_OUTPUT_ATTR failed for output {}: {}", i, ret);
             return false;
         }
         model_info_.output_sizes.push_back(output_attr.n_elems);
         output_attrs_[i] = output_attr;
-        logger_->debug("Output {}: size = {}, dims = [{},{},{},{}]",
+        LOG_DEBUG("Output {}: size = {}, dims = [{},{},{},{}]",
                       i, output_attr.n_elems,
                       output_attr.dims[0], output_attr.dims[1],
                       output_attr.dims[2], output_attr.dims[3]);
@@ -212,10 +213,10 @@ bool RKNNDetector::queryModelInfo() {
         native_input_attrs_[i].index = i;
         ret = rknn_query(rknn_ctx_, RKNN_QUERY_NATIVE_INPUT_ATTR, &native_input_attrs_[i], sizeof(native_input_attrs_[i]));
         if (ret < 0) {
-            logger_->error("rknn_query RKNN_QUERY_NATIVE_INPUT_ATTR failed: {}", ret);
+            LOG_ERROR("rknn_query RKNN_QUERY_NATIVE_INPUT_ATTR failed: {}", ret);
             return false;
         }
-        logger_->info("Native input[{}]: w_stride={}, size_with_stride={}, fmt={}",
+        LOG_INFO("Native input[{}]: w_stride={}, size_with_stride={}, fmt={}",
                      i, native_input_attrs_[i].w_stride, native_input_attrs_[i].size_with_stride,
                      static_cast<int>(native_input_attrs_[i].fmt));
     }
@@ -226,10 +227,10 @@ bool RKNNDetector::queryModelInfo() {
         native_output_attrs_[i].index = i;
         ret = rknn_query(rknn_ctx_, RKNN_QUERY_NATIVE_OUTPUT_ATTR, &native_output_attrs_[i], sizeof(native_output_attrs_[i]));
         if (ret < 0) {
-            logger_->error("rknn_query RKNN_QUERY_NATIVE_OUTPUT_ATTR failed: {}", ret);
+            LOG_ERROR("rknn_query RKNN_QUERY_NATIVE_OUTPUT_ATTR failed: {}", ret);
             return false;
         }
-        logger_->info("Native output[{}]: size_with_stride={}, fmt={}, zp={}, scale={:.6f}",
+        LOG_INFO("Native output[{}]: size_with_stride={}, fmt={}, zp={}, scale={:.6f}",
                      i, native_output_attrs_[i].size_with_stride, static_cast<int>(native_output_attrs_[i].fmt),
                      native_output_attrs_[i].zp, native_output_attrs_[i].scale);
     }
@@ -237,7 +238,7 @@ bool RKNNDetector::queryModelInfo() {
     // 判断是否为量化模型
     is_quant_ = (native_output_attrs_[0].fmt == RKNN_TENSOR_NC1HWC2 &&
                   native_output_attrs_[0].type == RKNN_TENSOR_INT8);
-    logger_->info("Model is {}quantized", is_quant_ ? "" : "not ");
+    LOG_INFO("Model is {}quantized", is_quant_ ? "" : "not ");
 #endif
 
     return true;
@@ -259,7 +260,7 @@ bool RKNNDetector::setupInputsOutputs() {
         outputs_[i].is_prealloc = 0;
     }
 
-    logger_->debug("Inputs/outputs setup completed ({} outputs)", model_info_.num_outputs);
+    LOG_DEBUG("Inputs/outputs setup completed ({} outputs)", model_info_.num_outputs);
     return true;
 }
 
@@ -280,17 +281,17 @@ void RKNNDetector::releaseResources() {
 
     model_data_.clear();
     outputs_.clear();
-    logger_->debug("Resources released");
+    LOG_DEBUG("Resources released");
 }
 
 bool RKNNDetector::detectFrame(AVFrame* frame, DetectionResult& result) {
     if (!initialized_) {
-        logger_->error("RKNNDetector not initialized");
+        LOG_ERROR("RKNNDetector not initialized");
         return false;
     }
 
     if (!frame) {
-        logger_->error("Invalid frame");
+        LOG_ERROR("Invalid frame");
         return false;
     }
 
@@ -299,7 +300,7 @@ bool RKNNDetector::detectFrame(AVFrame* frame, DetectionResult& result) {
     // 预处理帧
     std::vector<uint8_t> input_data;
     if (!preprocessFrame(frame, input_data)) {
-        logger_->error("Failed to preprocess frame");
+        LOG_ERROR("Failed to preprocess frame");
         return false;
     }
 
@@ -307,7 +308,7 @@ bool RKNNDetector::detectFrame(AVFrame* frame, DetectionResult& result) {
     inputs_[0].buf = input_data.data();
     int ret = rknn_inputs_set(rknn_ctx_, 1, inputs_);
     if (ret < 0) {
-        logger_->error("rknn_inputs_set failed: {}", ret);
+        LOG_ERROR("rknn_inputs_set failed: {}", ret);
         return false;
     }
 
@@ -320,20 +321,20 @@ bool RKNNDetector::detectFrame(AVFrame* frame, DetectionResult& result) {
     // 执行推理
     ret = rknn_run(rknn_ctx_, nullptr);
     if (ret < 0) {
-        logger_->error("rknn_run failed: {}", ret);
+        LOG_ERROR("rknn_run failed: {}", ret);
         return false;
     }
 
     // 获取输出
     ret = rknn_outputs_get(rknn_ctx_, outputs_.size(), outputs_.data(), nullptr);
     if (ret < 0) {
-        logger_->error("rknn_outputs_get failed: {}", ret);
+        LOG_ERROR("rknn_outputs_get failed: {}", ret);
         return false;
     }
 
     // 解析检测结果
     if (!parseDetectionOutputs(outputs_.data(), result)) {
-        logger_->error("Failed to parse detection outputs");
+        LOG_ERROR("Failed to parse detection outputs");
         rknn_outputs_release(rknn_ctx_, outputs_.size(), outputs_.data());
         return false;
     }
@@ -353,7 +354,7 @@ bool RKNNDetector::detectFrame(AVFrame* frame, DetectionResult& result) {
 
 bool RKNNDetector::detectFrameZeroCopy(const DMABufferInfo& dma_info, DetectionResult& result) {
     if (!initialized_) {
-        logger_->error("RKNNDetector not initialized");
+        LOG_ERROR("RKNNDetector not initialized");
         return false;
     }
 
@@ -369,7 +370,7 @@ bool RKNNDetector::detectFrameZeroCopy(const DMABufferInfo& dma_info, DetectionR
 
     if (!rga_ok) {
         // 2. CPU fallback：直接写入 RKNN 输入内存
-        logger_->debug("RGA preprocess failed, using CPU fallback");
+        LOG_DEBUG("RGA preprocess failed, using CPU fallback");
         cpuFallbackNV12toRGB(dma_info);
     }
 
@@ -385,13 +386,13 @@ bool RKNNDetector::detectFrameZeroCopy(const DMABufferInfo& dma_info, DetectionR
     // 3. RKNN 推理（无需 rknn_inputs_set，已通过 rknn_set_io_mem 绑定）
     int ret = rknn_run(rknn_ctx_, nullptr);
     if (ret < 0) {
-        logger_->error("rknn_run failed: {}", ret);
+        LOG_ERROR("rknn_run failed: {}", ret);
         return false;
     }
 
     // 4. 从持久化输出内存解析检测结果（NC1HWC2 → NCHW 反量化）
     if (!parseDetectionOutputsZeroCopy(result)) {
-        logger_->error("Failed to parse detection outputs");
+        LOG_ERROR("Failed to parse detection outputs");
         return false;
     }
 
@@ -423,7 +424,7 @@ bool RKNNDetector::preprocessFrame(AVFrame* frame, std::vector<uint8_t>& output_
         SWS_BILINEAR, nullptr, nullptr, nullptr);
 
     if (!sws_ctx) {
-        logger_->error("Failed to create SwsContext");
+        LOG_ERROR("Failed to create SwsContext");
         return false;
     }
 
@@ -452,7 +453,7 @@ bool RKNNDetector::preprocessFrame(AVFrame* frame, std::vector<uint8_t>& output_
 
 bool RKNNDetector::parseDetectionOutputs(rknn_output* outputs, DetectionResult& result) {
     if (!outputs || !outputs[0].buf) {
-        logger_->error("Invalid outputs");
+        LOG_ERROR("Invalid outputs");
         return false;
     }
 
@@ -616,11 +617,11 @@ std::vector<BoundingBox> RKNNDetector::applyNMS(
 
 bool RKNNDetector::warmup(int iterations) {
     if (!initialized_) {
-        logger_->error("Cannot warmup: detector not initialized");
+        LOG_ERROR("Cannot warmup: detector not initialized");
         return false;
     }
 
-    logger_->info("Warming up RKNN detector with {} iterations...", iterations);
+    LOG_INFO("Warming up RKNN detector with {} iterations...", iterations);
 
 #ifdef ENABLE_RKNN_SMART_RECORDING
     if (config_.zero_copy_enabled && input_mem_) {
@@ -631,7 +632,7 @@ bool RKNNDetector::warmup(int iterations) {
         for (int i = 0; i < iterations; i++) {
             int ret = rknn_run(rknn_ctx_, nullptr);
             if (ret < 0) {
-                logger_->error("Warmup failed at iteration {}", i);
+                LOG_ERROR("Warmup failed at iteration {}", i);
                 return false;
             }
         }
@@ -647,19 +648,19 @@ bool RKNNDetector::warmup(int iterations) {
 
             int ret = rknn_inputs_set(rknn_ctx_, 1, inputs_);
             if (ret < 0) {
-                logger_->error("Warmup failed at iteration {}", i);
+                LOG_ERROR("Warmup failed at iteration {}", i);
                 return false;
             }
 
             ret = rknn_run(rknn_ctx_, nullptr);
             if (ret < 0) {
-                logger_->error("Warmup failed at iteration {}", i);
+                LOG_ERROR("Warmup failed at iteration {}", i);
                 return false;
             }
 
             ret = rknn_outputs_get(rknn_ctx_, outputs_.size(), outputs_.data(), nullptr);
             if (ret < 0) {
-                logger_->error("Warmup failed at iteration {}", i);
+                LOG_ERROR("Warmup failed at iteration {}", i);
                 return false;
             }
 
@@ -669,7 +670,7 @@ bool RKNNDetector::warmup(int iterations) {
     }
 #endif
 
-    logger_->info("Warmup completed successfully");
+    LOG_INFO("Warmup completed successfully");
     return true;
 }
 
@@ -685,19 +686,19 @@ bool RKNNDetector::setupZeroCopyIO() {
     // 分配并绑定输入内存
     input_mem_ = rknn_create_mem(rknn_ctx_, native_input_attrs_[0].size_with_stride);
     if (!input_mem_) {
-        logger_->error("setupZeroCopyIO: rknn_create_mem(input) failed");
+        LOG_ERROR("setupZeroCopyIO: rknn_create_mem(input) failed");
         return false;
     }
 
     int ret = rknn_set_io_mem(rknn_ctx_, input_mem_, &native_input_attrs_[0]);
     if (ret < 0) {
-        logger_->error("setupZeroCopyIO: rknn_set_io_mem(input) failed: {}", ret);
+        LOG_ERROR("setupZeroCopyIO: rknn_set_io_mem(input) failed: {}", ret);
         rknn_destroy_mem(rknn_ctx_, input_mem_);
         input_mem_ = nullptr;
         return false;
     }
 
-    logger_->info("RKNN input zero-copy: size={}, size_with_stride={}, w_stride={}",
+    LOG_INFO("RKNN input zero-copy: size={}, size_with_stride={}, w_stride={}",
                  native_input_attrs_[0].size, native_input_attrs_[0].size_with_stride,
                  native_input_attrs_[0].w_stride);
 
@@ -708,7 +709,7 @@ bool RKNNDetector::setupZeroCopyIO() {
     for (uint32_t i = 0; i < model_info_.num_outputs; ++i) {
         output_mems_[i] = rknn_create_mem(rknn_ctx_, native_output_attrs_[i].size_with_stride);
         if (!output_mems_[i]) {
-            logger_->error("setupZeroCopyIO: rknn_create_mem(output[{}]) failed", i);
+            LOG_ERROR("setupZeroCopyIO: rknn_create_mem(output[{}]) failed", i);
             // 清理已分配的内存
             for (uint32_t j = 0; j < i; ++j) {
                 rknn_destroy_mem(rknn_ctx_, output_mems_[j]);
@@ -721,7 +722,7 @@ bool RKNNDetector::setupZeroCopyIO() {
 
         ret = rknn_set_io_mem(rknn_ctx_, output_mems_[i], &native_output_attrs_[i]);
         if (ret < 0) {
-            logger_->error("setupZeroCopyIO: rknn_set_io_mem(output[{}]) failed: {}", i, ret);
+            LOG_ERROR("setupZeroCopyIO: rknn_set_io_mem(output[{}]) failed: {}", i, ret);
             // 清理
             for (uint32_t j = 0; j <= i; ++j) {
                 rknn_destroy_mem(rknn_ctx_, output_mems_[j]);
@@ -736,12 +737,12 @@ bool RKNNDetector::setupZeroCopyIO() {
         int elem_count = output_attrs_[i].n_elems;
         float_outputs_[i].resize(elem_count);
 
-        logger_->info("RKNN output[{}] zero-copy: size={}, size_with_stride={}, zp={}, scale={:.6f}",
+        LOG_INFO("RKNN output[{}] zero-copy: size={}, size_with_stride={}, zp={}, scale={:.6f}",
                      i, native_output_attrs_[i].size, native_output_attrs_[i].size_with_stride,
                      native_output_attrs_[i].zp, native_output_attrs_[i].scale);
     }
 
-    logger_->info("RKNN zero-copy IO setup completed");
+    LOG_INFO("RKNN zero-copy IO setup completed");
     return true;
 }
 
@@ -803,7 +804,7 @@ bool RKNNDetector::parseDetectionOutputsZeroCopy(DetectionResult& result) {
             convertNC1HWC2ToFloat(i, float_outputs_[i]);
         } else {
             // 非量化或非NC1HWC2格式（不应发生在 RK3588）
-            logger_->warn("Output[{}] has unexpected format, skipping conversion", i);
+            LOG_WARN("Output[{}] has unexpected format, skipping conversion", i);
             return false;
         }
     }
@@ -821,7 +822,7 @@ bool RKNNDetector::parseDetectionOutputsZeroCopy(DetectionResult& result) {
 
 void RKNNDetector::cpuFallbackNV12toRGB(const DMABufferInfo& dma_info) {
     if (!input_mem_ || !input_mem_->virt_addr) {
-        logger_->error("cpuFallbackNV12toRGB: input_mem_ not available");
+        LOG_ERROR("cpuFallbackNV12toRGB: input_mem_ not available");
         return;
     }
 
@@ -829,7 +830,7 @@ void RKNNDetector::cpuFallbackNV12toRGB(const DMABufferInfo& dma_info) {
     size_t total_size = static_cast<size_t>(dma_info.stride) * dma_info.height * 3 / 2;
     void* mapped = mmap(nullptr, total_size, PROT_READ, MAP_SHARED, dma_info.fd, 0);
     if (mapped == MAP_FAILED) {
-        logger_->error("cpuFallbackNV12toRGB: mmap failed, fd={}, size={}", dma_info.fd, total_size);
+        LOG_ERROR("cpuFallbackNV12toRGB: mmap failed, fd={}, size={}", dma_info.fd, total_size);
         return;
     }
 

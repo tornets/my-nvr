@@ -23,11 +23,20 @@ struct ScheduleConfig {
     std::vector<TimeRange> time_ranges;        // 录制时间段列表
 };
 
+// 检测模式
+enum class DetectionMode {
+    Keyframe,   // 只检测关键帧，按关键帧间隔跳帧
+    Sampled,    // 按 PTS 时间间隔检查
+    Realtime    // 每一帧都检测
+};
+
 // RKNN 检测配置
 struct RKNNConfig {
     bool enabled = false;                      // 是否启用 RKNN 检测
+    DetectionMode detection_mode = DetectionMode::Keyframe;  // 检测模式
     std::string model_path = "";               // RKNN 模型路径
-    int detection_interval_keyframes = 30;     // 检测间隔（关键帧数）
+    int detection_interval_keyframes = 30;     // keyframe 模式：检测间隔（关键帧数）
+    float detection_interval_seconds = 2.0f;   // sampled 模式：检测间隔（秒）
     int player_class_id = 0;                   // 玩家类别 ID
     int npc_class_id = 1;                      // NPC 类别 ID
     float confidence_threshold = 0.5f;         // 置信度阈值

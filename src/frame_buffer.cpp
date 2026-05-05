@@ -4,7 +4,7 @@
 //
 
 #include "frame_buffer.h"
-#include <spdlog/spdlog.h>
+#include "log.h"
 #include <algorithm>
 
 namespace nvr {
@@ -36,7 +36,7 @@ bool FrameBuffer::addFrame(AVPacket* packet, int64_t pts, int64_t dts, bool is_k
     CachedFrame cached_frame;
     cached_frame.packet = av_packet_clone(packet);
     if (!cached_frame.packet) {
-        spdlog::error("Failed to clone packet for frame buffer");
+        LOG_ERROR("Failed to clone packet for frame buffer");
         return false;
     }
 
@@ -227,7 +227,7 @@ FrameBufferWriter::~FrameBufferWriter() = default;
 
 bool FrameBufferWriter::writeFrames(const std::vector<CachedFrame>& frames) {
     if (!output_ctx_) {
-        spdlog::error("FrameBufferWriter: output context is null");
+        LOG_ERROR("FrameBufferWriter: output context is null");
         return false;
     }
 
@@ -239,7 +239,7 @@ bool FrameBufferWriter::writeFrames(const std::vector<CachedFrame>& frames) {
         // 克隆 packet（避免修改原始数据）
         AVPacket* pkt = av_packet_clone(cached_frame.packet);
         if (!pkt) {
-            spdlog::error("Failed to clone packet for writing");
+            LOG_ERROR("Failed to clone packet for writing");
             continue;
         }
 
@@ -263,7 +263,7 @@ bool FrameBufferWriter::writeFrames(const std::vector<CachedFrame>& frames) {
         if (ret < 0) {
             char err_buf[AV_ERROR_MAX_STRING_SIZE];
             av_strerror(ret, err_buf, sizeof(err_buf));
-            spdlog::error("Failed to write frame: {}", err_buf);
+            LOG_ERROR("Failed to write frame: {}", err_buf);
             return false;
         }
     }

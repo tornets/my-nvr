@@ -281,4 +281,5 @@ void Application::setupSignalHandlers(ApplicationState& state) {
 
     std::signal(SIGINT, signalHandler);
     std::signal(SIGTERM, signalHandler);
+    std::signal(SIGPIPE, SIG_IGN);  // 上传连接断开时不杀死进程
 }

@@ -141,9 +141,7 @@ public:
     // 获取分段时长（秒）
     double getSegmentDurationSeconds() const;
 
-#if DUMP_DECTECT_IMAGE
     void setDebugOutputDir(const std::string& dir) { debug_output_dir_ = dir; }
-#endif
 
 private:
     // 检测线程工作函数
@@ -157,6 +155,9 @@ private:
 
     // 检查是否需要执行检测
     bool shouldRunDetection(bool is_key_frame, int64_t pts);
+
+    // 检查是否需要导出调试图像
+    bool shouldDump(const detection::DetectionResult& result) const;
 
     // 清理旧的检测结果
     void cleanupOldDetections();
@@ -219,12 +220,11 @@ private:
     mutable std::mutex state_mutex_;
     mutable std::mutex output_mutex_;
 
-#if DUMP_DECTECT_IMAGE
     std::string debug_output_dir_;
     int debug_decode_frame_index_ = 0;
+    detection::DumpDetectConfig dump_detect_;
     void saveDetectionImage(const detection::PoolDetectionResult& pool_result, int detect_count);
     void saveDecodedFrame(AVFrame* frame, int frame_idx);
-#endif
 };
 
 } // namespace nvr

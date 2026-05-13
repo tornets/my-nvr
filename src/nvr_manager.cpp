@@ -38,6 +38,7 @@ NVRManager::NVRManager(const Config& config)
             det_config.confidence_threshold = stream.smart_recording.rknn.confidence_threshold;
             det_config.detection_interval_keyframes = stream.smart_recording.rknn.detection_interval_keyframes;
             det_config.zero_copy_enabled = stream.smart_recording.rknn.zero_copy_enabled;
+            det_config.dump_detect = stream.smart_recording.dump_detect;
 
             m_detection_pool = std::make_unique<nvr::detection::DetectionPool>(
                 m_config.detection_pool.workers, det_config, m_config.detection_pool.queue_size);

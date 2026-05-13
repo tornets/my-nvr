@@ -234,6 +234,24 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
                                 stream_config.smart_recording.rknn.zero_copy_enabled = rknn["zero_copy_enabled"].as<bool>();
                             }
                         }
+
+                        // 解析调试图像导出配置
+                        if (sr["dump_detect"]) {
+                            const auto& dd = sr["dump_detect"];
+                            if (dd["enable"]) {
+                                stream_config.smart_recording.dump_detect.enable = dd["enable"].as<bool>();
+                            }
+                            if (dd["filter"]) {
+                                std::string filter = dd["filter"].as<std::string>();
+                                if (filter == "has_detection") {
+                                    stream_config.smart_recording.dump_detect.filter = nvr::detection::DumpDetectFilter::HasDetection;
+                                } else if (filter == "no_detection") {
+                                    stream_config.smart_recording.dump_detect.filter = nvr::detection::DumpDetectFilter::NoDetection;
+                                } else {
+                                    stream_config.smart_recording.dump_detect.filter = nvr::detection::DumpDetectFilter::All;
+                                }
+                            }
+                        }
                     }
 
                     config.streams.push_back(stream_config);
@@ -375,6 +393,26 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
                 } else {
                     config.detection_pool.queue_size = queue_size;
                 }
+            }
+        }
+
+        // 环境变量覆盖 dump_detect 配置（全局生效）
+        if (const char* env = std::getenv("DUMP_DETECT")) {
+            bool enable = (std::string(env) == "1" || std::string(env) == "true");
+            for (auto& stream : config.streams) {
+                stream.smart_recording.dump_detect.enable = enable;
+            }
+        }
+        if (const char* env = std::getenv("DUMP_DETECT_FILTER")) {
+            nvr::detection::DumpDetectFilter filter = nvr::detection::DumpDetectFilter::All;
+            std::string filter_str = env;
+            if (filter_str == "has_detection") {
+                filter = nvr::detection::DumpDetectFilter::HasDetection;
+            } else if (filter_str == "no_detection") {
+                filter = nvr::detection::DumpDetectFilter::NoDetection;
+            }
+            for (auto& stream : config.streams) {
+                stream.smart_recording.dump_detect.filter = filter;
             }
         }
 

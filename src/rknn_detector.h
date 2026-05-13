@@ -70,12 +70,10 @@ public:
     // 设置 NPU 核心亲和性，须在 initialize() 之后调用
     bool setCoreMask(uint32_t core_mask);  // 传入 RKNN_NPU_CORE_0/1/2 或组合
 
-#if DUMP_DECTECT_IMAGE
     // 调试：获取最后一次推理的输入 RGB 数据（640×640）
     const std::vector<uint8_t>& getLastInputRGB() const { return last_input_rgb_; }
     int getLastInputWidth() const { return last_input_w_; }
     int getLastInputHeight() const { return last_input_h_; }
-#endif
 
     // 预热模型（运行几次推理以优化性能）
     bool warmup(int iterations = 3);
@@ -142,12 +140,10 @@ private:
     // 线程安全
     mutable std::mutex mutex_;
 
-#if DUMP_DECTECT_IMAGE
     // 调试：存储最后一次推理的输入 RGB
     std::vector<uint8_t> last_input_rgb_;
     int last_input_w_ = 0;
     int last_input_h_ = 0;
-#endif
 
 #ifdef ENABLE_RKNN_SMART_RECORDING
     // 零拷贝：持久化 RKNN 输入/输出内存

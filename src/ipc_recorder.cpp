@@ -193,9 +193,7 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
 
         if (m_smart_recording->initialize()) {
             m_smart_recording->start();
-#if DUMP_DECTECT_IMAGE
             m_smart_recording->setDebugOutputDir(m_output_dir);
-#endif
             LOG_INFO("Smart recording enabled for stream: {}", m_stream_id);
         } else {
             LOG_WARN("Failed to initialize smart recording for stream: {}", m_stream_id);

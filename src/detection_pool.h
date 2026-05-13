@@ -26,12 +26,9 @@ struct PoolDetectionResult {
     DetectionResult detection;
     bool success = false;
     bool dropped = false;  // 队列过载时任务被丢弃
-
-#if DUMP_DECTECT_IMAGE
     std::vector<uint8_t> debug_rgb;
     int debug_w = 0;
     int debug_h = 0;
-#endif
 };
 
 // NPU 推理线程池

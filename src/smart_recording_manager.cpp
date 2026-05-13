@@ -20,6 +20,7 @@ SmartRecordingManager::SmartRecordingManager(
     const std::string& stream_id,
     detection::DetectionPool& detection_pool)
     : config_(config)
+    , dump_detect_(config.dump_detect)
     , stream_id_(stream_id)
     , detection_pool_(detection_pool)
     , initialized_(false)
@@ -263,11 +264,6 @@ void SmartRecordingManager::detectionWorkerThread() {
             continue;
         }
 
-#if DUMP_DECTECT_IMAGE
-        int frame_idx = debug_decode_frame_index_++;
-        saveDecodedFrame(task.frame, frame_idx);
-#endif
-
         // 提交到 NPU 推理池（同步等待结果）
         auto pool_result = detection_pool_.detect(task.frame);
 
@@ -279,9 +275,13 @@ void SmartRecordingManager::detectionWorkerThread() {
                            result.has_player, result.player_confidence,
                            result.processing_time_ms);
             handleDetectionResult(result);
-#if DUMP_DECTECT_IMAGE
-            saveDetectionImage(pool_result, frame_idx);
-#endif
+
+            // 调试图像导出（检测结果返回后才能应用 filter）
+            if (dump_detect_.enable && shouldDump(result)) {
+                int frame_idx = debug_decode_frame_index_++;
+                saveDecodedFrame(task.frame, frame_idx);
+                saveDetectionImage(pool_result, frame_idx);
+            }
         } else if (pool_result.dropped) {
             LOG_DEBUG("[{}] Detection dropped #{}: (pool overloaded), pts={}", stream_id_, detection_count_.load(), task.pts);
         } else {
@@ -395,6 +395,17 @@ bool SmartRecordingManager::shouldRunDetection(bool is_key_frame, int64_t pts) {
 
     default:
         return false;
+    }
+}
+
+bool SmartRecordingManager::shouldDump(const detection::DetectionResult& result) const {
+    switch (dump_detect_.filter) {
+    case detection::DumpDetectFilter::All:
+        return true;
+    case detection::DumpDetectFilter::HasDetection:
+        return result.has_player || result.has_npc;
+    case detection::DumpDetectFilter::NoDetection:
+        return !result.has_player && !result.has_npc;
     }
 }
 
@@ -574,7 +585,6 @@ void SmartRecordingManager::cleanupOldDetections() {
 // ============================================================================
 // DUMP_DECTECT_IMAGE 调试图像导出
 // ============================================================================
-#if DUMP_DECTECT_IMAGE
 
 #include <filesystem>
 #include <iomanip>
@@ -799,6 +809,7 @@ void rotateCCW90(const std::vector<uint8_t>& src, std::vector<uint8_t>& dst, int
 namespace nvr {
 
 void SmartRecordingManager::saveDetectionImage(const detection::PoolDetectionResult& pool_result, int detect_count) {
+    if (!dump_detect_.enable) return;
     if (debug_output_dir_.empty()) return;
 
     const auto& rgb_src = pool_result.debug_rgb;
@@ -904,6 +915,7 @@ void SmartRecordingManager::saveDetectionImage(const detection::PoolDetectionRes
 }
 
 void SmartRecordingManager::saveDecodedFrame(AVFrame* frame, int frame_idx) {
+    if (!dump_detect_.enable) return;
     if (!frame || debug_output_dir_.empty()) return;
 
     int width = frame->width;
@@ -960,5 +972,3 @@ void SmartRecordingManager::saveDecodedFrame(AVFrame* frame, int frame_idx) {
 }
 
 } // namespace nvr
-
-#endif // DUMP_DECTECT_IMAGE

@@ -4,6 +4,7 @@
 #include <vector>
 #include <optional>
 #include <map>
+#include "detection_types.h"
 
 // 时间段配置（支持跨午夜）
 struct TimeRange {
@@ -37,8 +38,8 @@ struct RKNNConfig {
     std::string model_path = "";               // RKNN 模型路径
     int detection_interval_keyframes = 30;     // keyframe 模式：检测间隔（关键帧数）
     float detection_interval_seconds = 2.0f;   // sampled 模式：检测间隔（秒）
-    int player_class_id = 0;                   // 玩家类别 ID
-    int npc_class_id = 1;                      // NPC 类别 ID
+    int player_class_id = 1;                   // 玩家类别 ID
+    int npc_class_id = 0;                      // NPC 类别 ID
     float confidence_threshold = 0.5f;         // 置信度阈值
     bool zero_copy_enabled = true;             // 零拷贝开关
 };
@@ -51,6 +52,7 @@ struct SmartRecordingConfig {
     int min_recording_duration = 10;           // 最小录制时长（秒）
     int post_recording_delay_seconds = 5;      // 玩家消失后延迟停止秒数
     RKNNConfig rknn;                           // RKNN 检测配置
+    nvr::detection::DumpDetectConfig dump_detect;  // 调试图像导出配置
 };
 
 struct StreamConfig {

@@ -163,13 +163,11 @@ void DetectionPool::workerLoop(int index) {
                 task.frame, result.detection);
         }
 
-#if DUMP_DECTECT_IMAGE
-        if (result.success) {
+        if (config_.dump_detect.enable && result.success) {
             result.debug_rgb = detector->getLastInputRGB();
             result.debug_w = detector->getLastInputWidth();
             result.debug_h = detector->getLastInputHeight();
         }
-#endif
 
         task.promise.set_value(std::move(result));
     }

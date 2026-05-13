@@ -312,11 +312,11 @@ bool RKNNDetector::detectFrame(AVFrame* frame, DetectionResult& result) {
         return false;
     }
 
-#if DUMP_DECTECT_IMAGE
-    last_input_rgb_.assign(input_data.begin(), input_data.end());
-    last_input_w_ = model_info_.input_width;
-    last_input_h_ = model_info_.input_height;
-#endif
+    if (config_.dump_detect.enable) {
+        last_input_rgb_.assign(input_data.begin(), input_data.end());
+        last_input_w_ = model_info_.input_width;
+        last_input_h_ = model_info_.input_height;
+    }
 
     // 执行推理
     ret = rknn_run(rknn_ctx_, nullptr);
@@ -374,14 +374,14 @@ bool RKNNDetector::detectFrameZeroCopy(const DMABufferInfo& dma_info, DetectionR
         cpuFallbackNV12toRGB(dma_info);
     }
 
-#if DUMP_DECTECT_IMAGE
-    // 保存调试图像（从持久化输入内存拷贝实际 RGB 数据）
-    int image_size = model_info_.input_width * model_info_.input_height * model_info_.input_channels;
-    last_input_rgb_.assign(static_cast<const uint8_t*>(input_mem_->virt_addr),
-                           static_cast<const uint8_t*>(input_mem_->virt_addr) + image_size);
-    last_input_w_ = model_info_.input_width;
-    last_input_h_ = model_info_.input_height;
-#endif
+    if (config_.dump_detect.enable) {
+        // 保存调试图像（从持久化输入内存拷贝实际 RGB 数据）
+        int image_size = model_info_.input_width * model_info_.input_height * model_info_.input_channels;
+        last_input_rgb_.assign(static_cast<const uint8_t*>(input_mem_->virt_addr),
+                               static_cast<const uint8_t*>(input_mem_->virt_addr) + image_size);
+        last_input_w_ = model_info_.input_width;
+        last_input_h_ = model_info_.input_height;
+    }
 
     // 3. RKNN 推理（无需 rknn_inputs_set，已通过 rknn_set_io_mem 绑定）
     int ret = rknn_run(rknn_ctx_, nullptr);
@@ -457,91 +457,123 @@ bool RKNNDetector::parseDetectionOutputs(rknn_output* outputs, DetectionResult& 
         return false;
     }
 
-    // YOLO11 RKNN 输出格式（9 个输出，3 个检测头 × 3 输出）:
-    //   [3*i]:   DFL bbox  [dfl_len*4, grid_h, grid_w]
-    //   [3*i+1]: class scores [num_classes, grid_h, grid_w]
-    //   [3*i+2]: score sum [1, grid_h, grid_w] (快速过滤)
-    //
-    // 数据布局: channel-first (NCHW), 如 score_tensor[c * grid_len + offset]
-    // 参考官方示例: rknn_model_zoo/examples/yolo11/cpp/postprocess.cc
-
-    const int num_classes = 80;
-    const int reg_max = model_info_.output_sizes[0] / (model_info_.output_sizes[2]) / 4;
-    // reg_max = 409600 / 6400 / 4 = 16
+    result.player_class_id = config_.player_class_id;
+    result.npc_class_id = config_.npc_class_id;
 
     std::vector<BoundingBox> all_boxes;
 
-    for (int s = 0; s < 3; s++) {
-        if (3 * s + 2 >= static_cast<int>(model_info_.output_sizes.size())) break;
+    if (model_info_.num_outputs <= 3) {
+        // 单输出格式: (1, 4+nc, 8400)，cxcywh 坐标
+        // 参考 rknn_model_zoo/examples/yolo11/python/t.py post_process
+        float* data = static_cast<float*>(outputs[0].buf);
+        int channels = output_attrs_[0].dims[1];       // 4 + num_classes
+        int total_preds = output_attrs_[0].n_elems / channels;  // 8400
+        int num_classes = channels - 4;
 
-        float* bbox_dfl = static_cast<float*>(outputs[3 * s].buf);
-        float* cls_scores = static_cast<float*>(outputs[3 * s + 1].buf);
-        float* score_sum = static_cast<float*>(outputs[3 * s + 2].buf);
-
-        int grid_len = model_info_.output_sizes[3 * s + 2];  // grid_h * grid_w
-        int grid = 1;
-        while (grid * grid < grid_len) grid++;
-        int grid_h = grid;
-        int grid_w = grid;
-        int stride = model_info_.input_height / grid_h;
-
-        for (int i = 0; i < grid_h; i++) {
-            for (int j = 0; j < grid_w; j++) {
-                int offset = i * grid_w + j;
-
-                // 快速过滤: score sum < threshold 则跳过
-                if (score_sum[offset] < config_.confidence_threshold) {
-                    continue;
+        for (int i = 0; i < total_preds; i++) {
+            // 找最大 class score
+            float max_score = 0;
+            int max_cls_id = -1;
+            for (int c = 0; c < num_classes; c++) {
+                float score = data[(4 + c) * total_preds + i];
+                if (score > max_score) {
+                    max_score = score;
+                    max_cls_id = c;
                 }
+            }
 
-                // 找最大 class score（channel-first: score_tensor[c * grid_len + offset]）
-                float max_score = 0;
-                int max_cls_id = -1;
-                int cls_offset = offset;
-                for (int c = 0; c < num_classes; c++) {
-                    if (cls_scores[cls_offset] > max_score) {
-                        max_score = cls_scores[cls_offset];
-                        max_cls_id = c;
+            if (max_score < config_.confidence_threshold) {
+                continue;
+            }
+
+            // cxcywh → xyxy
+            float cx = data[0 * total_preds + i];
+            float cy = data[1 * total_preds + i];
+            float w  = data[2 * total_preds + i];
+            float h  = data[3 * total_preds + i];
+            float x1 = cx - w / 2.0f;
+            float y1 = cy - h / 2.0f;
+
+            if (w > 0 && h > 0) {
+                all_boxes.emplace_back(x1, y1, w, h, max_score, max_cls_id);
+            }
+        }
+    } else {
+        // DFL 多分支格式（9 个输出，3 个检测头 × 3 输出）:
+        //   [3*i]:   DFL bbox  [dfl_len*4, grid_h, grid_w]
+        //   [3*i+1]: class scores [num_classes, grid_h, grid_w]
+        //   [3*i+2]: score sum [1, grid_h, grid_w] (快速过滤)
+        const int num_classes = model_info_.output_sizes[1] / model_info_.output_sizes[2];
+        const int reg_max = model_info_.output_sizes[0] / (model_info_.output_sizes[2]) / 4;
+
+        for (int s = 0; s < 3; s++) {
+            if (3 * s + 2 >= static_cast<int>(model_info_.output_sizes.size())) break;
+
+            float* bbox_dfl = static_cast<float*>(outputs[3 * s].buf);
+            float* cls_scores = static_cast<float*>(outputs[3 * s + 1].buf);
+            float* score_sum = static_cast<float*>(outputs[3 * s + 2].buf);
+
+            int grid_len = model_info_.output_sizes[3 * s + 2];
+            int grid = 1;
+            while (grid * grid < grid_len) grid++;
+            int grid_h = grid;
+            int grid_w = grid;
+            int stride = model_info_.input_height / grid_h;
+
+            for (int i = 0; i < grid_h; i++) {
+                for (int j = 0; j < grid_w; j++) {
+                    int offset = i * grid_w + j;
+
+                    if (score_sum[offset] < config_.confidence_threshold) {
+                        continue;
                     }
-                    cls_offset += grid_len;
-                }
 
-                if (max_score < config_.confidence_threshold) {
-                    continue;
-                }
-
-                // DFL 解码 bbox（channel-first: box_tensor[k * grid_len + offset]）
-                float box[4];
-                float before_dfl[reg_max * 4];
-                int dfl_offset = offset;
-                for (int k = 0; k < reg_max * 4; k++) {
-                    before_dfl[k] = bbox_dfl[dfl_offset];
-                    dfl_offset += grid_len;
-                }
-
-                // compute_dfl: 4 组 reg_max softmax
-                for (int b = 0; b < 4; b++) {
-                    float sum_exp = 0;
-                    for (int r = 0; r < reg_max; r++) {
-                        before_dfl[b * reg_max + r] = std::exp(before_dfl[b * reg_max + r]);
-                        sum_exp += before_dfl[b * reg_max + r];
+                    float max_score = 0;
+                    int max_cls_id = -1;
+                    int cls_offset = offset;
+                    for (int c = 0; c < num_classes; c++) {
+                        if (cls_scores[cls_offset] > max_score) {
+                            max_score = cls_scores[cls_offset];
+                            max_cls_id = c;
+                        }
+                        cls_offset += grid_len;
                     }
-                    float acc = 0;
-                    for (int r = 0; r < reg_max; r++) {
-                        acc += (before_dfl[b * reg_max + r] / sum_exp) * r;
+
+                    if (max_score < config_.confidence_threshold) {
+                        continue;
                     }
-                    box[b] = acc;
-                }
 
-                float x1 = (-box[0] + j + 0.5f) * stride;
-                float y1 = (-box[1] + i + 0.5f) * stride;
-                float x2 = (box[2] + j + 0.5f) * stride;
-                float y2 = (box[3] + i + 0.5f) * stride;
-                float w = x2 - x1;
-                float h = y2 - y1;
+                    float box[4];
+                    float before_dfl[reg_max * 4];
+                    int dfl_offset = offset;
+                    for (int k = 0; k < reg_max * 4; k++) {
+                        before_dfl[k] = bbox_dfl[dfl_offset];
+                        dfl_offset += grid_len;
+                    }
 
-                if (w > 0 && h > 0) {
-                    all_boxes.emplace_back(x1, y1, w, h, max_score, max_cls_id);
+                    for (int b = 0; b < 4; b++) {
+                        float sum_exp = 0;
+                        for (int r = 0; r < reg_max; r++) {
+                            before_dfl[b * reg_max + r] = std::exp(before_dfl[b * reg_max + r]);
+                            sum_exp += before_dfl[b * reg_max + r];
+                        }
+                        float acc = 0;
+                        for (int r = 0; r < reg_max; r++) {
+                            acc += (before_dfl[b * reg_max + r] / sum_exp) * r;
+                        }
+                        box[b] = acc;
+                    }
+
+                    float x1 = (-box[0] + j + 0.5f) * stride;
+                    float y1 = (-box[1] + i + 0.5f) * stride;
+                    float x2 = (box[2] + j + 0.5f) * stride;
+                    float y2 = (box[3] + i + 0.5f) * stride;
+                    float w = x2 - x1;
+                    float h = y2 - y1;
+
+                    if (w > 0 && h > 0) {
+                        all_boxes.emplace_back(x1, y1, w, h, max_score, max_cls_id);
+                    }
                 }
             }
         }
@@ -707,6 +739,13 @@ bool RKNNDetector::setupZeroCopyIO() {
     float_outputs_.resize(model_info_.num_outputs);
 
     for (uint32_t i = 0; i < model_info_.num_outputs; ++i) {
+        // 非量化模型：请求 RKNN 运行时将输出转为 float32 NCHW
+        if (!is_quant_) {
+            native_output_attrs_[i].type = RKNN_TENSOR_FLOAT32;
+            native_output_attrs_[i].fmt = RKNN_TENSOR_NCHW;
+            native_output_attrs_[i].size_with_stride = output_attrs_[i].n_elems * sizeof(float);
+        }
+
         output_mems_[i] = rknn_create_mem(rknn_ctx_, native_output_attrs_[i].size_with_stride);
         if (!output_mems_[i]) {
             LOG_ERROR("setupZeroCopyIO: rknn_create_mem(output[{}]) failed", i);
@@ -798,13 +837,18 @@ void RKNNDetector::convertNC1HWC2ToFloat(int output_idx, std::vector<float>& out
 }
 
 bool RKNNDetector::parseDetectionOutputsZeroCopy(DetectionResult& result) {
-    // 转换所有输出从 NC1HWC2 int8 到 NCHW float32
     for (uint32_t i = 0; i < model_info_.num_outputs; ++i) {
         if (is_quant_ && native_output_attrs_[i].fmt == RKNN_TENSOR_NC1HWC2) {
             convertNC1HWC2ToFloat(i, float_outputs_[i]);
+        } else if (!is_quant_) {
+            // 非量化模型：输出已在 setupZeroCopyIO 中请求转为 float32
+            float* src = static_cast<float*>(output_mems_[i]->virt_addr);
+            int elem_count = output_attrs_[i].n_elems;
+            float_outputs_[i].assign(src, src + elem_count);
         } else {
-            // 非量化或非NC1HWC2格式（不应发生在 RK3588）
-            LOG_WARN("Output[{}] has unexpected format, skipping conversion", i);
+            LOG_WARN("Output[{}]: unsupported format (quant={}, fmt={}, type={})",
+                         i, is_quant_, static_cast<int>(native_output_attrs_[i].fmt),
+                         static_cast<int>(native_output_attrs_[i].type));
             return false;
         }
     }

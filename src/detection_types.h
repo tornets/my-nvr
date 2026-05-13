@@ -76,6 +76,8 @@ struct DetectionResult {
     float player_confidence;            // 玩家最大置信度
     float npc_confidence;               // NPC 最大置信度
     std::vector<BoundingBox> boxes;     // 所有检测到的边界框
+    int player_class_id = 1;            // 玩家类别 ID
+    int npc_class_id = 0;               // NPC 类别 ID
     int64_t frame_pts;                  // 帧 PTS 时间戳
     double processing_time_ms;          // 处理耗时（毫秒）
     std::chrono::system_clock::time_point timestamp; // 检测时间戳
@@ -113,12 +115,12 @@ struct DetectionResult {
 
     // 获取玩家边界框
     std::vector<BoundingBox> getPlayerBoxes() const {
-        return getBoxesByClass(0); // 假设玩家类别 ID 为 0
+        return getBoxesByClass(player_class_id);
     }
 
     // 获取 NPC 边界框
     std::vector<BoundingBox> getNPCBoxes() const {
-        return getBoxesByClass(1); // 假设 NPC 类别 ID 为 1
+        return getBoxesByClass(npc_class_id);
     }
 };
 
@@ -198,6 +200,14 @@ struct DetectionStats {
     }
 };
 
+// 调试图像导出配置
+enum class DumpDetectFilter { All, HasDetection, NoDetection };
+
+struct DumpDetectConfig {
+    bool enable = false;
+    DumpDetectFilter filter = DumpDetectFilter::All;
+};
+
 // 检测配置
 struct DetectionConfig {
     std::string model_path;             // RKNN 模型路径
@@ -206,20 +216,16 @@ struct DetectionConfig {
     float confidence_threshold;         // 置信度阈值
     int detection_interval_keyframes;   // 检测间隔（关键帧数）
     bool zero_copy_enabled;             // 零拷贝开关
+    DumpDetectConfig dump_detect;       // 调试图像导出配置
 
     DetectionConfig()
-        : player_class_id(0)
-        , npc_class_id(1)
+        : player_class_id(1)
+        , npc_class_id(0)
         , confidence_threshold(0.5f)
         , detection_interval_keyframes(30)
         , zero_copy_enabled(true) {}
 };
 
 } // namespace nvr::detection
-
-// 调试宏：启用推理图像导出（可通过 CMake -DDUMP_DECTECT_IMAGE=1 覆盖）
-#ifndef DUMP_DECTECT_IMAGE
-#define DUMP_DECTECT_IMAGE 0
-#endif
 
 #endif // NVR_DETECTION_TYPES_H

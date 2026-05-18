@@ -25,6 +25,12 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/tools/ipc_scan/CMakeLists.txt")
   add_subdirectory(tools/ipc_scan)
 endif()
 
+# RKNN 测试工具（可选，仅 RK3588）
+option(BUILD_RKNN_TEST_TOOL "Build RKNN inference test tool" OFF)
+if(BUILD_RKNN_TEST_TOOL AND EXISTS "${CMAKE_SOURCE_DIR}/tools/rknn_test/CMakeLists.txt")
+  add_subdirectory(tools/rknn_test)
+endif()
+
 # Project metadata for packaging
 set(PROJECT_DISPLAY_NAME "NVR Service")
 set(PROJECT_PUBLISHER "Your Company")

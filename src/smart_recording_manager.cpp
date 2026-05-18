@@ -723,39 +723,32 @@ void fillRect(std::vector<uint8_t>& rgb, int img_w, int img_h,
     }
 }
 
-bool saveJpeg(const std::string& path, const uint8_t* rgb_data, int width, int height) {
-    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+bool saveImage(const std::string& path, const uint8_t* rgb_data, int width, int height) {
+    // 使用 PNG 无损格式而不是 MJPEG，以确保检测调试的准确性
+    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
     if (!codec) return false;
 
     AVCodecContext* ctx = avcodec_alloc_context3(codec);
-    ctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
+    ctx->pix_fmt = AV_PIX_FMT_RGB24;  // PNG 直接支持 RGB，无需色彩转换
     ctx->width = width;
     ctx->height = height;
     ctx->time_base = {1, 25};
-    ctx->qmin = 2;
-    ctx->qmax = 10;
+    // PNG 压缩级别：0-9，0=无压缩最快，9=最大压缩最慢
+    // 使用 3 级压缩，平衡速度和文件大小
+    ctx->compression_level = 3;
     if (avcodec_open2(ctx, codec, nullptr) < 0) {
         avcodec_free_context(&ctx);
         return false;
     }
 
-    SwsContext* sws = sws_getContext(width, height, AV_PIX_FMT_RGB24,
-                                      width, height, AV_PIX_FMT_YUVJ420P,
-                                      SWS_FULL_CHR_H_INP, nullptr, nullptr, nullptr);
-    if (!sws) {
-        avcodec_free_context(&ctx);
-        return false;
-    }
-
     AVFrame* frame = av_frame_alloc();
-    frame->format = AV_PIX_FMT_YUVJ420P;
+    frame->format = AV_PIX_FMT_RGB24;
     frame->width = width;
     frame->height = height;
     av_frame_get_buffer(frame, 0);
 
-    const uint8_t* src_data[1] = { rgb_data };
-    int src_stride[1] = { width * 3 };
-    sws_scale(sws, src_data, src_stride, 0, height, frame->data, frame->linesize);
+    // 直接拷贝 RGB 数据（无需色彩转换）
+    memcpy(frame->data[0], rgb_data, width * height * 3);
 
     avcodec_send_frame(ctx, frame);
 
@@ -773,7 +766,6 @@ bool saveJpeg(const std::string& path, const uint8_t* rgb_data, int width, int h
 
     av_packet_free(&pkt);
     av_frame_free(&frame);
-    sws_freeContext(sws);
     avcodec_free_context(&ctx);
     return ok;
 }
@@ -826,6 +818,7 @@ void SmartRecordingManager::saveDetectionImage(const detection::PoolDetectionRes
         img = rgb_src;
     }
 
+#if 1
     const int font_scale = 2;          // 字体缩放 2x（10×14 px/字符）
     const int box_thickness = 3;       // 框线粗细
     const int label_pad = 2;           // 标签内边距
@@ -887,6 +880,7 @@ void SmartRecordingManager::saveDetectionImage(const detection::PoolDetectionRes
         fillRect(img, w, h, bx, label_y, label_w, label_h, 0, 0, 0);
         drawText(img, w, h, label, bx + label_pad, label_y + label_pad, font_scale, cr, cg, cb);
     }
+#endif
 
     // 构造输出路径: {output_dir}/debug/detect/{date}/{stream_id}_{count}_{player}P_{npc}N.jpg
     auto now = std::chrono::system_clock::now();
@@ -902,7 +896,7 @@ void SmartRecordingManager::saveDetectionImage(const detection::PoolDetectionRes
     }
 
     char fname[256];
-    snprintf(fname, sizeof(fname), "%s_%d_%dP_%dN.jpg",
+    snprintf(fname, sizeof(fname), "%s_%d_%dP_%dN.png",
              stream_id_.c_str(), detect_count,
              player_count, npc_count);
 
@@ -911,7 +905,23 @@ void SmartRecordingManager::saveDetectionImage(const detection::PoolDetectionRes
     std::filesystem::create_directories(dir, ec);
 
     std::string path = (dir / fname).string();
-    saveJpeg(path, img.data(), w, h);
+    saveImage(path, img.data(), w, h);
+    LOG_DEBUG("Exported detection image: {}", path);
+
+#if 0
+    // 同时保存原始 RGB 数据（用于调试，绕过 JPG 编码）
+    char raw_fname[256];
+    snprintf(raw_fname, sizeof(raw_fname), "%s_%d_%dP_%dN.rgb",
+             stream_id_.c_str(), detect_count,
+             player_count, npc_count);
+    std::string raw_path = (dir / raw_fname).string();
+    FILE* f = fopen(raw_path.c_str(), "wb");
+    if (f) {
+        fwrite(rgb_src.data(), 1, rgb_src.size(), f);
+        fclose(f);
+        LOG_DEBUG("Exported raw RGB data: {}", raw_path);
+    }
+#endif
 }
 
 void SmartRecordingManager::saveDecodedFrame(AVFrame* frame, int frame_idx) {
@@ -934,7 +944,7 @@ void SmartRecordingManager::saveDecodedFrame(AVFrame* frame, int frame_idx) {
     std::filesystem::create_directories(dir, ec);
 
     char fname[256];
-    snprintf(fname, sizeof(fname), "%s_%d.jpg", stream_id_.c_str(), frame_idx);
+    snprintf(fname, sizeof(fname), "%s_%d.png", stream_id_.c_str(), frame_idx);
     std::string path = (dir / fname).string();
 
     // DRM_PRIME → CPU 帧
@@ -966,7 +976,7 @@ void SmartRecordingManager::saveDecodedFrame(AVFrame* frame, int frame_idx) {
     sws_freeContext(sws);
     av_frame_free(&cpu_frame);
 
-    saveJpeg(path, rgb.data(), width, height);
+    saveImage(path, rgb.data(), width, height);
 
     LOG_DEBUG("Exported decoded frame: {}", path);
 }

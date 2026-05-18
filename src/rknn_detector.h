@@ -167,6 +167,16 @@ private:
     void convertNC1HWC2ToFloat(int output_idx, std::vector<float>& out_buf);
     bool parseDetectionOutputsZeroCopy(DetectionResult& result);
     void cpuFallbackNV12toRGB(const DMABufferInfo& dma_info);
+
+    // Letterbox 参数（CPU 模式）
+    LetterboxParams last_letterbox_params_;
+
+    // 映射检测坐标到原始帧空间
+    void mapCoordinatesToOriginalFrame(
+        DetectionResult& result,
+        const LetterboxParams& letterbox,
+        int original_width,
+        int original_height);
 #endif
 };
 

@@ -26,6 +26,15 @@ struct DMABufferInfo {
     DMABufferInfo() : fd(-1), size(0), width(0), height(0), format(0), stride(0), height_stride(0) {}
 };
 
+// Letterbox 预处理参数（完全符合 Rockchip 官方标准）
+struct LetterboxParams {
+    float scale;      // 缩放比例 = min(dst_width/src_width, dst_height/src_height)
+    int pad_x;        // X 方向填充偏移（左边距）
+    int pad_y;        // Y 方向填充偏移（上边距）
+
+    LetterboxParams() : scale(1.0f), pad_x(0), pad_y(0) {}
+};
+
 // 边界框
 struct BoundingBox {
     float x;          // 左上角 x 坐标

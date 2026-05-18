@@ -92,8 +92,8 @@ bool RKNNDetector::initialize() {
             if (dst_wstride == 0) dst_wstride = model_info_.input_width;
 
             rga_preprocessor_ = std::make_unique<RGAPreprocessor>();
-            if (!rga_preprocessor_->initialize(input_mem_->fd, model_info_.input_width,
-                                                    model_info_.input_height, dst_wstride)) {
+            if (!rga_preprocessor_->initialize(input_mem_->fd, input_mem_->virt_addr,
+                                                    model_info_.input_width, model_info_.input_height, dst_wstride)) {
                 LOG_WARN("RGA preprocessor init failed, will use CPU fallback");
                 rga_preprocessor_.reset();
             }
@@ -313,9 +313,14 @@ bool RKNNDetector::detectFrame(AVFrame* frame, DetectionResult& result) {
     }
 
     if (config_.dump_detect.enable) {
+        // 在推理前保存输入数据（用于调试）
         last_input_rgb_.assign(input_data.begin(), input_data.end());
         last_input_w_ = model_info_.input_width;
         last_input_h_ = model_info_.input_height;
+        LOG_DEBUG("[DETECT] Saved input RGB: {} bytes, first bytes: [{},{},{},{},{},{}]",
+                  last_input_rgb_.size(),
+                  last_input_rgb_[0], last_input_rgb_[1], last_input_rgb_[2],
+                  last_input_rgb_[3], last_input_rgb_[4], last_input_rgb_[5]);
     }
 
     // 执行推理
@@ -396,6 +401,12 @@ bool RKNNDetector::detectFrameZeroCopy(const DMABufferInfo& dma_info, DetectionR
         return false;
     }
 
+    // 5. 如果使用了 RGA 预处理且成功，映射坐标回原始帧
+    if (rga_ok && rga_preprocessor_) {
+        const auto& letterbox = rga_preprocessor_->getLetterboxParams();
+        mapCoordinatesToOriginalFrame(result, letterbox, dma_info.width, dma_info.height);
+    }
+
     auto end_time = std::chrono::high_resolution_clock::now();
     result.processing_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
     result.frame_pts = 0;
@@ -417,35 +428,95 @@ bool RKNNDetector::preprocessFrame(AVFrame* frame, std::vector<uint8_t>& output_
     int dst_height = model_info_.input_height;
     AVPixelFormat dst_format = AV_PIX_FMT_RGB24;
 
-    // 创建 SwsContext
+    // Letterbox: 保持宽高比，在边缘填充灰色（Rockchip 标准算法）
+    // 1. 计算缩放比例
+    float scale_w = static_cast<float>(dst_width) / src_width;
+    float scale_h = static_cast<float>(dst_height) / src_height;
+    float scale = std::min(scale_w, scale_h);
+
+    // 2. 计算缩放后的尺寸
+    int resize_w = static_cast<int>(src_width * scale);
+    int resize_h = static_cast<int>(src_height * scale);
+
+    // 3. 对齐调整（Rockchip 参考：allow_slight_change）
+    if (resize_w % 4 != 0) resize_w -= resize_w % 4;
+    if (resize_h % 2 != 0) resize_h -= resize_h % 2;
+
+    // 4. 计算 padding
+    int pad_w = dst_width - resize_w;
+    int pad_h = dst_height - resize_h;
+
+    // 5. 根据宽高比决定填充方向，确保居中
+    int pad_x = 0, pad_y = 0;
+    if (scale_w < scale_h) {
+        // 宽度限制，上下填充
+        pad_y = pad_h / 2;
+        if (pad_y % 2 != 0) pad_y -= pad_y % 2;  // 确保偶数
+        if (pad_y < 0) pad_y = 0;
+    } else {
+        // 高度限制，左右填充
+        pad_x = pad_w / 2;
+        if (pad_x % 2 != 0) pad_x -= pad_x % 2;  // 确保偶数
+        if (pad_x < 0) pad_x = 0;
+    }
+
+    // 存储 letterbox 参数（供坐标映射使用）
+    last_letterbox_params_.scale = scale;
+    last_letterbox_params_.pad_x = pad_x;
+    last_letterbox_params_.pad_y = pad_y;
+
+    LOG_DEBUG("CPU Letterbox: src={}x{}, dst={}x{}, scale={}, pad_x={}, pad_y={}, resize={}x{}",
+              src_width, src_height, dst_width, dst_height, scale, pad_x, pad_y, resize_w, resize_h);
+
+    // 6. 创建缩放上下文
     SwsContext* sws_ctx = sws_getContext(
         src_width, src_height, src_format,
-        dst_width, dst_height, dst_format,
+        resize_w, resize_h, dst_format,
         SWS_BILINEAR, nullptr, nullptr, nullptr);
 
     if (!sws_ctx) {
-        LOG_ERROR("Failed to create SwsContext");
+        LOG_ERROR("Failed to create SwsContext for letterbox");
         return false;
     }
 
-    // 分配输出帧
-    AVFrame* dst_frame = av_frame_alloc();
-    dst_frame->width = dst_width;
-    dst_frame->height = dst_height;
-    dst_frame->format = dst_format;
-    av_frame_get_buffer(dst_frame, 0);
+    // 7. 分配缩放后的帧
+    AVFrame* scaled_frame = av_frame_alloc();
+    scaled_frame->width = resize_w;
+    scaled_frame->height = resize_h;
+    scaled_frame->format = dst_format;
+    av_frame_get_buffer(scaled_frame, 0);
 
-    // 调整大小并转换格式
+    // 6. 缩放图像
     sws_scale(sws_ctx,
               frame->data, frame->linesize, 0, src_height,
-              dst_frame->data, dst_frame->linesize);
+              scaled_frame->data, scaled_frame->linesize);
 
-    // 复制数据到输出向量
+    // 7. 创建目标帧并应用 letterbox（填充黑色 0）
     output_data.resize(dst_width * dst_height * 3);
-    memcpy(output_data.data(), dst_frame->data[0], output_data.size());
+    const uint8_t pad_color[3] = {0, 0, 0};  // 黑色填充
+
+    // 填充整个目标图像为黑色
+    for (int i = 0; i < dst_width * dst_height * 3; i += 3) {
+        output_data[i] = pad_color[0];
+        output_data[i + 1] = pad_color[1];
+        output_data[i + 2] = pad_color[2];
+    }
+
+    // 8. 将缩放后的图像复制到中心位置
+    for (int y = 0; y < resize_h; y++) {
+        int dst_y = y + pad_y;
+        for (int x = 0; x < resize_w; x++) {
+            int dst_x = x + pad_x;
+            int src_idx = (y * resize_w + x) * 3;
+            int dst_idx = (dst_y * dst_width + dst_x) * 3;
+            output_data[dst_idx] = scaled_frame->data[0][src_idx];
+            output_data[dst_idx + 1] = scaled_frame->data[0][src_idx + 1];
+            output_data[dst_idx + 2] = scaled_frame->data[0][src_idx + 2];
+        }
+    }
 
     // 清理
-    av_frame_free(&dst_frame);
+    av_frame_free(&scaled_frame);
     sws_freeContext(sws_ctx);
 
     return true;
@@ -906,6 +977,22 @@ void RKNNDetector::cpuFallbackNV12toRGB(const DMABufferInfo& dma_info) {
     }
 
     munmap(mapped, total_size);
+}
+
+void RKNNDetector::mapCoordinatesToOriginalFrame(
+    DetectionResult& result,
+    const LetterboxParams& letterbox,
+    int original_width,
+    int original_height) {
+
+    for (auto& box : result.boxes) {
+        // 将模型空间坐标 (640x640) 映射回原始帧空间
+        // Rockchip 参考：box.left = x1 / letter_box->scale
+        box.x = box.x / letterbox.scale;
+        box.y = box.y / letterbox.scale;
+        box.width = box.width / letterbox.scale;
+        box.height = box.height / letterbox.scale;
+    }
 }
 #endif
 

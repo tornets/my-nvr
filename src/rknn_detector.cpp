@@ -284,7 +284,7 @@ void RKNNDetector::releaseResources() {
     LOG_DEBUG("Resources released");
 }
 
-bool RKNNDetector::detectFrame(AVFrame* frame, DetectionResult& result) {
+bool RKNNDetector::detectFrame(AVFrame* frame, DetectionResult& result, int64_t frame_pts) {
     if (!initialized_) {
         LOG_ERROR("RKNNDetector not initialized");
         return false;
@@ -351,13 +351,16 @@ bool RKNNDetector::detectFrame(AVFrame* frame, DetectionResult& result) {
     auto end_time = std::chrono::high_resolution_clock::now();
     result.processing_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
 
+    // 设置帧 PTS
+    result.frame_pts = frame_pts;
+
     // 更新统计信息
     stats_.update(result);
 
     return true;
 }
 
-bool RKNNDetector::detectFrameZeroCopy(const DMABufferInfo& dma_info, DetectionResult& result) {
+bool RKNNDetector::detectFrameZeroCopy(const DMABufferInfo& dma_info, DetectionResult& result, int64_t frame_pts) {
     if (!initialized_) {
         LOG_ERROR("RKNNDetector not initialized");
         return false;
@@ -409,7 +412,7 @@ bool RKNNDetector::detectFrameZeroCopy(const DMABufferInfo& dma_info, DetectionR
 
     auto end_time = std::chrono::high_resolution_clock::now();
     result.processing_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-    result.frame_pts = 0;
+    result.frame_pts = frame_pts;
 
     stats_.update(result);
     return true;

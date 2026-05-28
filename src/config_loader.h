@@ -83,6 +83,7 @@ struct UploadConfig {
     int threads;                  // 上传线程数（默认 1）
     bool persist_progress;        // 是否持久化上传进度
     std::string progress_file;    // 上传进度文件路径
+    std::string upload_subdir = "filter";     // 上传哪个子目录（raw/filter/all）
 };
 
 struct ShopConfig {
@@ -107,6 +108,13 @@ struct RecordConfig {
     std::string filename_template; // 文件名模板，支持变量: {stream_id}, {start_datetime}, {segment_index} 等
     bool enable_audio;            // 是否启用音频录制
     ScheduleConfig schedule;      // 录制时间段配置
+
+    // 两阶段录制配置
+    std::string raw_subdir = "raw";           // 实时录制子目录
+    std::string filter_subdir = "filter";     // 事件提取子目录
+    bool enable_extraction = true;            // 是否启用事件提取
+    int min_player_segment_duration = 5;      // 最小玩家片段时长（秒）
+    int player_segment_merge_gap = 5;         // 玩家片段合并最大间隔（秒）
 };
 
 struct Config {

@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <functional>
+#include <filesystem>
 
 #include "log.h"
 
@@ -45,10 +46,15 @@ public:
 private:
     void cleanupLoop();
     void uploadLoop();  // 扫描新文件并上传
+    void extractionLoop();  // 扫描 raw 视频并提取事件
     bool cleanOldFiles();
     bool checkDiskUsage();
     void scanAndUploadNewFiles();
     bool cleanTempFiles();  // 清理临时目录中残留的文件
+
+    // 事件提取相关
+    void scanAndExtractRawVideos();  // 扫描 raw 目录并提取事件视频
+    bool shouldExtractVideo(const std::filesystem::path& raw_video);  // 判断是否应该提取
 
     // 调度相关
     void scheduleLoop();                    // 调度线程主循环
@@ -64,13 +70,16 @@ private:
     std::thread m_cleanup_thread;
     std::thread m_upload_thread;  // 上传扫描线程
     std::thread m_schedule_thread; // 调度线程
+    std::thread m_extraction_thread; // 事件提取线程
     std::atomic<bool> m_running;
     std::condition_variable m_cleanup_cv;
     std::condition_variable m_upload_cv;
     std::condition_variable m_schedule_cv;
+    std::condition_variable m_extraction_cv;
     std::mutex m_cleanup_mutex;
     std::mutex m_upload_mutex;
     std::mutex m_schedule_mutex;
+    std::mutex m_extraction_mutex;
 
     std::shared_ptr<VideoUploader> m_uploader;
     std::shared_ptr<UploadProgressManager> m_upload_progress;  // 上传进度管理器

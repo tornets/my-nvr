@@ -277,6 +277,22 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
             if (record["enable_audio"]) {
                 config.record.enable_audio = record["enable_audio"].as<bool>();
             }
+            // 解析两阶段录制配置
+            if (record["raw_subdir"]) {
+                config.record.raw_subdir = record["raw_subdir"].as<std::string>();
+            }
+            if (record["filter_subdir"]) {
+                config.record.filter_subdir = record["filter_subdir"].as<std::string>();
+            }
+            if (record["enable_extraction"]) {
+                config.record.enable_extraction = record["enable_extraction"].as<bool>();
+            }
+            if (record["min_player_segment_duration"]) {
+                config.record.min_player_segment_duration = record["min_player_segment_duration"].as<int>();
+            }
+            if (record["player_segment_merge_gap"]) {
+                config.record.player_segment_merge_gap = record["player_segment_merge_gap"].as<int>();
+            }
             // 解析调度配置
             if (record["schedule"]) {
                 const auto& schedule = record["schedule"];
@@ -364,6 +380,10 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
             // 解析 progress_file 配置
             if (upload["progress_file"]) {
                 config.upload.progress_file = upload["progress_file"].as<std::string>();
+            }
+            // 解析 upload_subdir 配置
+            if (upload["upload_subdir"]) {
+                config.upload.upload_subdir = upload["upload_subdir"].as<std::string>();
             }
         }
 

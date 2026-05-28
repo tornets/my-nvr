@@ -12,6 +12,7 @@
 #include "detection_pool.h"
 #include "config_loader.h"
 #include "log.h"
+#include "detection_logger.h"
 #include <memory>
 
 // 前向声明
@@ -143,6 +144,12 @@ public:
 
     void setDebugOutputDir(const std::string& dir) { debug_output_dir_ = dir; }
 
+    // 设置检测日志器（用于两阶段录制）
+    void setDetectionLogger(DetectionLogger* logger) { detection_logger_ = logger; }
+
+    // 设置当前 CSV 日志文件路径
+    void setCurrentLogFile(const std::string& log_file) { current_log_file_ = log_file; }
+
 private:
     // 检测线程工作函数
     void detectionWorkerThread();
@@ -225,6 +232,10 @@ private:
     detection::DumpDetectConfig dump_detect_;
     void saveDetectionImage(const detection::PoolDetectionResult& pool_result, int detect_count);
     void saveDecodedFrame(AVFrame* frame, int frame_idx);
+
+    // 检测日志器（两阶段录制）
+    DetectionLogger* detection_logger_ = nullptr;
+    std::string current_log_file_;  // 当前视频的 CSV 日志文件路径
 };
 
 } // namespace nvr

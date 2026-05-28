@@ -88,6 +88,7 @@ static bool uploadConfigInfo(const Config& config) {
             nlohmann::json camera;
             camera["channel"] = stream.id;
             camera["ip"] = extractIpFromUrl(stream.url);
+            camera["name"] = stream.name;
             cameras.push_back(camera);
         }
         j["cameras"] = cameras;

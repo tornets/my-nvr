@@ -22,13 +22,70 @@ streams:
     max_reconnect_attempts: -1      # 最大重连次数，-1表示无限重连（默认: -1）
     timeout_seconds: 30             # 流超时时间，秒（默认: 30）
 
-    # 可选的额外参数
-    params:
-      # timeout: 30                  # 连接超时（秒）- 已废弃，使用 timeout_seconds
-      # reconnect: auto              # 自动重连 - 已废弃，使用 auto_reconnect
+    # 可选的额外参数（传递给 FFmpeg）
+    extra_params:
+      # rtsp_transport: tcp          # 强制使用 TCP 传输
+
+    # ============================================
+    # 智能录制配置（RK3588 平台，按流独立配置）
+    # ============================================
+    smart_recording:
+      enabled: false                     # 是否启用智能录制
+
+      # 预缓存时长（秒）：在 IDLE 状态下缓存最近 N 秒的视频帧
+      # 当检测到玩家时，从最近的关键帧开始写入预缓存的帧
+      prebuffer_duration_seconds: 5
+
+      # 分段时长（秒）：智能录制的每个视频段的最小时长
+      segment_duration_seconds: 60
+
+      # 最小录制时长（秒）：检测到玩家后至少录制 N 秒才停止
+      min_recording_duration: 10
+
+      # 玩家消失后延迟停止秒数：玩家消失后延迟 N 秒再停止录制
+      # 若延迟期间玩家重新出现，则继续录制
+      post_recording_delay_seconds: 5
+
+      # RKNN 检测配置
+      rknn:
+        enabled: false                 # 是否启用 RKNN 检测
+        model_path: "models/yolo11.rknn"  # RKNN 模型文件路径
+
+        # 检测模式：keyframe | sampled | realtime
+        # - keyframe: 只检测 I 帧，按 detection_interval_keyframes 跳帧（默认）
+        # - sampled:  按 PTS 时间间隔检查（所有帧统一按间隔，关键帧始终解码用于预缓存）
+        # - realtime: 每一帧都检测（含非关键帧）
+        detection_mode: keyframe
+
+        # keyframe 模式：检测间隔（关键帧数）
+        # 每 N 个关键帧检测一次，例如 30 表示每 30 个关键帧检测一次
+        detection_interval_keyframes: 30
+
+        # sampled 模式：检测间隔（秒）
+        # 每 N 秒检测一次（所有帧统一按间隔，关键帧始终解码用于预缓存）
+        detection_interval_seconds: 2.0
+
+        # 玩家类别 ID（YOLO11 模型）
+        player_class_id: 0               # 玩家类别 ID
+
+        # NPC 类别 ID（YOLO11 模型）
+        npc_class_id: 1                  # NPC 类别 ID
+
+        # 检测置信度阈值（0.0 - 1.0）
+        confidence_threshold: 0.5         # 检测置信度阈值，低于此值的结果会被过滤
+
+        # 零拷贝开关：使用 RGA + DMA-BUF 零拷贝管道
+        # 禁用时回退到 CPU 预处理（性能较低）
+        zero_copy_enabled: true
+
+      # 调试图像导出配置
+      dump_detect:
+        enable: false                    # 是否导出调试图像
+        filter: all                      # 导出过滤: all | has_detection | no_detection
 
   # 摄像头 2（示例）
   # - id: camera2
+  #   name: 后门摄像头
   #   url: rtsp://192.168.1.101:554/stream1
   #   auto_reconnect: true
   #   reconnect_interval_seconds: 10
@@ -103,6 +160,21 @@ record:
       # - start: "08:00"              # 可以配置多个时间段
       #   end: "10:00"
 
+  # ============================================
+  # 两阶段录制配置（智能录制 + 事件提取）
+  # ============================================
+  # 两阶段架构：实时录制全部视频 → raw 目录
+  #             事件提取有人片段 → filter 目录
+  raw_subdir: "raw"                        # 实时录制子目录（默认: raw）
+  filter_subdir: "filter"                  # 事件提取子目录（默认: filter）
+  enable_extraction: true                  # 是否启用事件提取（默认: true）
+
+  # 最小玩家片段时长（秒）：小于此时长的片段将被过滤
+  min_player_segment_duration: 5           # 默认: 5
+
+  # 玩家片段合并最大间隔（秒）：两个有人片段之间的间隔小于此值则合并
+  player_segment_merge_gap: 5              # 默认: 5
+
 # ============================================
 # 日志配置
 # ============================================
@@ -129,6 +201,9 @@ upload:
                                        # 进度信息包括：已上传文件、失败文件、重试次数等
                                        # 重启后会自动恢复，避免重复上传
 
+  # 上传目录过滤：raw（全部视频）| filter（仅有人片段）| all（全部）
+  upload_subdir: "filter"              # 默认: filter
+
 # ============================================
 # 自动清理配置
 # ============================================
@@ -139,67 +214,9 @@ autoclean:
   check_interval_seconds: 3600  # 1小时
 
 # ============================================
-# 智能录制配置（RK3588 平台）
-# ============================================
-# 仅在 RK3588 平台（aarch64 架构）启用，其他平台忽略此配置
-# 启用后，系统会根据检测结果（玩家/NPC）自动控制录制开关
-smart_recording:
-  enabled: false                     # 是否启用智能录制
-
-  # 预缓存时长（秒）：在 IDLE 状态下缓存最近 N 秒的视频帧
-  # 当检测到玩家时，从最近的关键帧开始写入预缓存的帧
-  prebuffer_duration_seconds: 5
-
-  # 分段时长（秒）：智能录制的每个视频段的最小时长
-  segment_duration_seconds: 60
-
-  # 最小录制时长（秒）：检测到玩家后至少录制 N 秒才停止
-  min_recording_duration: 10
-
-  # 玩家消失后延迟停止秒数：玩家消失后延迟 N 秒再停止录制
-  # 若延迟期间玩家重新出现，则继续录制
-  post_recording_delay_seconds: 5
-
-  # RKNN 检测配置
-  rknn:
-    enabled: false                 # 是否启用 RKNN 检测
-    model_path: "models/yolo11.rknn"  # RKNN 模型文件路径
-
-    # 检测模式：keyframe | sampled | realtime
-    # - keyframe: 只检测 I 帧，按 detection_interval_keyframes 跳帧（默认）
-    # - sampled:  按 PTS 时间间隔检查（所有帧统一按间隔，关键帧始终解码用于预缓存）
-    # - realtime: 每一帧都检测（含非关键帧）
-    detection_mode: keyframe
-
-    # keyframe 模式：检测间隔（关键帧数）
-    # 每 N 个关键帧检测一次，例如 30 表示每 30 个关键帧检测一次
-    detection_interval_keyframes: 30
-
-    # sampled 模式：检测间隔（秒）
-    # 每 N 秒检测一次（所有帧统一按间隔，关键帧始终解码用于预缓存）
-    detection_interval_seconds: 2.0
-
-    # 玩家类别 ID（YOLO11 模型）
-    player_class_id: 0               # 玩家类别 ID
-
-    # NPC 类别 ID（YOLO11 模型）
-    npc_class_id: 1                  # NPC 类别 ID
-
-    # 检测置信度阈值（0.0 - 1.0）
-    confidence_threshold: 0.5         # 检测置信度阈值，低于此值的结果会被过滤
-
-    # 零拷贝开关：使用 RGA + DMA-BUF 零拷贝管道
-    # 禁用时回退到 CPU 预处理（性能较低）
-    zero_copy_enabled: true
-
-    # 检测间隔（关键帧数）：仅用于向后兼容，推荐使用 detection_mode
-    # detection_interval_keyframes: 30
-
-# ============================================
 # NPU 检测池配置（RK3588 平台）
 # ============================================
 # 仅在启用智能录制时生效，控制全局 NPU 推理池的并发度
 detection_pool:
   workers: 3                 # NPU worker 数量（对应 NPU 核心数，RK3588 最大 3）
   queue_size: 64             # 最大排队任务数（建议 >= 流数量 × 2）
-

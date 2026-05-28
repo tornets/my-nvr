@@ -32,6 +32,13 @@ bool FrameBuffer::addFrame(AVPacket* packet, int64_t pts, int64_t dts, bool is_k
 
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // 如果缓冲区为空且当前帧不是关键帧，跳过此帧
+    // 确保预缓存总是从关键帧开始
+    if (frames_.empty() && !is_key_frame) {
+        LOG_DEBUG("Frame buffer empty, skipping non-key frame to ensure prebuffer starts with key frame");
+        return false;
+    }
+
     // 创建新的缓存帧
     CachedFrame cached_frame;
     cached_frame.packet = av_packet_clone(packet);
@@ -125,6 +132,22 @@ std::vector<CachedFrame> FrameBuffer::getRecentFrames(int duration_seconds) cons
 
     if (start_it == frames_.end()) {
         return getAllFrames();
+    }
+
+    // 确保从关键帧开始：查找第一个关键帧
+    auto keyframe_it = std::find_if(start_it, frames_.end(),
+        [](const CachedFrame& frame) {
+            return frame.is_key_frame;
+        });
+
+    if (keyframe_it != frames_.end()) {
+        // 找到关键帧，从关键帧开始
+        start_it = keyframe_it;
+        LOG_DEBUG("Prebuffer starts from key frame at pts={}", start_it->pts);
+    } else {
+        // 没有关键帧，返回空（不应该发生，因为addFrame确保从关键帧开始）
+        LOG_WARN("No key frame found in prebuffer, returning empty frames");
+        return {};
     }
 
     // 复制从起始位置到结尾的所有帧
@@ -231,16 +254,36 @@ bool FrameBufferWriter::writeFrames(const std::vector<CachedFrame>& frames) {
         return false;
     }
 
-    for (const auto& cached_frame : frames) {
+    if (frames.empty()) {
+        LOG_DEBUG("No frames to write");
+        return true;
+    }
+
+    // 验证第一帧是关键帧
+    if (!frames.empty() && !frames[0].is_key_frame) {
+        LOG_ERROR("FrameBufferWriter: First frame is not a keyframe! This will create corrupt video.");
+        return false;
+    }
+
+    LOG_DEBUG("FrameBufferWriter: Writing {} frames, first frame is keyframe: {}", frames.size(), frames[0].is_key_frame);
+
+    for (size_t i = 0; i < frames.size(); i++) {
+        const auto& cached_frame = frames[i];
         if (!cached_frame.packet) {
+            LOG_WARN("Skipping null packet at index {}", i);
             continue;
         }
 
         // 克隆 packet（避免修改原始数据）
         AVPacket* pkt = av_packet_clone(cached_frame.packet);
         if (!pkt) {
-            LOG_ERROR("Failed to clone packet for writing");
+            LOG_ERROR("Failed to clone packet for writing at index {}", i);
             continue;
+        }
+
+        // 验证：确保关键帧标志正确
+        if (cached_frame.is_key_frame) {
+            pkt->flags |= AV_PKT_FLAG_KEY;  // 强制设置关键帧标志
         }
 
         // 设置流索引
@@ -263,11 +306,19 @@ bool FrameBufferWriter::writeFrames(const std::vector<CachedFrame>& frames) {
         if (ret < 0) {
             char err_buf[AV_ERROR_MAX_STRING_SIZE];
             av_strerror(ret, err_buf, sizeof(err_buf));
-            LOG_ERROR("Failed to write frame: {}", err_buf);
+            LOG_ERROR("Failed to write frame at index {}: {}", i, err_buf);
             return false;
+        }
+
+        // 调试：记录前几个帧的信息
+        if (i < 5) {
+            LOG_DEBUG("Wrote frame {}: keyframe={}, pts={}, dts={}",
+                     i, (cached_frame.is_key_frame ? "yes" : "no"),
+                     pkt->pts, pkt->dts);
         }
     }
 
+    LOG_DEBUG("FrameBufferWriter: Successfully wrote {} frames", frames.size());
     return true;
 }
 

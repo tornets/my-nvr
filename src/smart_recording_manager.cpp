@@ -6,6 +6,7 @@
 #include "smart_recording_manager.h"
 #include "config_loader.h"
 #include "log.h"
+#include "detection_logger.h"
 #include <chrono>
 #include <climits>
 
@@ -36,6 +37,8 @@ SmartRecordingManager::SmartRecordingManager(
     , player_detected_count_(0)
     , should_write_(false)
     , logger_(spdlog::get("nvr") ? spdlog::get("nvr") : spdlog::default_logger())
+    , detection_logger_(nullptr)
+    , current_log_file_("")
 {
     player_last_seen_ = std::chrono::steady_clock::now();
     recording_stop_time_ = std::chrono::steady_clock::time_point::max();
@@ -265,14 +268,15 @@ void SmartRecordingManager::detectionWorkerThread() {
         }
 
         // 提交到 NPU 推理池（同步等待结果）
-        auto pool_result = detection_pool_.detect(task.frame);
+        auto pool_result = detection_pool_.detect(task.frame, task.pts);
 
         if (pool_result.success) {
             detection_count_++;
             const auto& result = pool_result.detection;
-            LOG_DEBUG("[{}] Detection #{}: {} boxes, has_player={}, player_conf={:.2f}, time={:.1f}ms",
+            LOG_DEBUG("[{}] Detection #{}: {} boxes, has_player={}, player_conf={:.2f}, has_npc={}, npc_conf={:.2f}, time={:.1f}ms",
                            stream_id_, detection_count_.load(), result.boxes.size(),
                            result.has_player, result.player_confidence,
+                           result.has_npc, result.npc_confidence,
                            result.processing_time_ms);
             handleDetectionResult(result);
 
@@ -300,9 +304,31 @@ void SmartRecordingManager::detectionWorkerThread() {
 void SmartRecordingManager::handleDetectionResult(const detection::DetectionResult& result) {
     std::lock_guard<std::mutex> lock(state_mutex_);
 
-    // 添加到缓存
+    // TODO: 两阶段录制重构 - 记录检测结果到 CSV
+    if (detection_logger_ && !current_log_file_.empty()) {
+        // 只记录属于当前视频分段的检测结果（frame_pts >= segment_start_pts_）
+        // 忽略预缓存阶段的检测结果，因为它们不属于当前视频文件
+        if (segment_start_pts_ > 0 && result.frame_pts >= segment_start_pts_) {
+            // 计算相对于当前视频分段的 PTS（确保与视频文件的 PTS 一致）
+            int64_t relative_frame_pts = result.frame_pts - segment_start_pts_;
+            detection_logger_->log(current_log_file_, relative_frame_pts, result.timestamp, result);
+        } else if (segment_start_pts_ == 0) {
+            // segment_start_pts_ 还未设置（可能在预缓存阶段），暂时记录原始 frame_pts
+            detection_logger_->log(current_log_file_, result.frame_pts, result.timestamp, result);
+        }
+        // 否则：result.frame_pts < segment_start_pts_，忽略此检测结果
+    }
+
+    // 添加到缓存（只缓存属于当前视频分段的检测结果）
     if (detection_cache_) {
-        detection_cache_->addResult(result, result.frame_pts);
+        if (segment_start_pts_ > 0 && result.frame_pts >= segment_start_pts_) {
+            int64_t relative_frame_pts = result.frame_pts - segment_start_pts_;
+            detection_cache_->addResult(result, relative_frame_pts);
+        } else if (segment_start_pts_ == 0) {
+            // segment_start_pts_ 还未设置，使用原始 frame_pts
+            detection_cache_->addResult(result, result.frame_pts);
+        }
+        // 否则：result.frame_pts < segment_start_pts_，忽略此检测结果
     }
 
     // 统计
@@ -469,23 +495,40 @@ std::vector<CachedFrame> SmartRecordingManager::getPrebufferFrames() const {
 
     auto all_frames = frame_buffer_->getAllFrames();
 
+    if (all_frames.empty()) {
+        LOG_DEBUG("Prebuffer is empty");
+        return {};
+    }
+
     // 找到第一个关键帧作为起始点（必须从关键帧开始才能正确解码）
-    size_t start_idx = 0;
+    size_t start_idx = SIZE_MAX;  // 使用 SIZE_MAX 表示"未找到"
     for (size_t i = 0; i < all_frames.size(); i++) {
         if (all_frames[i].is_key_frame) {
             start_idx = i;
+            LOG_DEBUG("Found first keyframe in prebuffer at index {}", i);
             break;  // 找到第一个关键帧就停止
         }
     }
 
     // 如果没有找到关键帧，返回空（避免写入无法解码的帧）
-    if (start_idx == 0 && !all_frames.empty() && !all_frames[0].is_key_frame) {
-        LOG_WARN("No keyframe found in prebuffer, skipping prebuffer write");
+    if (start_idx == SIZE_MAX) {
+        LOG_WARN("No keyframe found in prebuffer ({} frames), skipping prebuffer write to prevent corrupt video",
+                 all_frames.size());
         return {};
     }
 
+    // 验证：确保第一个关键帧的标志正确设置
+    if (!all_frames[start_idx].is_key_frame) {
+        LOG_ERROR("BUG: Selected frame at index {} is not marked as keyframe!", start_idx);
+        return {};
+    }
+
+    LOG_DEBUG("Retrieving prebuffer: {} frames from index {} (keyframe: {})",
+             all_frames.size() - start_idx, start_idx, all_frames[start_idx].is_key_frame);
+
     // 从第一个关键帧开始返回
     std::vector<CachedFrame> result;
+    result.reserve(all_frames.size() - start_idx);
     for (size_t i = start_idx; i < all_frames.size(); i++) {
         result.push_back(std::move(all_frames[i]));
     }

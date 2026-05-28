@@ -42,6 +42,8 @@ if(RK3588_PLATFORM)
         detection_result_cache.cpp
         rga_preprocessor.cpp
         detection_pool.cpp
+        detection_logger.cpp
+        video_segment_extractor.cpp
     )
 
     # 添加 RKNN 包含路径

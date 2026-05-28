@@ -5,15 +5,26 @@
 #include "log.h"
 #include "nvr_manager.h"
 #include "schedule_utils.h"
+#include "video_segment_extractor.h"
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <system_error>
 #include <iomanip>
 #include <sstream>
 #include <ctime>
+#include <regex>
+#include <unordered_set>
+#include <optional>
 
 namespace fs = std::filesystem;
+
+// 前向声明辅助函数
+std::optional<std::chrono::system_clock::time_point>
+parseRecordingTimeFromFilename(const fs::path& file_path);
+
+bool compareByRecordingTime(const fs::path& a, const fs::path& b);
 
 NVRManager::NVRManager(const Config& config)
     : m_config(config)
@@ -60,6 +71,12 @@ NVRManager::NVRManager(const Config& config)
     if (m_config.autoclean.enabled) {
         m_cleanup_thread = std::thread(&NVRManager::cleanupLoop, this);
         LOG_INFO("Cleanup thread started");
+    }
+
+    // 如果启用了事件提取，启动提取线程
+    if (m_config.record.enable_extraction) {
+        m_extraction_thread = std::thread(&NVRManager::extractionLoop, this);
+        LOG_INFO("Event extraction thread started");
     }
 
     // 如果启用了调度，启动调度线程
@@ -189,6 +206,7 @@ void NVRManager::stopAll() {
         m_cleanup_cv.notify_all();
         m_upload_cv.notify_all();
         m_schedule_cv.notify_all();
+        m_extraction_cv.notify_all();
 
         // 只在线程实际启动时 join
         if (m_cleanup_thread.joinable()) {
@@ -199,6 +217,9 @@ void NVRManager::stopAll() {
         }
         if (m_schedule_thread.joinable()) {
             m_schedule_thread.join();
+        }
+        if (m_extraction_thread.joinable()) {
+            m_extraction_thread.join();
         }
     }
 
@@ -273,6 +294,24 @@ void NVRManager::scanAndUploadNewFiles() {
         return;
     }
 
+    // 根据配置决定扫描哪个目录
+    fs::path scan_dir = m_config.record.output_dir;
+
+    if (m_config.upload.upload_subdir == "filter") {
+        scan_dir = scan_dir / m_config.record.filter_subdir;
+        LOG_DEBUG("Upload scan directory: filter ({} )", scan_dir.string());
+    } else if (m_config.upload.upload_subdir == "raw") {
+        scan_dir = scan_dir / m_config.record.raw_subdir;
+        LOG_DEBUG("Upload scan directory: raw ({} )", scan_dir.string());
+    } else if (m_config.upload.upload_subdir != "all") {
+        LOG_WARN("Unknown upload_subdir: {}, using output_dir", m_config.upload.upload_subdir);
+    }
+
+    // 检查扫描目录是否存在
+    if (!fs::exists(scan_dir)) {
+        return;
+    }
+
     // 获取临时目录的规范路径，用于比较
     fs::path temp_dir_path;
     try {
@@ -282,7 +321,7 @@ void NVRManager::scanAndUploadNewFiles() {
     }
 
     // 使用递归扫描，因为文件名模板可能包含多级目录
-    for (const auto& entry : fs::recursive_directory_iterator(m_config.record.output_dir)) {
+    for (const auto& entry : fs::recursive_directory_iterator(scan_dir)) {
         if (!entry.is_regular_file() || entry.path().extension() != ".mp4") {
             continue;
         }
@@ -350,7 +389,7 @@ void NVRManager::scanAndUploadNewFiles() {
 
 bool NVRManager::cleanOldFiles() {
     int max_age_seconds = m_config.autoclean.max_age_hours * 3600;
-    auto now = fs::file_time_type::clock::now();
+    auto now = std::chrono::system_clock::now();
     int deleted_count = 0;
 
     // 获取临时目录的规范路径，用于比较
@@ -361,13 +400,17 @@ bool NVRManager::cleanOldFiles() {
         temp_dir_path = m_config.record.temp_dir;
     }
 
+    // 收集文件并解析录制时间
+    std::vector<std::pair<fs::path, std::chrono::system_clock::time_point>> files_with_time;
+
     for (const auto& entry : fs::recursive_directory_iterator(m_config.record.output_dir)) {
-        if (!entry.is_regular_file() || entry.path().extension() != ".mp4") {
+        if (!entry.is_regular_file()) {
             continue;
         }
 
         // 跳过临时目录中的文件
-        fs::path file_parent = entry.path().parent_path();
+        fs::path file_path = entry.path();
+        fs::path file_parent = file_path.parent_path();
         try {
             fs::path file_parent_canonical = fs::canonical(file_parent);
             if (file_parent_canonical == temp_dir_path ||
@@ -380,27 +423,55 @@ bool NVRManager::cleanOldFiles() {
             }
         }
 
-        auto ftime = entry.last_write_time();
-        auto age = std::chrono::duration_cast<std::chrono::seconds>(now - ftime).count();
+        // 只处理 MP4 和 CSV 文件
+        if (file_path.extension() != ".mp4" && file_path.extension() != ".csv") {
+            continue;
+        }
+
+        // 尝试从文件名解析录制时间
+        auto time_opt = parseRecordingTimeFromFilename(file_path);
+        if (time_opt) {
+            files_with_time.push_back(std::make_pair(file_path, *time_opt));
+        }
+    }
+
+    // 按录制时间排序（时间早的在前）
+    std::sort(files_with_time.begin(), files_with_time.end(),
+             [](const auto& a, const auto& b) {
+                 return a.second < b.second;  // 时间早的在前
+             });
+
+    // 删除最旧的文件，同时删除关联的 CSV 文件
+    std::unordered_set<std::string> deleted_files;
+    for (const auto& [file_path, recording_time] : files_with_time) {
+        // 计算文件年龄
+        auto age = std::chrono::duration_cast<std::chrono::seconds>(now - recording_time).count();
 
         if (age > max_age_seconds) {
             std::error_code ec;
-            if (fs::remove(entry.path(), ec)) {
-                LOG_INFO("Deleted old file: {} (age: {}h)", entry.path().string(),
-                              age / 3600.0);
+            if (fs::remove(file_path, ec)) {
+                deleted_files.insert(file_path.string());
+                LOG_INFO("Deleted old file: {} (age: {}h)", file_path.string(), age / 3600.0);
                 deleted_count++;
 
+                // 删除关联的 CSV 文件
+                fs::path csv_file = file_path;
+                csv_file.replace_extension(".csv");
+                if (fs::exists(csv_file) && fs::remove(csv_file, ec)) {
+                    LOG_INFO("Deleted associated detection log: {}", csv_file.filename().string());
+                }
+
                 // 清除空目录
-                auto parent_dir = entry.path().parent_path();
+                auto parent_dir = file_path.parent_path();
                 while (parent_dir != m_config.record.output_dir && fs::is_empty(parent_dir)) {
-                    if(!fs::remove(parent_dir)) {
+                    if (!fs::remove(parent_dir, ec)) {
                         LOG_ERROR("Failed to delete empty directory {}: {}", parent_dir.string(), ec.message());
                         break;
                     }
                     parent_dir = parent_dir.parent_path();
                 }
             } else {
-                LOG_ERROR("Failed to delete {}: {}", entry.path().string(), ec.message());
+                LOG_ERROR("Failed to delete {}: {}", file_path.string(), ec.message());
             }
         }
     }
@@ -673,5 +744,205 @@ void NVRManager::stopStreamRecording(const std::string& stream_id) {
         // 所以这里选择 erase 来完全清理
         m_recorders.erase(it);
         LOG_INFO("Schedule: Stopped recording for stream {}", stream_id);
+    }
+}
+
+// ==================== 事件提取相关方法 ====================
+
+void NVRManager::extractionLoop() {
+    LOG_INFO("Event extraction loop started");
+
+    while (m_running) {
+        try {
+            scanAndExtractRawVideos();
+        } catch (const std::exception& e) {
+            LOG_ERROR("Extraction scan error: {}", e.what());
+        }
+
+        std::unique_lock<std::mutex> lock(m_extraction_mutex);
+        // 每1秒扫描一次（确保及时提取新完成的视频）
+        if (m_extraction_cv.wait_for(lock, std::chrono::seconds(1),
+                                    [this] { return !m_running; })) {
+            break;  // 收到停止信号
+        }
+    }
+
+    LOG_INFO("Event extraction loop stopped");
+}
+
+void NVRManager::scanAndExtractRawVideos() {
+    LOG_DEBUG("Extraction scan: enable_extraction={}", m_config.record.enable_extraction);
+    if (!m_config.record.enable_extraction) {
+        return;
+    }
+
+    fs::path raw_dir = fs::path(m_config.record.output_dir) / m_config.record.raw_subdir;
+    LOG_DEBUG("Extraction scan: raw_dir={}", raw_dir.string());
+
+    // 检查 raw 目录是否存在
+    if (!fs::exists(raw_dir)) {
+        LOG_DEBUG("Raw directory does not exist: {}", raw_dir.string());
+        return;
+    }
+
+    // 扫描 raw 目录中的 MP4 文件
+    int found_count = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(raw_dir)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".mp4") {
+            continue;
+        }
+
+        found_count++;
+        LOG_DEBUG("Found raw video: {}", entry.path().string());
+
+        // 检查是否应该提取该视频
+        if (!shouldExtractVideo(entry.path())) {
+            LOG_DEBUG("Skipping video (shouldExtractVideo=false): {}", entry.path().string());
+            continue;
+        }
+
+        // 检查对应的 CSV 检测日志是否存在
+        fs::path csv_file = entry.path();
+        csv_file.replace_extension(".csv");
+        if (!fs::exists(csv_file)) {
+            LOG_DEBUG("Detection log not found for {}, skipping", entry.path().string());
+            continue;
+        }
+
+        LOG_INFO("Processing raw video for extraction: {}", entry.path().string());
+
+        try {
+            // 创建提取占位符文件，防止重复提取
+            fs::path expected_filter_dir = fs::path(m_config.record.output_dir) / m_config.record.filter_subdir;
+            fs::path relative_path = fs::relative(entry.path(), fs::path(m_config.record.output_dir) / m_config.record.raw_subdir);
+            fs::path filter_video = expected_filter_dir / relative_path;
+            fs::path placeholder = filter_video;
+            placeholder.replace_extension(".extracting");
+
+            // 创建目录和占位符文件
+            fs::create_directories(filter_video.parent_path());
+            std::ofstream(placeholder.string()) << "Extracting...";  // 创建占位符文件
+
+            LOG_DEBUG("Created extraction placeholder: {}", placeholder.string());
+
+            // 创建视频片段提取器
+            VideoSegmentExtractor extractor(m_config);
+            extractor.processRawVideo(entry.path(), csv_file);
+
+            // 提取完成，删除占位符文件
+            fs::remove(placeholder);
+
+            LOG_INFO("Successfully processed raw video: {}", entry.path().string());
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to extract from {}: {}", entry.path().string(), e.what());
+
+            // 失败时也要删除占位符文件
+            fs::path expected_filter_dir = fs::path(m_config.record.output_dir) / m_config.record.filter_subdir;
+            fs::path relative_path = fs::relative(entry.path(), fs::path(m_config.record.output_dir) / m_config.record.raw_subdir);
+            fs::path filter_video = expected_filter_dir / relative_path;
+            fs::path placeholder = filter_video;
+            placeholder.replace_extension(".extracting");
+            fs::remove(placeholder);
+        }
+    }
+
+    if (found_count == 0) {
+        LOG_DEBUG("Extraction scan: no MP4 files found in {}", raw_dir.string());
+    } else {
+        LOG_DEBUG("Extraction scan: found {} MP4 files in {}", found_count, raw_dir.string());
+    }
+}
+
+bool NVRManager::shouldExtractVideo(const std::filesystem::path& raw_video) {
+    LOG_DEBUG("shouldExtractVideo: checking {}", raw_video.string());
+
+    // 检查 CSV 文件是否存在（视频已完成录制和检测）
+    fs::path csv_file = raw_video;
+    csv_file.replace_extension(".csv");
+    if (!fs::exists(csv_file)) {
+        LOG_DEBUG("shouldExtractVideo: CSV file not found: {}", csv_file.string());
+        return false;  // 视频还在录制或检测未完成
+    }
+
+    // 额外检查：确保CSV文件不是临时文件（temp_*.csv）
+    // 临时CSV文件名包含"temp_"，表示还在录制中
+    if (csv_file.filename().string().find("temp_") != std::string::npos) {
+        LOG_DEBUG("shouldExtractVideo: CSV file is temporary, skipping: {}", csv_file.string());
+        return false;
+    }
+
+    // 检查是否已经生成了对应的 filter 视频
+    fs::path expected_filter_dir = fs::path(m_config.record.output_dir) / m_config.record.filter_subdir;
+    fs::path relative_path = fs::relative(raw_video, fs::path(m_config.record.output_dir) / m_config.record.raw_subdir);
+    fs::path filter_video = expected_filter_dir / relative_path;
+
+    LOG_DEBUG("shouldExtractVideo: expected_filter={}, relative_path={}, filter_video={}",
+              expected_filter_dir.string(), relative_path.string(), filter_video.string());
+
+    // 检查 filter 视频或提取占位符文件是否存在
+    bool filter_exists = fs::exists(filter_video);
+    fs::path placeholder = filter_video;
+    placeholder.replace_extension(".extracting");
+    bool placeholder_exists = fs::exists(placeholder);
+
+    if (filter_exists || placeholder_exists) {
+        LOG_DEBUG("shouldExtractVideo: Filter video or placeholder already exists: {} (filter={}, placeholder={})",
+                  filter_video.string(), filter_exists, placeholder_exists);
+        return false;
+    }
+
+    LOG_DEBUG("shouldExtractVideo: returning TRUE for {}", raw_video.string());
+    return true;
+}
+
+// ==================== 清理优化辅助函数 ====================
+
+// 从文件名解析录制时间
+std::optional<std::chrono::system_clock::time_point>
+parseRecordingTimeFromFilename(const fs::path& file_path) {
+    std::string filename = file_path.stem().string();  // 去扩展名
+
+    // 示例文件名: camera1_20260528_001407_001417.mp4
+    // 使用正则表达式提取时间戳
+    std::regex time_regex(R"(\d{8}_\d{6})");
+    std::smatch match;
+
+    if (std::regex_search(filename, match, time_regex)) {
+        std::string datetime_str = match[0].str();  // "20260528_001407"
+
+        // 解析为时间点
+        std::tm tm = {};
+        std::istringstream ss(datetime_str);
+        ss >> std::get_time(&tm, "%Y%m%d_%H%M%S");
+        if (ss.fail()) {
+            // 解析失败，返回 nullopt
+            return std::nullopt;
+        }
+
+        std::time_t time = std::mktime(&tm);
+        if (time == -1) {
+            return std::nullopt;
+        }
+
+        return std::chrono::system_clock::from_time_t(time);
+    }
+
+    return std::nullopt;
+}
+
+// 按文件名中的录制时间排序
+bool compareByRecordingTime(const fs::path& a, const fs::path& b) {
+    auto time_a = parseRecordingTimeFromFilename(a);
+    auto time_b = parseRecordingTimeFromFilename(b);
+
+    if (time_a && time_b) {
+        return *time_a < *time_b;
+    } else if (time_a) {
+        return true;  // 有时间的排在前面
+    } else if (time_b) {
+        return false;
+    } else {
+        // 都没有时间，使用文件修改时间
+        return fs::last_write_time(a) < fs::last_write_time(b);
     }
 }

@@ -45,13 +45,15 @@ public:
 
     // 同步检测接口：提交任务到共享队列，阻塞等待结果
     // frame 的所有权不转移，调用者负责释放
-    PoolDetectionResult detect(::AVFrame* frame);
+    // frame_pts 是帧的 PTS 时间戳，用于记录检测结果对应的时间
+    PoolDetectionResult detect(::AVFrame* frame, int64_t frame_pts = 0);
 
     int getNumWorkers() const { return num_workers_; }
 
 private:
     struct Task {
         ::AVFrame* frame;
+        int64_t frame_pts;  // 帧 PTS 时间戳
         std::promise<PoolDetectionResult> promise;
     };
 

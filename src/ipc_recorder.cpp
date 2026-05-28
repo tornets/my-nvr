@@ -9,6 +9,7 @@
 #ifdef ENABLE_RKNN_SMART_RECORDING
 #include "smart_recording_manager.h"
 #include "frame_buffer.h"
+#include "detection_logger.h"
 #endif
 
 #include <chrono>
@@ -153,9 +154,13 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
     , m_segment_duration(segment_duration)
     , m_segment_index(0)
     , m_segment_start_time(0)
+    , m_stream_start_wallclock(0)
+    , m_stream_start_pts(0)
     , m_last_video_pts(0)
     , m_last_video_dts(0)
+    , m_last_audio_pts(0)
     , m_video_time_base{1, 90000}
+    , m_audio_time_base{1, 90000}
     , m_current_dts(0)
     , m_pts_offset(0)
 {
@@ -173,6 +178,7 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
 
     // 解析输出格式（从文件名模板）
     m_output_format = parseOutputFormat();
+    LOG_INFO("Segment duration: {} seconds", m_segment_duration);
     LOG_INFO("Output format: {}", m_output_format);
 
     // 创建输出目录和临时目录（使用 UTF-8 兼容函数）
@@ -185,6 +191,10 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
 #endif
 
 #ifdef ENABLE_RKNN_SMART_RECORDING
+    // 初始化检测结果日志器（两阶段录制）
+    m_detection_logger = std::make_unique<DetectionLogger>(m_output_dir);
+    LOG_INFO("Detection logger initialized for stream: {}", m_stream_id);
+
     // 初始化智能录制
     if (smart_recording_config && smart_recording_config->enabled && detection_pool) {
         m_smart_recording_enabled = true;
@@ -194,6 +204,8 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
         if (m_smart_recording->initialize()) {
             m_smart_recording->start();
             m_smart_recording->setDebugOutputDir(m_output_dir);
+            // 设置检测日志器
+            m_smart_recording->setDetectionLogger(m_detection_logger.get());
             LOG_INFO("Smart recording enabled for stream: {}", m_stream_id);
         } else {
             LOG_WARN("Failed to initialize smart recording for stream: {}", m_stream_id);
@@ -536,22 +548,27 @@ bool IPCRecorder::connectAndRecord() {
 #ifdef ENABLE_RKNN_SMART_RECORDING
         // 智能录制门控模式
         if (m_smart_recording_enabled && m_smart_recording) {
-            // 检查延迟停止（POST_RECORDING 超时）
-            if (m_output_ctx && m_smart_recording->shouldStopRecording()) {
-                LOG_INFO("Smart recording: post-recording delay expired, closing segment");
-                closeOutput();
-                m_smart_recording->clearCache();
-            }
+            // TODO: 两阶段录制重构 - 禁用 POST_RECORDING 停止逻辑
+            // 两阶段模式下所有视频连续录制，分段只由 shouldSwitchSegment 控制
+            // if (m_output_ctx && m_smart_recording->shouldStopRecording()) {
+            //     LOG_INFO("Smart recording: post-recording delay expired, closing segment");
+            //     closeOutput();
+            //     m_smart_recording->clearCache();
+            // }
 
             // 分段时长检查（智能录制也按配置时长切片）
             if (m_output_ctx && shouldSwitchSegment(packet)) {
-                LOG_INFO("Smart recording: segment duration reached, starting new segment");
+                LOG_INFO("Smart recording: segment duration reached, closing segment at key frame pts={}", packet->pts);
                 closeOutput();
                 m_smart_recording->clearCache();
+                // 当前关键帧将作为新分段的首帧，确保分片间无缝衔接
+                // 关闭旧分段后继续往下走，写入新分段
             }
 
             // 不在录制中且门控未开启 → 跳过此包
-            if (!m_output_ctx && !m_smart_recording->shouldWritePacket()) {
+            // TODO: 两阶段录制重构 - 暂时禁用智能录制门控，所有视频录制到 raw 目录
+            // if (!m_output_ctx && !m_smart_recording->shouldWritePacket()) {
+            if (false) {
                 // IDLE：缓存所有视频帧，按检测模式决定是否解码
                 if (packet->stream_index == m_video_stream_idx) {
                     bool is_key_frame = (packet->flags & AV_PKT_FLAG_KEY) != 0;
@@ -571,7 +588,9 @@ bool IPCRecorder::connectAndRecord() {
             }
 
             // 门控刚开启（IDLE→RECORDING）且未打开输出 → 用预缓存帧立即开始录制
-            if (!m_output_ctx && m_smart_recording->shouldWritePacket()) {
+            // TODO: 两阶段录制重构 - 暂时禁用智能录制门控
+            // if (!m_output_ctx && m_smart_recording->shouldWritePacket()) {
+            if (false) {
                 auto prebuffer = m_smart_recording->getPrebufferFrames();
 
                 if (!prebuffer.empty() && prebuffer[0].is_key_frame) {
@@ -619,23 +638,43 @@ bool IPCRecorder::connectAndRecord() {
                     m_audio_frame_count = 0;
                     m_last_video_pts = 0;
                     m_last_video_dts = 0;
+                    m_last_audio_pts = 0;
 
                     // 写入预缓存帧（PTS 偏移到从 0 开始）
                     if (!prebuffer.empty() && prebuffer[0].is_key_frame) {
-                        nvr::FrameBufferWriter writer(m_output_ctx, 0);
-                        writer.setTimeBase(m_video_time_base);
-                        writer.setPTSOffset(m_segment_start_pts, m_segment_start_dts);
-                        if (!writer.writeFrames(prebuffer)) {
-                            LOG_WARN("Failed to write some prebuffer frames");
+                        // 验证预缓存的完整性
+                        bool has_valid_keyframes = true;
+                        for (size_t i = 0; i < prebuffer.size(); i++) {
+                            if (i == 0 && !prebuffer[i].is_key_frame) {
+                                LOG_ERROR("Prebuffer first frame is not a key frame!");
+                                has_valid_keyframes = false;
+                                break;
+                            }
                         }
 
-                        // 不更新 m_segment_start_pts 和 m_segment_start_dts
-                        // 保持原来的值，这样当前帧的时间戳会相对于预缓存的第一帧，而不是最后一帧
-                        // 这确保了 DTS 的连续性
+                        if (!has_valid_keyframes) {
+                            LOG_ERROR("Prebuffer validation failed, discarding prebuffer");
+                            // 不写入预缓存，等待下一个关键帧
+                            if (!(packet->flags & AV_PKT_FLAG_KEY) || packet->stream_index != m_video_stream_idx) {
+                                av_packet_unref(packet);
+                                continue;
+                            }
+                        } else {
+                            nvr::FrameBufferWriter writer(m_output_ctx, 0);
+                            writer.setTimeBase(m_video_time_base);
+                            writer.setPTSOffset(m_segment_start_pts, m_segment_start_dts);
+                            if (!writer.writeFrames(prebuffer)) {
+                                LOG_WARN("Failed to write some prebuffer frames");
+                            }
 
-                        LOG_INFO("Smart recording: prebuffer written ({} frames), start pts={} kept for continuity",
-                                 prebuffer.size(), m_segment_start_pts);
-                        // 当前包继续往下走正常写入流程
+                            // 不更新 m_segment_start_pts 和 m_segment_start_dts
+                            // 保持原来的值，这样当前帧的时间戳会相对于预缓存的第一帧，而不是最后一帧
+                            // 这确保了 DTS 的连续性
+
+                            LOG_INFO("Smart recording: prebuffer written ({} frames), start pts={} kept for continuity",
+                                     prebuffer.size(), m_segment_start_pts);
+                            // 当前包继续往下走正常写入流程
+                        }
                     } else {
                         // 无预缓存或无关键帧，等待下一个关键帧
                         if (!(packet->flags & AV_PKT_FLAG_KEY) || packet->stream_index != m_video_stream_idx) {
@@ -644,6 +683,19 @@ bool IPCRecorder::connectAndRecord() {
                         }
                         LOG_INFO("Smart recording: opening new file (no prebuffer), player detected");
                     }
+                }
+            }
+
+            // 智能录制模式：等待关键帧检查（两阶段录制重构）
+            // 当没有输出上下文时，必须等待关键帧才开始录制
+            if (!m_output_ctx) {
+                if (packet->stream_index == m_video_stream_idx) {
+                    if (!(packet->flags & AV_PKT_FLAG_KEY)) {
+                        LOG_DEBUG("Smart recording: waiting for key frame before starting new segment...");
+                        av_packet_unref(packet);
+                        continue;
+                    }
+                    LOG_INFO("Smart recording: key frame received, starting new segment");
                 }
             }
         } else
@@ -660,7 +712,11 @@ bool IPCRecorder::connectAndRecord() {
 
             // 常规分段切换
             if (shouldSwitchSegment(packet)) {
+                LOG_INFO("Segment duration reached, closing current segment at key frame pts={}", packet->pts);
                 closeOutput();
+                // 跳过当前关键帧，避免它被写入下一个分段
+                // 下一个分段将从下一个关键帧开始
+                continue;
             }
         }
 
@@ -671,6 +727,14 @@ bool IPCRecorder::connectAndRecord() {
 
                 // 记录开始时间
                 std::time(&m_segment_start_time);
+
+                // 第一个分段：记录 PTS 锚点，后续分段用此计算文件名时间
+                if (m_stream_start_wallclock == 0) {
+                    m_stream_start_wallclock = m_segment_start_time;
+                    m_stream_start_pts = packet->pts;
+                    LOG_INFO("Stream PTS anchor set: wallclock={}, pts={}",
+                             m_stream_start_wallclock, m_stream_start_pts);
+                }
 
                 // 生成临时文件名（使用随机字符串和目标格式扩展名）
                 static const char charset[] = "0123456789abcdefghijklmnopqrstuvwxyz";
@@ -710,6 +774,15 @@ bool IPCRecorder::connectAndRecord() {
                 }
                 LOG_INFO("Temp file opened successfully");
 
+                // 验证：确保文件从关键帧开始
+                if (!(packet->flags & AV_PKT_FLAG_KEY)) {
+                    LOG_ERROR("BUG: First frame written is not a key frame! This should not happen.");
+                    closeOutput();
+                    av_packet_unref(packet);
+                    continue;
+                }
+                LOG_DEBUG("Validated: Segment starts with key frame at pts={}", packet->pts);
+
 #ifdef ENABLE_RKNN_SMART_RECORDING
                 // 设置智能录制管理器的输出上下文
                 if (m_smart_recording_enabled && m_smart_recording) {
@@ -736,6 +809,7 @@ bool IPCRecorder::connectAndRecord() {
                 m_audio_frame_count = 0;
                 m_last_video_pts = 0;  // 重置最后一个视频PTS
                 m_last_video_dts = 0;   // 重置最后一个视频DTS
+                m_last_audio_pts = 0;   // 重置最后一个音频PTS
             }
 
             int stream_index = packet->stream_index;
@@ -750,6 +824,15 @@ bool IPCRecorder::connectAndRecord() {
             }
             if (packet->dts >= 0) {
                 m_last_video_dts = packet->dts;
+            }
+
+            // 关键帧统计和验证
+            if (packet->flags & AV_PKT_FLAG_KEY) {
+                static int keyframe_count = 0;
+                keyframe_count++;
+                if (keyframe_count % 100 == 0) {  // 每100个关键帧记录一次
+                    LOG_DEBUG("Key frame stats: {} keyframes processed, latest pts={}", keyframe_count, packet->pts);
+                }
             }
 
             // 计算相对时间戳并转换到输出时间基准
@@ -809,6 +892,11 @@ bool IPCRecorder::connectAndRecord() {
                 // 记录第一个音频包的 PTS 作为起始点
                 m_audio_start_pts = packet->pts;
                 LOG_DEBUG("Audio start PTS set to: {}", m_audio_start_pts);
+            }
+
+            // 保存最后一个音频包的PTS（用于分段切换判断）
+            if (packet->pts > 0) {
+                m_last_audio_pts = packet->pts;
             }
 
             if (m_audio_encoder_ctx) {
@@ -923,6 +1011,23 @@ bool IPCRecorder::openOutput(const std::string& filename) {
     m_current_filename = filename;
     // 使用临时目录存放正在录制的文件
     std::string full_path = (fs::path(m_temp_dir) / filename).string();
+
+    // TODO: 两阶段录制重构 - 为临时文件创建 CSV 日志（录制后重命名为最终名）
+    #ifdef ENABLE_RKNN_SMART_RECORDING
+    if (m_detection_logger && m_smart_recording) {
+        // 为临时文件创建 CSV 日志文件（在 temp_dir 中）
+        fs::path temp_csv_path = fs::path(m_temp_dir) / m_current_filename;
+        temp_csv_path.replace_extension(".csv");
+
+        // 创建 CSV 日志文件
+        std::string csv_log_path = m_detection_logger->createLogFile(temp_csv_path);
+        if (!csv_log_path.empty()) {
+            // 设置 SmartRecordingManager 的日志文件路径
+            m_smart_recording->setCurrentLogFile(csv_log_path);
+            LOG_DEBUG("Set detection log file for current recording: {}", csv_log_path);
+        }
+    }
+    #endif
 
     // 动态创建输出上下文，使用解析的格式
     int ret = avformat_alloc_output_context2(&m_output_ctx, nullptr, m_output_format.c_str(), full_path.c_str());
@@ -1194,9 +1299,11 @@ void IPCRecorder::closeOutput() {
             }
 
             // 步骤3: 发送 NULL 帧到编码器，告知没有更多输入
+            LOG_DEBUG("Sending NULL frame to audio encoder to flush...");
             avcodec_send_frame(m_audio_encoder_ctx, nullptr);
 
-            // 步骤4: 接收所有剩余的编码包
+            // 步骤4: 接收所有剩余的编码包（循环直到没有更多数据）
+            int flush_count = 0;
             while (true) {
                 AVPacket* encoded_packet = av_packet_alloc();
                 int ret = avcodec_receive_packet(m_audio_encoder_ctx, encoded_packet);
@@ -1226,13 +1333,14 @@ void IPCRecorder::closeOutput() {
                                         m_audio_encoder_ctx->time_base,
                                         m_output_ctx->streams[out_audio_idx]->time_base);
                     writePacket(encoded_packet);
-                    LOG_DEBUG("Flushed audio packet to stream {}", out_audio_idx);
+                    flush_count++;
+                    LOG_DEBUG("Flushed audio packet {} to stream {}", flush_count, out_audio_idx);
                 }
 
                 av_packet_free(&encoded_packet);
             }
 
-            LOG_INFO("Audio encoder flushed");
+            LOG_INFO("Audio encoder flushed, wrote {} packets", flush_count);
         }
 
         av_write_trailer(m_output_ctx);
@@ -1244,6 +1352,8 @@ void IPCRecorder::closeOutput() {
         if (!m_current_filename.empty()) {
             // 计算实际录制时长（基于视频PTS）
             int64_t duration_seconds = 0;
+            int64_t video_duration_seconds = 0;
+            int64_t audio_duration_seconds = 0;
 
             if (m_last_video_pts > 0 && m_segment_start_pts >= 0 && m_video_stream_idx >= 0) {
                 // 计算相对PTS（最后一个视频PTS - 起始PTS）
@@ -1251,9 +1361,33 @@ void IPCRecorder::closeOutput() {
 
                 // 使用视频流的 time_base 将相对 PTS 转换为秒
                 AVRational tb = m_video_time_base;
-                duration_seconds = av_rescale_q(relative_pts, tb, AVRational{1, 1});
+                video_duration_seconds = av_rescale_q(relative_pts, tb, AVRational{1, 1});
+                duration_seconds = video_duration_seconds;
                 LOG_DEBUG("Video duration calculation: last_pts={}, start_pts={}, relative_pts={}, tb={}/{}, duration={}s",
-                               m_last_video_pts, m_segment_start_pts, relative_pts, tb.num, tb.den, duration_seconds);
+                               m_last_video_pts, m_segment_start_pts, relative_pts, tb.num, tb.den, video_duration_seconds);
+            }
+
+            // 计算音频时长（用于调试音视频同步）
+            if (m_last_audio_pts > 0 && m_audio_start_pts >= 0 && m_audio_stream_idx >= 0) {
+                int64_t audio_relative_pts = m_last_audio_pts - m_audio_start_pts;
+                audio_duration_seconds = av_rescale_q(audio_relative_pts, m_audio_time_base, AVRational{1, 1});
+                LOG_INFO("Audio duration calculation: last_pts={}, start_pts={}, relative_pts={}, tb={}/{}, duration={}s",
+                              m_last_audio_pts, m_audio_start_pts, audio_relative_pts,
+                              m_audio_time_base.num, m_audio_time_base.den, audio_duration_seconds);
+
+                // 计算音视频时长差异
+                if (video_duration_seconds > 0) {
+                    int64_t duration_diff = video_duration_seconds - audio_duration_seconds;
+                    if (duration_diff > 0) {
+                        LOG_WARN("Video is {} seconds longer than audio (video: {}s, audio: {}s)",
+                                 duration_diff, video_duration_seconds, audio_duration_seconds);
+                    } else if (duration_diff < 0) {
+                        LOG_WARN("Audio is {} seconds longer than video (audio: {}s, video: {}s)",
+                                 -duration_diff, audio_duration_seconds, video_duration_seconds);
+                    } else {
+                        LOG_INFO("Perfect audio-video synchronization: both {}s", video_duration_seconds);
+                    }
+                }
             }
 
             // 如果视频PTS计算失败（或为0），回退到系统时间计算
@@ -1264,13 +1398,22 @@ void IPCRecorder::closeOutput() {
                 LOG_WARN("Video PTS not available, using system time for duration: {}s", duration_seconds);
             }
 
+            // 关键帧质量检查
+            if (video_duration_seconds > 0) {
+                // 计算期望的关键帧数量（假设2秒一个关键帧）
+                int expected_keyframes = static_cast<int>(video_duration_seconds / 2) + 1;
+                LOG_INFO("Segment quality check: duration={}s, expected ~{} keyframes, file starts with key frame: YES",
+                         video_duration_seconds, expected_keyframes);
+            }
+
             // 生成新的文件名（包含结束时间和时长）
             std::string new_filename = generateFilenameFromTemplate(m_segment_start_pts, 0, duration_seconds);
 
             // 如果文件名包含路径，创建最终目录
             fs::path new_filepath(new_filename);
             if (new_filepath.has_parent_path()) {
-                fs::path full_final_dir = m_output_dir / new_filepath.parent_path();
+                // TODO: 两阶段录制重构 - 输出到 raw 子目录
+                fs::path full_final_dir = fs::path(m_output_dir) / "raw" / new_filepath.parent_path();
 #ifdef _WIN32
                 create_directories_recursive(full_final_dir.string());
 #else
@@ -1279,12 +1422,23 @@ void IPCRecorder::closeOutput() {
             }
 
             fs::path temp_path = fs::path(m_temp_dir) / m_current_filename;
-            fs::path final_path = fs::path(m_output_dir) / new_filename;
+            // TODO: 两阶段录制重构 - 输出到 raw 子目录
+            fs::path final_path = fs::path(m_output_dir) / "raw" / new_filename;
 
             // 移动文件（使用 UTF-8 兼容函数）
 #ifdef _WIN32
             if (rename_file_utf8(temp_path.string(), final_path.string())) {
                 LOG_INFO("Moved recording: {} -> {}", m_current_filename, new_filename);
+
+                // TODO: 两阶段录制重构 - 创建 CSV 日志文件
+                #ifdef ENABLE_RKNN_SMART_RECORDING
+                if (m_detection_logger) {
+                    std::string csv_path = m_detection_logger->createLogFile(final_path);
+                    if (!csv_path.empty()) {
+                        LOG_INFO("Created detection log: {}", csv_path);
+                    }
+                }
+                #endif
             } else {
                 LOG_ERROR("Failed to move recording {} to {}: {}",
                                m_current_filename, new_filename, GetLastError());
@@ -1295,6 +1449,36 @@ void IPCRecorder::closeOutput() {
                 fs::rename(temp_path, final_path, ec);
                 if (!ec) {
                     LOG_INFO("Moved recording: {} -> {}", m_current_filename, new_filename);
+
+                    // TODO: 两阶段录制重构 - 重命名 CSV 日志文件到最终路径
+                    #ifdef ENABLE_RKNN_SMART_RECORDING
+                    if (m_detection_logger) {
+                        // 获取临时CSV文件路径（在temp_dir中）
+                        fs::path temp_csv = fs::path(m_temp_dir) / m_current_filename;
+                        temp_csv.replace_extension(".csv");
+
+                        // 创建最终CSV文件路径（在raw目录，使用最终文件名）
+                        fs::path final_csv = fs::path(m_output_dir) / "raw" / new_filename;
+                        final_csv.replace_extension(".csv");
+
+                        // 重命名临时CSV为最终CSV
+                        if (fs::exists(temp_csv)) {
+                            std::error_code ec;
+                            fs::rename(temp_csv, final_csv, ec);
+                            if (!ec) {
+                                LOG_INFO("Moved detection log: {} -> {}", temp_csv.filename().string(), final_csv.filename().string());
+                            } else {
+                                LOG_WARN("Failed to move detection log: {} -> {}, error: {}",
+                                        temp_csv.string(), final_csv.string(), ec.message());
+                            }
+                        } else {
+                            LOG_DEBUG("Temp CSV not found (may be empty): {}", temp_csv.string());
+                        }
+
+                        // 完成最终CSV文件的写入
+                        m_detection_logger->finalizeLogFile(final_csv.string());
+                    }
+                    #endif
                 } else {
                     LOG_ERROR("Failed to move recording {} to {}: {}",
                                    m_current_filename, new_filename, ec.message().c_str());
@@ -1315,6 +1499,9 @@ bool IPCRecorder::setupStreams() {
             m_video_stream_idx = i;
         } else if (m_input_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && m_enable_audio) {
             m_audio_stream_idx = i;
+            // 保存音频时间基准
+            m_audio_time_base = m_input_ctx->streams[i]->time_base;
+            LOG_DEBUG("Audio time base: {}/{}", m_audio_time_base.num, m_audio_time_base.den);
         }
     }
 
@@ -1484,11 +1671,28 @@ bool IPCRecorder::shouldSwitchSegment(const AVPacket* packet) {
         return false;
     }
 
-    int64_t pts_diff = packet->pts - m_segment_start_pts;
-    int64_t duration_in_sec = av_rescale_q(pts_diff, m_video_time_base, AVRational{1, 1});
+    // 只在视频关键帧上检查分段切换
+    if (packet->stream_index == m_video_stream_idx && (packet->flags & AV_PKT_FLAG_KEY)) {
+        int64_t pts_diff = packet->pts - m_segment_start_pts;
+        int64_t duration_in_sec = av_rescale_q(pts_diff, m_video_time_base, AVRational{1, 1});
 
-    if (duration_in_sec >= m_segment_duration) {
-        if (packet->flags & AV_PKT_FLAG_KEY) {
+        if (duration_in_sec >= m_segment_duration) {
+            // 如果有音频流，检查音频是否也接近分段时长
+            if (m_audio_stream_idx >= 0 && m_last_audio_pts > 0) {
+                int64_t audio_duration_in_sec = av_rescale_q(
+                    m_last_audio_pts - m_audio_start_pts,
+                    m_audio_time_base,
+                    AVRational{1, 1}
+                );
+
+                // 允许音频比视频晚最多2秒（避免无限等待）
+                int64_t max_audio_delay = 2;
+                if (audio_duration_in_sec < duration_in_sec - max_audio_delay) {
+                    LOG_DEBUG("Waiting for audio to catch up: video={}s, audio={}s",
+                             duration_in_sec, audio_duration_in_sec);
+                    return false;  // 音频落后太多，等待音频追赶
+                }
+            }
             return true;
         }
     }
@@ -1890,12 +2094,21 @@ std::string IPCRecorder::generateFilenameFromTemplate(int64_t start_pts, int64_t
     vars["{stream_name}"] = m_stream_name;
     vars["{shop_id}"] = std::to_string(m_shop_id);
 
-    // 时间相关
-    vars["{start_date}"] = formatDate(m_segment_start_time, "%Y-%m-%d");
-    vars["{start_time}"] = formatDate(m_segment_start_time, "%H%M%S");
-    vars["{start_datetime}"] = formatDate(m_segment_start_time, "%Y%m%d_%H%M%S");
+    // 时间相关 — 基于 PTS 锚点计算，确保分片间时间戳连续无重叠
+    std::time_t seg_start_time;
+    if (m_stream_start_wallclock > 0 && m_segment_start_pts >= m_stream_start_pts) {
+        int64_t pts_offset = m_segment_start_pts - m_stream_start_pts;
+        int64_t secs = av_rescale_q(pts_offset, m_video_time_base, AVRational{1, 1});
+        seg_start_time = m_stream_start_wallclock + secs;
+    } else {
+        seg_start_time = m_segment_start_time;  // 回退：锚点未设置时用系统墙钟
+    }
 
-    std::time_t end_time = m_segment_start_time + duration_seconds;
+    vars["{start_date}"] = formatDate(seg_start_time, "%Y-%m-%d");
+    vars["{start_time}"] = formatDate(seg_start_time, "%H%M%S");
+    vars["{start_datetime}"] = formatDate(seg_start_time, "%Y%m%d_%H%M%S");
+
+    std::time_t end_time = seg_start_time + duration_seconds;
     vars["{end_time}"] = formatDate(end_time, "%H%M%S");
     vars["{end_datetime}"] = formatDate(end_time, "%Y%m%d_%H%M%S");
 

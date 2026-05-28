@@ -104,13 +104,14 @@ void DetectionPool::shutdown() {
     LOG_INFO("DetectionPool: shutdown complete");
 }
 
-PoolDetectionResult DetectionPool::detect(AVFrame* frame) {
+PoolDetectionResult DetectionPool::detect(AVFrame* frame, int64_t frame_pts) {
     if (!running_ || !frame) {
         return {};
     }
 
     Task task;
     task.frame = frame;
+    task.frame_pts = frame_pts;
     auto future = task.promise.get_future();
 
     {
@@ -159,10 +160,10 @@ void DetectionPool::workerLoop(int index) {
             auto wrapper = DMABufferExtractor::extractFromAVFrame(task.frame);
             if (wrapper && wrapper->isValid()) {
                 result.success = detector->detectFrameZeroCopy(
-                    wrapper->getInfo(), result.detection);
+                    wrapper->getInfo(), result.detection, task.frame_pts);
             } else {
                 // 零拷贝失败，回退到 CPU 模式
-                result.success = detector->detectFrame(task.frame, result.detection);
+                result.success = detector->detectFrame(task.frame, result.detection, task.frame_pts);
             }
         } else if (task.frame->format == AV_PIX_FMT_DRM_PRIME) {
             // CPU 模式但收到 DRM_PRIME 帧：先下载到 CPU 内存
@@ -173,7 +174,7 @@ void DetectionPool::workerLoop(int index) {
                 if (ret == 0) {
                     cpu_frame->width = task.frame->width;
                     cpu_frame->height = task.frame->height;
-                    result.success = detector->detectFrame(cpu_frame, result.detection);
+                    result.success = detector->detectFrame(cpu_frame, result.detection, task.frame_pts);
                 } else {
                     LOG_ERROR("av_hwframe_transfer_data failed: {}", ret);
                 }
@@ -181,7 +182,7 @@ void DetectionPool::workerLoop(int index) {
             }
         } else {
             // 普通 CPU 帧（非 DRM_PRIME）
-            result.success = detector->detectFrame(task.frame, result.detection);
+            result.success = detector->detectFrame(task.frame, result.detection, task.frame_pts);
         }
 
         if (config_.dump_detect.enable && result.success) {

@@ -52,10 +52,10 @@ public:
     bool isInitialized() const { return initialized_; }
 
     // 使用 CPU 拷贝方式进行检测
-    bool detectFrame(AVFrame* frame, DetectionResult& result);
+    bool detectFrame(AVFrame* frame, DetectionResult& result, int64_t frame_pts = 0);
 
     // 使用零拷贝方式进行检测
-    bool detectFrameZeroCopy(const DMABufferInfo& dma_info, DetectionResult& result);
+    bool detectFrameZeroCopy(const DMABufferInfo& dma_info, DetectionResult& result, int64_t frame_pts = 0);
 
     // 获取模型信息
     const RKNNModelInfo& getModelInfo() const { return model_info_; }

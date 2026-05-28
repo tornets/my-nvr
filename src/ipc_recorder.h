@@ -29,6 +29,9 @@ extern "C" {
 }
 
 // 前向声明
+class DetectionLogger;
+
+// 前向声明
 class IPCRecorder;
 
 #ifdef ENABLE_RKNN_SMART_RECORDING
@@ -160,9 +163,13 @@ private:
     int64_t m_segment_duration;
     int m_segment_index;         // 当前分段序号（每个流独立）
     std::time_t m_segment_start_time; // 分段开始时间（系统时间）
+    std::time_t m_stream_start_wallclock; // 录制流首次启动时的墙钟（PTS锚点）
+    int64_t m_stream_start_pts; // 录制流首个分段的起始 PTS（PTS锚点）
     int64_t m_last_video_pts;   // 最后一个视频包的 PTS（用于计算实际时长）
     int64_t m_last_video_dts;   // 最后一个视频包的 DTS
+    int64_t m_last_audio_pts;   // 最后一个音频包的 PTS（用于音视频同步）
     AVRational m_video_time_base;
+    AVRational m_audio_time_base;  // 音频流时间基准
     int64_t m_current_dts;
     int64_t m_pts_offset;
 
@@ -179,6 +186,9 @@ private:
     // 硬件解码器（仅用于检测，不影响 stream copy 录制）
     AVCodecContext* m_video_decoder_ctx;
     AVFrame* m_decoded_frame;
+
+    // 检测结果日志器
+    std::unique_ptr<DetectionLogger> m_detection_logger;
 
     bool initHardwareDecoder();
     void closeHardwareDecoder();

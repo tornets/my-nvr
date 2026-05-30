@@ -116,7 +116,8 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
                          int max_reconnect_attempts,
                          int timeout_seconds,
                          int shop_id,
-                         const std::string& stream_name
+                         const std::string& stream_name,
+                         int min_segment_duration_seconds
 #ifdef ENABLE_RKNN_SMART_RECORDING
                          , const SmartRecordingConfig* smart_recording_config
                          , nvr::detection::DetectionPool* detection_pool
@@ -134,6 +135,7 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
     , m_reconnect_interval_seconds(reconnect_interval_seconds)
     , m_max_reconnect_attempts(max_reconnect_attempts)
     , m_timeout_seconds(timeout_seconds)
+    , m_min_segment_duration_seconds(min_segment_duration_seconds)
     , m_reconnect_count(0)
     , m_last_packet_time(0)
     , m_last_read_time(0)
@@ -449,6 +451,8 @@ bool IPCRecorder::connectAndRecord() {
     m_audio_stream_idx = -1;
     m_segment_index = 0;
     m_pts_offset = 0;
+    m_stream_start_wallclock = 0;
+    m_stream_start_pts = 0;
 
 #ifdef ENABLE_RKNN_SMART_RECORDING
     // 重置智能录制检测状态（PTS 重连后会从低值重新开始）
@@ -501,6 +505,9 @@ bool IPCRecorder::connectAndRecord() {
         if (elapsed >= m_timeout_seconds) {
             m_last_error = "Stream timeout - no data received";
             LOG_ERROR("[{}] Stream timeout: no data for {} seconds, reconnecting...", m_stream_id, elapsed);
+            if (m_output_ctx) {
+                closeOutput();
+            }
             m_reconnect_count++;
             av_packet_free(&packet);
             return false;
@@ -529,6 +536,9 @@ bool IPCRecorder::connectAndRecord() {
             if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
                 m_last_error = "Too many consecutive read errors";
                 LOG_ERROR("[{}] Too many consecutive errors ({}), reconnecting...", m_stream_id, MAX_CONSECUTIVE_ERRORS);
+                if (m_output_ctx) {
+                    closeOutput();
+                }
                 m_reconnect_count++;
                 av_packet_free(&packet);
                 return false;
@@ -1415,6 +1425,16 @@ void IPCRecorder::closeOutput() {
                 int expected_keyframes = static_cast<int>(video_duration_seconds / 2) + 1;
                 LOG_INFO("Segment quality check: duration={}s, expected ~{} keyframes, file starts with key frame: YES",
                          video_duration_seconds, expected_keyframes);
+            }
+
+            // 最短时长检查：过短的分段丢弃
+            if (duration_seconds < m_min_segment_duration_seconds) {
+                LOG_WARN("Segment too short ({}s < {}s), discarding: {}",
+                         duration_seconds, m_min_segment_duration_seconds, m_current_filename);
+                std::error_code ec;
+                fs::remove(fs::path(m_temp_dir) / m_current_filename, ec);
+                m_current_filename.clear();
+                return;
             }
 
             // 生成新的文件名（包含结束时间和时长）

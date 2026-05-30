@@ -136,7 +136,8 @@ bool NVRManager::addStreamWithConfig(const std::string& stream_id, const std::st
                                                       max_reconnect_attempts,
                                                       timeout_seconds,
                                                       m_config.shop.id,
-                                                      stream_name
+                                                      stream_name,
+                                                      m_config.record.min_segment_duration_seconds
 #ifdef ENABLE_RKNN_SMART_RECORDING
                                                       , smart_recording_config
                                                       , m_detection_pool.get()
@@ -722,7 +723,8 @@ void NVRManager::startStreamRecording(const std::string& stream_id) {
         stream_config.max_reconnect_attempts,
         stream_config.timeout_seconds,
         m_config.shop.id,
-        stream_config.name
+        stream_config.name,
+        m_config.record.min_segment_duration_seconds
 #ifdef ENABLE_RKNN_SMART_RECORDING
         , smart_recording_config
         , m_detection_pool.get()

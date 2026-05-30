@@ -117,6 +117,7 @@ struct RecordConfig {
     bool delete_raw_after_extraction = false; // 提取完成后是否删除原始视频
     int min_player_segment_duration = 5;      // 最小玩家片段时长（秒）
     int player_segment_merge_gap = 5;         // 玩家片段合并最大间隔（秒）
+    int min_segment_duration_seconds = 5;      // 最短分段时长（秒），低于此值丢弃
 };
 
 struct Config {

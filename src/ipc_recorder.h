@@ -57,7 +57,8 @@ public:
                 int max_reconnect_attempts = -1,
                 int timeout_seconds = 30,
                 int shop_id = 0,
-                const std::string& stream_name = ""
+                const std::string& stream_name = "",
+                int min_segment_duration_seconds = 5
 #ifdef ENABLE_RKNN_SMART_RECORDING
                 , const SmartRecordingConfig* smart_recording_config = nullptr
                 , nvr::detection::DetectionPool* detection_pool = nullptr
@@ -131,6 +132,7 @@ private:
     int m_reconnect_interval_seconds; // 重连间隔（秒）
     int m_max_reconnect_attempts;    // 最大重连尝试次数
     int m_timeout_seconds;           // 超时时间（秒）
+    int m_min_segment_duration_seconds; // 最短分段时长（秒）
 
     // 重连状态
     std::atomic<int> m_reconnect_count;      // 当前重连次数

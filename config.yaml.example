@@ -105,6 +105,9 @@ record:
   # 录制分段时长（秒）
   segment_duration_seconds: 600  # 10分钟
 
+  # 最短分段时长（秒）：断开连接时保存的残片低于此时长将被丢弃
+  min_segment_duration_seconds: 5  # 默认: 5
+
   # 文件名模板
   # 支持的变量:
   #   {stream_id}       - 流ID（如：camera1）

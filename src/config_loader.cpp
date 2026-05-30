@@ -299,6 +299,9 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
             if (record["delete_raw_after_extraction"]) {
                 config.record.delete_raw_after_extraction = record["delete_raw_after_extraction"].as<bool>();
             }
+            if (record["min_segment_duration_seconds"]) {
+                config.record.min_segment_duration_seconds = record["min_segment_duration_seconds"].as<int>();
+            }
             // 解析调度配置
             if (record["schedule"]) {
                 const auto& schedule = record["schedule"];

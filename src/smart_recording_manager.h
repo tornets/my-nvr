@@ -123,6 +123,9 @@ public:
     // 清空缓存
     void clearCache();
 
+    // 重连后重置检测状态
+    void resetForReconnect();
+
     // 设置输出上下文（用于写入帧）
     void setOutputContext(AVFormatContext* output_ctx, int video_stream_index);
 

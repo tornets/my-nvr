@@ -131,7 +131,7 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
                     stream_config.auto_reconnect = true;
                     stream_config.reconnect_interval_seconds = 5;
                     stream_config.max_reconnect_attempts = -1;  // 无限重连
-                    stream_config.timeout_seconds = 30;
+                    stream_config.timeout_seconds = 10;
                     stream_config.name = "";  // 默认为空
 
                     if (stream["id"]) {

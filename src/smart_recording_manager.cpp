@@ -558,6 +558,16 @@ void SmartRecordingManager::clearCache() {
     }
 }
 
+void SmartRecordingManager::resetForReconnect() {
+    last_detection_pts_ = 0;
+    keyframe_count_ = 0;
+    segment_start_pts_ = 0;
+    current_state_ = SmartRecordingState::IDLE;
+    should_write_ = false;
+    clearCache();
+    LOG_INFO("[{}] Smart recording state reset for reconnect", stream_id_);
+}
+
 void SmartRecordingManager::setOutputContext(AVFormatContext* output_ctx, int video_stream_index) {
     std::lock_guard<std::mutex> lock(output_mutex_);
     output_ctx_ = output_ctx;

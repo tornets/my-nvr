@@ -178,8 +178,6 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
 
     // 解析输出格式（从文件名模板）
     m_output_format = parseOutputFormat();
-    LOG_INFO("Segment duration: {} seconds", m_segment_duration);
-    LOG_INFO("Output format: {}", m_output_format);
 
     // 创建输出目录和临时目录（使用 UTF-8 兼容函数）
 #ifdef _WIN32
@@ -214,6 +212,8 @@ IPCRecorder::IPCRecorder(const std::string& stream_id, const std::string& stream
         }
     }
 #endif
+
+    LOG_INFO("Segment duration: {} seconds", m_segment_duration);
 }
 
 IPCRecorder::~IPCRecorder() {
@@ -292,6 +292,7 @@ void IPCRecorder::recordingLoop() {
 
     while (m_running) {
         // 尝试连接并录制
+        int prev_reconnect_count = m_reconnect_count.load();
         if (!connectAndRecord()) {
             // 连接或录制失败
             if (!m_auto_reconnect) {
@@ -306,10 +307,12 @@ void IPCRecorder::recordingLoop() {
             }
 
             // 等待后重连
-            LOG_INFO("Reconnecting in {} seconds...", m_reconnect_interval_seconds);
+            LOG_INFO("[{}] Reconnecting in {} seconds...", m_stream_id, m_reconnect_interval_seconds);
             for (int i = 0; i < m_reconnect_interval_seconds && m_running; i++) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
+        } else if (prev_reconnect_count > 0) {
+            LOG_INFO("[{}] Reconnected successfully: {} (after {} attempt(s))", m_stream_id, m_stream_url, prev_reconnect_count);
         }
     }
 
@@ -447,6 +450,13 @@ bool IPCRecorder::connectAndRecord() {
     m_segment_index = 0;
     m_pts_offset = 0;
 
+#ifdef ENABLE_RKNN_SMART_RECORDING
+    // 重置智能录制检测状态（PTS 重连后会从低值重新开始）
+    if (m_smart_recording) {
+        m_smart_recording->resetForReconnect();
+    }
+#endif
+
     // 尝试打开输入
     if (!openInput()) {
         m_last_error = "Failed to open input";
@@ -465,7 +475,7 @@ bool IPCRecorder::connectAndRecord() {
         m_audio_stream_idx = -1;
     }
 
-    LOG_INFO("Connection established, starting recording loop");
+    LOG_INFO("[{}] Connection established, starting recording loop", m_stream_id);
 
 #ifdef ENABLE_RKNN_SMART_RECORDING
     // 初始化硬件解码器（用于检测）
@@ -488,9 +498,9 @@ bool IPCRecorder::connectAndRecord() {
         // 检查超时
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_activity_time).count();
-        if (elapsed > m_timeout_seconds) {
+        if (elapsed >= m_timeout_seconds) {
             m_last_error = "Stream timeout - no data received";
-            LOG_ERROR("Stream timeout: no data for {} seconds, reconnecting...", elapsed);
+            LOG_ERROR("[{}] Stream timeout: no data for {} seconds, reconnecting...", m_stream_id, elapsed);
             m_reconnect_count++;
             av_packet_free(&packet);
             return false;
@@ -518,7 +528,7 @@ bool IPCRecorder::connectAndRecord() {
             // 连续错误过多，认为连接已断开
             if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
                 m_last_error = "Too many consecutive read errors";
-                LOG_ERROR("Too many consecutive errors ({}), reconnecting...", MAX_CONSECUTIVE_ERRORS);
+                LOG_ERROR("[{}] Too many consecutive errors ({}), reconnecting...", m_stream_id, MAX_CONSECUTIVE_ERRORS);
                 m_reconnect_count++;
                 av_packet_free(&packet);
                 return false;
@@ -971,6 +981,7 @@ bool IPCRecorder::openInput() {
     // 设置 FFmpeg 选项以增强错误恢复
     AVDictionary* options = nullptr;
     av_dict_set(&options, "rtsp_transport", "tcp", 0);  // 使用 TCP 传输（更稳定，防止丢包花屏）
+    av_dict_set(&options, "stimeout", std::to_string(m_timeout_seconds * 1000000).c_str(), 0);  // RTSP socket 超时（微秒）
     av_dict_set(&options, "fflags", "+genpts+discardcorrupt", 0);  // 生成 PTS 并丢弃损坏的数据包
     av_dict_set(&options, "err_detect", "ignore_err", 0);  // 忽略错误继续解码
     //av_dict_set(&options, "max_delay", "500000", 0);  // 最大延迟 500ms

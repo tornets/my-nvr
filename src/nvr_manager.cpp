@@ -771,17 +771,14 @@ void NVRManager::extractionLoop() {
 }
 
 void NVRManager::scanAndExtractRawVideos() {
-    LOG_DEBUG("Extraction scan: enable_extraction={}", m_config.record.enable_extraction);
     if (!m_config.record.enable_extraction) {
         return;
     }
 
     fs::path raw_dir = fs::path(m_config.record.output_dir) / m_config.record.raw_subdir;
-    LOG_DEBUG("Extraction scan: raw_dir={}", raw_dir.string());
 
     // 检查 raw 目录是否存在
     if (!fs::exists(raw_dir)) {
-        LOG_DEBUG("Raw directory does not exist: {}", raw_dir.string());
         return;
     }
 
@@ -793,11 +790,11 @@ void NVRManager::scanAndExtractRawVideos() {
         }
 
         found_count++;
-        LOG_DEBUG("Found raw video: {}", entry.path().string());
+        LOG_TRACE("Found raw video: {}", entry.path().string());
 
         // 检查是否应该提取该视频
         if (!shouldExtractVideo(entry.path())) {
-            LOG_DEBUG("Skipping video (shouldExtractVideo=false): {}", entry.path().string());
+            LOG_TRACE("Skipping video (shouldExtractVideo=false): {}", entry.path().string());
             continue;
         }
 
@@ -861,19 +858,17 @@ void NVRManager::scanAndExtractRawVideos() {
 }
 
 bool NVRManager::shouldExtractVideo(const std::filesystem::path& raw_video) {
-    LOG_DEBUG("shouldExtractVideo: checking {}", raw_video.string());
-
     // 检查 CSV 文件是否存在（视频已完成录制和检测）
     fs::path csv_file = raw_video;
     csv_file.replace_extension(".csv");
     if (!fs::exists(csv_file)) {
-        LOG_DEBUG("shouldExtractVideo: CSV file not found: {}", csv_file.string());
+        LOG_TRACE("shouldExtractVideo: CSV file not found: {}", csv_file.string());
         return false;  // 视频还在录制或检测未完成
     }
 
     // 额外检查：确保CSV文件不是临时文件（temp_*.csv）
     if (csv_file.filename().string().find("temp_") != std::string::npos) {
-        LOG_DEBUG("shouldExtractVideo: CSV file is temporary, skipping: {}", csv_file.string());
+        LOG_TRACE("shouldExtractVideo: CSV file is temporary, skipping: {}", csv_file.string());
         return false;
     }
 
@@ -881,7 +876,7 @@ bool NVRManager::shouldExtractVideo(const std::filesystem::path& raw_video) {
     fs::path placeholder = raw_video;
     placeholder.replace_extension(".extracting");
     if (fs::exists(placeholder)) {
-        LOG_DEBUG("shouldExtractVideo: Extracting placeholder exists: {}", placeholder.string());
+        LOG_TRACE("shouldExtractVideo: Extracting placeholder exists: {}", placeholder.string());
         return false;
     }
 
@@ -889,11 +884,11 @@ bool NVRManager::shouldExtractVideo(const std::filesystem::path& raw_video) {
     fs::path marker = raw_video;
     marker.replace_extension(".extracted");
     if (fs::exists(marker)) {
-        LOG_DEBUG("shouldExtractVideo: Extracted marker exists: {}", marker.string());
+        LOG_TRACE("shouldExtractVideo: Extracted marker exists: {}", marker.string());
         return false;
     }
 
-    LOG_DEBUG("shouldExtractVideo: returning TRUE for {}", raw_video.string());
+    LOG_TRACE("shouldExtractVideo: returning TRUE for {}", raw_video.string());
     return true;
 }
 

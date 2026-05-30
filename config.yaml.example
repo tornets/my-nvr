@@ -168,6 +168,8 @@ record:
   raw_subdir: "raw"                        # 实时录制子目录（默认: raw）
   filter_subdir: "filter"                  # 事件提取子目录（默认: filter）
   enable_extraction: true                  # 是否启用事件提取（默认: true）
+  extraction_scan_interval_seconds: 1      # 提取扫描间隔，秒（默认: 1）
+  delete_raw_after_extraction: false       # 提取完成后是否删除原始视频（默认: false）
 
   # 最小玩家片段时长（秒）：小于此时长的片段将被过滤
   min_player_segment_duration: 5           # 默认: 5

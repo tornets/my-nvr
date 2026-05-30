@@ -30,6 +30,11 @@ Config parseCommandLine(int argc, char* argv[]) {
         .default_value(std::string(""))
         .nargs(1);
 
+    program.add_argument("-d")
+        .help("Enable console log output")
+        .default_value(false)
+        .implicit_value(true);
+
     program.add_argument("--upload-url")
         .help("Upload server URL (enables upload)")
         .default_value(std::string(""))
@@ -160,6 +165,10 @@ Config parseCommandLine(int argc, char* argv[]) {
         if (!log_level.empty()) {
             config.log_level = log_level;
         }
+    } catch (...) {}
+
+    try {
+        config.console_log = program.get<bool>("-d");
     } catch (...) {}
 
     try {

@@ -293,6 +293,12 @@ std::optional<Config> Config::fromYaml(const std::string& filepath) {
             if (record["player_segment_merge_gap"]) {
                 config.record.player_segment_merge_gap = record["player_segment_merge_gap"].as<int>();
             }
+            if (record["extraction_scan_interval_seconds"]) {
+                config.record.extraction_scan_interval_seconds = record["extraction_scan_interval_seconds"].as<int>();
+            }
+            if (record["delete_raw_after_extraction"]) {
+                config.record.delete_raw_after_extraction = record["delete_raw_after_extraction"].as<bool>();
+            }
             // 解析调度配置
             if (record["schedule"]) {
                 const auto& schedule = record["schedule"];

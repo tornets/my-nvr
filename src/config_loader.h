@@ -113,6 +113,8 @@ struct RecordConfig {
     std::string raw_subdir = "raw";           // 实时录制子目录
     std::string filter_subdir = "filter";     // 事件提取子目录
     bool enable_extraction = true;            // 是否启用事件提取
+    int extraction_scan_interval_seconds = 1; // 提取扫描间隔（秒）
+    bool delete_raw_after_extraction = false; // 提取完成后是否删除原始视频
     int min_player_segment_duration = 5;      // 最小玩家片段时长（秒）
     int player_segment_merge_gap = 5;         // 玩家片段合并最大间隔（秒）
 };
@@ -120,6 +122,7 @@ struct RecordConfig {
 struct Config {
     std::vector<StreamConfig> streams;
     std::string log_level;         // 日志级别: trace, debug, info, warn, error, critical
+    bool console_log = false;      // 是否启用控制台日志
     AutoCleanConfig autoclean;     // 自动清理配置
     UploadConfig upload;           // 上传配置
     RecordConfig record;           // 录制配置

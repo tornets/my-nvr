@@ -139,7 +139,7 @@ static spdlog::level::level_enum parseLogLevel(const std::string& level) {
     return spdlog::level::debug;
 }
 
-void Application::initializeLogging(const std::string& logLevel) {
+void Application::initializeLogging(const std::string& logLevel, bool consoleLog) {
     // Get executable directory for log file
     std::string logPath = "nvr.log";  // Default to current directory
 
@@ -161,10 +161,12 @@ void Application::initializeLogging(const std::string& logLevel) {
     std::vector<spdlog::sink_ptr> sinks = {file_sink};
 
     #ifndef _WIN32
-    sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
+    if (consoleLog) {
+        sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
+    }
     #else
     // On Windows, check if we have a console
-    if (GetConsoleWindow() != NULL) {
+    if (consoleLog && GetConsoleWindow() != NULL) {
         // 设置控制台输出编码为 utf8
         SetConsoleOutputCP(65001);
         sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());

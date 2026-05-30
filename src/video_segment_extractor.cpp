@@ -95,28 +95,46 @@ void VideoSegmentExtractor::processRawVideo(const fs::path& raw_video_path, cons
     fs::path filter_dir = fs::path(m_config.record.output_dir) / m_config.record.filter_subdir;
     fs::create_directories(filter_dir);
 
-    // 获取原始视频文件名（不含扩展名）
-    std::string original_filename = raw_video_path.stem().string();
+    // 使用 CSV 首条记录作为 PTS→墙钟映射参考
+    const DetectionLogEntry& pts_ref = log_entries.front();
 
     int extracted_count = 0;
     for (size_t i = 0; i < segments.size(); ++i) {
         const auto& segment = segments[i];
 
-        // 生成输出文件名 - 保持原始文件名，确保与shouldExtractVideo的检查匹配
-        std::string output_filename = generateSegmentFilename(segment, m_stream_id, std::to_string(m_shop_id), i, original_filename);
-        fs::path output_path = filter_dir / output_filename;
+        // 先提取到临时文件，获取实际时间后再重命名（必须 .mp4 扩展名，FFmpeg 依赖扩展名判断格式）
+        std::string temp_filename = "." + m_stream_id + "_seg_" + std::to_string(i) + ".mp4";
+        fs::path temp_path = filter_dir / temp_filename;
 
-        // 创建输出目录
-        fs::create_directories(output_path.parent_path());
+        LOG_INFO("Extracting segment {}/{}: {:.1f}s", i + 1, segments.size(), segment.duration_seconds);
 
-        LOG_INFO("Extracting segment {}/{}: {}s -> {}", i + 1, segments.size(), segment.duration_seconds, output_path.string());
+        ExtractTimingInfo timing_info;
+        if (extractSegment(raw_video_path, segment, temp_path, i, timing_info)) {
+            // 基于实际视频首帧 PTS 计算墙钟时间
+            auto actual_start = ptsToWallclock(timing_info.first_frame_pts, pts_ref);
+            auto actual_end = actual_start + std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                std::chrono::duration<double>(timing_info.duration_seconds));
 
-        // 提取片段
-        if (extractSegment(raw_video_path, segment, output_path, i)) {
-            extracted_count++;
-            LOG_INFO("Successfully extracted segment: {}", output_path.string());
+            // 用实际时间生成最终文件名
+            PlayerSegment timed_segment = segment;
+            timed_segment.start_time = actual_start;
+            timed_segment.end_time = actual_end;
+            std::string final_filename = generateSegmentFilename(timed_segment, static_cast<int>(i));
+            fs::path final_path = filter_dir / final_filename;
+
+            fs::create_directories(final_path.parent_path());
+            std::error_code ec;
+            fs::rename(temp_path, final_path, ec);
+            if (ec) {
+                LOG_ERROR("Failed to rename: {} -> {}: {}", temp_path.string(), final_path.string(), ec.message());
+            } else {
+                extracted_count++;
+                LOG_INFO("Extracted segment: {} ({:.2f}s)", final_path.string(), timing_info.duration_seconds);
+            }
         } else {
-            LOG_ERROR("Failed to extract segment: {}", output_path.string());
+            LOG_ERROR("Failed to extract segment {}", i);
+            std::error_code ec;
+            fs::remove(temp_path, ec);
         }
     }
 
@@ -212,6 +230,7 @@ std::vector<PlayerSegment> VideoSegmentExtractor::extractPlayerSegments(
                 // 结束当前玩家片段
                 in_player_segment = false;
                 current_segment.end_pts = entry.frame_pts;
+                current_segment.end_time = entry.timestamp;  // 首个无玩家检测的时间
 
                 // 计算时长（秒）
                 double pts_diff = current_segment.end_pts - current_segment.start_pts;
@@ -227,6 +246,7 @@ std::vector<PlayerSegment> VideoSegmentExtractor::extractPlayerSegments(
     // 处理最后一个片段（如果视频结束时仍然有玩家）
     if (in_player_segment && !log_entries.empty()) {
         current_segment.end_pts = log_entries.back().frame_pts;
+        current_segment.end_time = log_entries.back().timestamp;
         double pts_diff = current_segment.end_pts - current_segment.start_pts;
         current_segment.duration_seconds = pts_diff * av_q2d(m_video_time_base);
 
@@ -289,7 +309,9 @@ void VideoSegmentExtractor::filterShortSegments(std::vector<PlayerSegment>& segm
 bool VideoSegmentExtractor::extractSegment(const fs::path& input_video,
                                           const PlayerSegment& segment,
                                           const fs::path& output_video,
-                                          int segment_index) {
+                                          int segment_index,
+                                          ExtractTimingInfo& timing_info) {
+    timing_info = {};
     AVFormatContext* input_ctx = nullptr;
     AVFormatContext* output_ctx = nullptr;
 
@@ -384,7 +406,10 @@ bool VideoSegmentExtractor::extractSegment(const fs::path& input_video,
     // 读取并复制数据包
     AVPacket* packet = av_packet_alloc();
     int64_t end_pts = segment.end_pts;
-    int64_t pts_offset = 0;  // PTS 偏移量，用于让输出从 0 开始
+    int64_t video_pts_offset = 0;    // 视频 PTS 偏移量
+    int64_t audio_pts_offset = 0;    // 音频 PTS 偏移量
+    bool audio_offset_set = false;
+    int64_t last_video_pts_raw = 0;  // 最后一帧视频包的原始 PTS
 
     bool has_written_keyframe = false;
 
@@ -393,28 +418,40 @@ bool VideoSegmentExtractor::extractSegment(const fs::path& input_video,
         if (packet->stream_index == video_stream_index ||
             (audio_stream_index >= 0 && packet->stream_index == audio_stream_index)) {
 
-            // 检查是否超过结束时间
-            if (packet->pts > end_pts) {
+            // 检查是否超过结束时间（基于视频 PTS）
+            if (packet->stream_index == video_stream_index && packet->pts > end_pts) {
                 av_packet_unref(packet);
                 break;
             }
 
             // 在找到第一个视频关键帧之前，跳过所有包（包括音频）
-            // 否则音频包会以原始PTS被写入，导致PTS不连续，视频无法播放
             if (!has_written_keyframe) {
                 if (packet->stream_index == video_stream_index &&
                     (packet->flags & AV_PKT_FLAG_KEY)) {
                     has_written_keyframe = true;
-                    pts_offset = packet->pts;
+                    video_pts_offset = packet->pts;
+                    timing_info.first_frame_pts = packet->pts;
                 } else {
                     av_packet_unref(packet);
                     continue;
                 }
             }
 
-            // 调整 PTS/DTS
-            packet->pts -= pts_offset;
-            packet->dts -= pts_offset;
+            // 追踪最后一帧视频 PTS（PTS 调整之前，仍在原始空间）
+            if (packet->stream_index == video_stream_index) {
+                last_video_pts_raw = packet->pts;
+            }
+
+            // 设置音频 PTS 偏移量（以第一个到达的音频包为准）
+            if (packet->stream_index == audio_stream_index && !audio_offset_set) {
+                audio_pts_offset = packet->pts;
+                audio_offset_set = true;
+            }
+
+            // 调整 PTS/DTS（音视频使用各自的偏移量）
+            int64_t offset = (packet->stream_index == video_stream_index) ? video_pts_offset : audio_pts_offset;
+            packet->pts -= offset;
+            packet->dts -= offset;
 
             // 确保时间戳为正
             if (packet->pts < 0 || packet->dts < 0) {
@@ -436,6 +473,13 @@ bool VideoSegmentExtractor::extractSegment(const fs::path& input_video,
     }
 
     av_packet_free(&packet);
+
+    // 计算实际视频时长
+    timing_info.last_frame_pts = last_video_pts_raw;
+    if (last_video_pts_raw > timing_info.first_frame_pts) {
+        int64_t pts_diff = last_video_pts_raw - timing_info.first_frame_pts;
+        timing_info.duration_seconds = pts_diff * av_q2d(m_video_time_base);
+    }
 
     // 写入文件尾
     av_write_trailer(output_ctx);
@@ -489,60 +533,99 @@ int64_t VideoSegmentExtractor::seekToKeyframe(AVFormatContext* ctx, int64_t targ
     return actual_pts;
 }
 
+std::string VideoSegmentExtractor::lookupStreamName() const {
+    for (const auto& stream : m_config.streams) {
+        if (stream.id == m_stream_id) {
+            return stream.name;
+        }
+    }
+    return m_stream_id;
+}
+
 std::string VideoSegmentExtractor::generateSegmentFilename(const PlayerSegment& segment,
-                                                          const std::string& stream_id,
-                                                          const std::string& shop_id,
-                                                          int segment_index,
-                                                          const std::string& original_filename) {
-    // 使用原始文件名，确保与shouldExtractVideo的检查匹配
-    // 如果有多个片段，可以添加后缀，但为了简化，这里我们合并所有片段为一个文件
+                                                          int segment_index) {
+    std::string result = m_config.record.filename_template;
 
-    // 构建文件名（保持原始文件名）
-    std::string filename = original_filename + ".mp4";
+    auto formatTime = [](std::time_t t, const char* fmt) -> std::string {
+        std::tm tm = *std::localtime(&t);
+        std::ostringstream ss;
+        ss << std::put_time(&tm, fmt);
+        return ss.str();
+    };
 
-    // 添加日期目录
-    std::string date_str = formatDate(segment.start_time);
-    fs::path full_path = fs::path(stream_id) / date_str / filename;
+    std::time_t start_t = std::chrono::system_clock::to_time_t(segment.start_time);
+    std::time_t end_t = std::chrono::system_clock::to_time_t(segment.end_time);
+    int64_t dur_secs = static_cast<int64_t>(segment.duration_seconds);
 
-    return full_path.string();
+    std::map<std::string, std::string> vars;
+    vars["{stream_id}"] = m_stream_id;
+    vars["{stream_name}"] = lookupStreamName();
+    vars["{shop_id}"] = std::to_string(m_shop_id);
+    vars["{start_datetime}"] = formatTime(start_t, "%Y%m%d_%H%M%S");
+    vars["{start_date}"] = formatTime(start_t, "%Y-%m-%d");
+    vars["{start_time}"] = formatTime(start_t, "%H%M%S");
+    vars["{end_datetime}"] = formatTime(end_t, "%Y%m%d_%H%M%S");
+    vars["{end_time}"] = formatTime(end_t, "%H%M%S");
+    vars["{duration_seconds}"] = std::to_string(dur_secs);
+
+    // duration → HHMMSS
+    int hours = static_cast<int>(dur_secs / 3600);
+    int mins = static_cast<int>((dur_secs % 3600) / 60);
+    int secs = static_cast<int>(dur_secs % 60);
+    std::ostringstream dur_ss;
+    dur_ss << std::setfill('0') << std::setw(2) << hours
+           << std::setw(2) << mins << std::setw(2) << secs;
+    vars["{duration}"] = dur_ss.str();
+
+    vars["{segment_index}"] = std::to_string(segment_index);
+
+    for (const auto& var : vars) {
+        size_t pos = 0;
+        while ((pos = result.find(var.first, pos)) != std::string::npos) {
+            result.replace(pos, var.first.length(), var.second);
+            pos += var.second.length();
+        }
+    }
+
+    // 如果模板已包含目录路径（如 {stream_id}/{start_date}/...），直接使用
+    // 否则追加默认目录结构 {stream_id}/{yyyy-MM-dd}/
+    if (!fs::path(result).has_parent_path()) {
+        std::string date_str = formatTime(start_t, "%Y-%m-%d");
+        result = (fs::path(m_stream_id) / date_str / result).string();
+    }
+
+    return result;
 }
 
-std::string VideoSegmentExtractor::formatTimestamp(const std::chrono::system_clock::time_point& timestamp) {
-    std::time_t time = std::chrono::system_clock::to_time_t(timestamp);
-    std::tm tm = *std::localtime(&time);
-
-    std::ostringstream ss;
-    ss << std::setfill('0');
-    ss << std::put_time(&tm, "%Y%m%d_%H%M%S");
-    return ss.str();
-}
-
-std::string VideoSegmentExtractor::formatDate(const std::chrono::system_clock::time_point& timestamp) {
-    std::time_t time = std::chrono::system_clock::to_time_t(timestamp);
-    std::tm tm = *std::localtime(&time);
-
-    std::ostringstream ss;
-    ss << std::setfill('0');
-    ss << std::put_time(&tm, "%Y-%m-%d");
-    return ss.str();
+std::chrono::system_clock::time_point VideoSegmentExtractor::ptsToWallclock(
+    int64_t pts,
+    const DetectionLogEntry& ref_entry) const {
+    double pts_diff_seconds = (pts - ref_entry.frame_pts) * av_q2d(m_video_time_base);
+    auto duration = std::chrono::duration<double>(pts_diff_seconds);
+    return ref_entry.timestamp + std::chrono::duration_cast<std::chrono::system_clock::duration>(duration);
 }
 
 std::string VideoSegmentExtractor::extractStreamId(const fs::path& video_path) {
-    // 从文件名中提取流 ID
-    // 文件名格式：{shop_id}_{stream_id}_{datetime}_{duration}.mp4
-    std::string filename = video_path.stem().string();
-
-    // 使用正则表达式提取流 ID
-    std::regex regex(R"((\d+)_(.+?)_\d{8}_\d{6})");
-    std::smatch match;
-
-    if (std::regex_search(filename, match, regex)) {
-        return match[2].str();  // 第二个捕获组是 stream_id
+    // 优先从目录结构提取：raw/{stream_id}/.../file.mp4
+    fs::path p = video_path.parent_path();
+    while (!p.empty() && p.parent_path().filename() != m_config.record.raw_subdir) {
+        p = p.parent_path();
+    }
+    if (!p.empty() && p.parent_path().filename() == m_config.record.raw_subdir) {
+        std::string candidate = p.filename().string();
+        for (const auto& stream : m_config.streams) {
+            if (stream.id == candidate) {
+                return candidate;
+            }
+        }
     }
 
-    // 如果正则匹配失败，尝试从父目录获取
-    if (video_path.parent_path().filename() != "raw") {
-        return video_path.parent_path().filename().string();
+    // 后备：从文件名正则提取
+    std::string filename = video_path.stem().string();
+    std::regex regex(R"((\d+)_(.+?)_\d{8}_\d{6})");
+    std::smatch match;
+    if (std::regex_search(filename, match, regex)) {
+        return match[2].str();
     }
 
     return "unknown";

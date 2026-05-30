@@ -25,8 +25,16 @@ struct PlayerSegment {
     int64_t start_pts;                           // 开始 PTS
     int64_t end_pts;                             // 结束 PTS
     std::chrono::system_clock::time_point start_time;  // 开始时间
+    std::chrono::system_clock::time_point end_time;    // 结束时间
     int player_count;                            // 玩家数量
     double duration_seconds;                      // 片段时长（秒）
+};
+
+// 提取片段的实际时间信息
+struct ExtractTimingInfo {
+    int64_t first_frame_pts = 0;    // 首帧 PTS（原始视频 PTS 空间）
+    int64_t last_frame_pts = 0;     // 末帧 PTS（原始视频 PTS 空间）
+    double duration_seconds = 0.0;  // 实际视频时长
 };
 
 // 检测日志记录
@@ -58,17 +66,17 @@ private:
     bool extractSegment(const fs::path& input_video,
                        const PlayerSegment& segment,
                        const fs::path& output_video,
-                       int segment_index);
+                       int segment_index,
+                       ExtractTimingInfo& timing_info);
 
     // 使用 FFmpeg 定位到最近的 keyframe
     int64_t seekToKeyframe(AVFormatContext* ctx, int64_t target_pts, int stream_index);
 
-    // 生成片段文件名（基于原始文件名，确保与shouldExtractVideo匹配）
-    std::string generateSegmentFilename(const PlayerSegment& segment,
-                                       const std::string& stream_id,
-                                       const std::string& shop_id,
-                                       int segment_index,
-                                       const std::string& original_filename);
+    // 基于配置模板生成片段文件名
+    std::string generateSegmentFilename(const PlayerSegment& segment, int segment_index);
+
+    // 从配置中查找流名称
+    std::string lookupStreamName() const;
 
     // 解析 CSV 检测日志
     std::vector<DetectionLogEntry> parseDetectionLog(const fs::path& csv_log_path);
@@ -79,9 +87,10 @@ private:
     // 过滤短片段
     void filterShortSegments(std::vector<PlayerSegment>& segments);
 
-    // 格式化时间戳
-    std::string formatTimestamp(const std::chrono::system_clock::time_point& timestamp);
-    std::string formatDate(const std::chrono::system_clock::time_point& timestamp);
+    // 将 PTS 转换为墙钟时间（基于 CSV 条目的 PTS-时间戳对应关系）
+    std::chrono::system_clock::time_point ptsToWallclock(
+        int64_t pts,
+        const DetectionLogEntry& ref_entry) const;
 
     // 从文件名解析流 ID 和其他信息
     std::string extractStreamId(const fs::path& video_path);

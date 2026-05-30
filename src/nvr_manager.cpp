@@ -760,8 +760,8 @@ void NVRManager::extractionLoop() {
         }
 
         std::unique_lock<std::mutex> lock(m_extraction_mutex);
-        // 每1秒扫描一次（确保及时提取新完成的视频）
-        if (m_extraction_cv.wait_for(lock, std::chrono::seconds(1),
+        // 定期扫描已完成的 raw 视频
+        if (m_extraction_cv.wait_for(lock, std::chrono::seconds(m_config.record.extraction_scan_interval_seconds),
                                     [this] { return !m_running; })) {
             break;  // 收到停止信号
         }
@@ -812,16 +812,10 @@ void NVRManager::scanAndExtractRawVideos() {
         LOG_INFO("Processing raw video for extraction: {}", entry.path().string());
 
         try {
-            // 创建提取占位符文件，防止重复提取
-            fs::path expected_filter_dir = fs::path(m_config.record.output_dir) / m_config.record.filter_subdir;
-            fs::path relative_path = fs::relative(entry.path(), fs::path(m_config.record.output_dir) / m_config.record.raw_subdir);
-            fs::path filter_video = expected_filter_dir / relative_path;
-            fs::path placeholder = filter_video;
+            // 创建提取占位符文件（raw 目录下），防止重复提取
+            fs::path placeholder = entry.path();
             placeholder.replace_extension(".extracting");
-
-            // 创建目录和占位符文件
-            fs::create_directories(filter_video.parent_path());
-            std::ofstream(placeholder.string()) << "Extracting...";  // 创建占位符文件
+            std::ofstream(placeholder.string()) << "Extracting...";
 
             LOG_DEBUG("Created extraction placeholder: {}", placeholder.string());
 
@@ -829,18 +823,31 @@ void NVRManager::scanAndExtractRawVideos() {
             VideoSegmentExtractor extractor(m_config);
             extractor.processRawVideo(entry.path(), csv_file);
 
-            // 提取完成，删除占位符文件
+            // 提取完成，删除占位符，创建完成标记
             fs::remove(placeholder);
+            fs::path marker = entry.path();
+            marker.replace_extension(".extracted");
+            std::ofstream(marker.string()) << "Done";
+
+            // 根据配置决定是否删除原始视频
+            if (m_config.record.delete_raw_after_extraction) {
+                std::error_code ec;
+                fs::remove(entry.path(), ec);
+                if (ec) {
+                    LOG_WARN("Failed to delete raw video {}: {}", entry.path().string(), ec.message());
+                } else {
+                    LOG_INFO("Deleted raw video: {}", entry.path().string());
+                }
+                fs::remove(csv_file, ec);
+                fs::remove(marker, ec);
+            }
 
             LOG_INFO("Successfully processed raw video: {}", entry.path().string());
         } catch (const std::exception& e) {
             LOG_ERROR("Failed to extract from {}: {}", entry.path().string(), e.what());
 
             // 失败时也要删除占位符文件
-            fs::path expected_filter_dir = fs::path(m_config.record.output_dir) / m_config.record.filter_subdir;
-            fs::path relative_path = fs::relative(entry.path(), fs::path(m_config.record.output_dir) / m_config.record.raw_subdir);
-            fs::path filter_video = expected_filter_dir / relative_path;
-            fs::path placeholder = filter_video;
+            fs::path placeholder = entry.path();
             placeholder.replace_extension(".extracting");
             fs::remove(placeholder);
         }
@@ -865,29 +872,24 @@ bool NVRManager::shouldExtractVideo(const std::filesystem::path& raw_video) {
     }
 
     // 额外检查：确保CSV文件不是临时文件（temp_*.csv）
-    // 临时CSV文件名包含"temp_"，表示还在录制中
     if (csv_file.filename().string().find("temp_") != std::string::npos) {
         LOG_DEBUG("shouldExtractVideo: CSV file is temporary, skipping: {}", csv_file.string());
         return false;
     }
 
-    // 检查是否已经生成了对应的 filter 视频
-    fs::path expected_filter_dir = fs::path(m_config.record.output_dir) / m_config.record.filter_subdir;
-    fs::path relative_path = fs::relative(raw_video, fs::path(m_config.record.output_dir) / m_config.record.raw_subdir);
-    fs::path filter_video = expected_filter_dir / relative_path;
-
-    LOG_DEBUG("shouldExtractVideo: expected_filter={}, relative_path={}, filter_video={}",
-              expected_filter_dir.string(), relative_path.string(), filter_video.string());
-
-    // 检查 filter 视频或提取占位符文件是否存在
-    bool filter_exists = fs::exists(filter_video);
-    fs::path placeholder = filter_video;
+    // 检查 .extracting 占位符（正在提取中）
+    fs::path placeholder = raw_video;
     placeholder.replace_extension(".extracting");
-    bool placeholder_exists = fs::exists(placeholder);
+    if (fs::exists(placeholder)) {
+        LOG_DEBUG("shouldExtractVideo: Extracting placeholder exists: {}", placeholder.string());
+        return false;
+    }
 
-    if (filter_exists || placeholder_exists) {
-        LOG_DEBUG("shouldExtractVideo: Filter video or placeholder already exists: {} (filter={}, placeholder={})",
-                  filter_video.string(), filter_exists, placeholder_exists);
+    // 检查 .extracted 标记文件（已提取完成）
+    fs::path marker = raw_video;
+    marker.replace_extension(".extracted");
+    if (fs::exists(marker)) {
+        LOG_DEBUG("shouldExtractVideo: Extracted marker exists: {}", marker.string());
         return false;
     }
 

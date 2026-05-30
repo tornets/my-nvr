@@ -22,7 +22,7 @@ struct ApplicationState {
 class Application {
 public:
     // Initialize logging
-    static void initializeLogging(const std::string& logLevel);
+    static void initializeLogging(const std::string& logLevel, bool consoleLog = false);
 
     // Main application entry point
     static int run(const Config& config, ApplicationState& state);

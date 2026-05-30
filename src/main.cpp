@@ -251,7 +251,7 @@ int runConsoleMode(int argc, char* argv[]) {
             return 1;
         }
 
-        Application::initializeLogging(config.log_level);
+        Application::initializeLogging(config.log_level, config.console_log);
 
         LOG_INFO("Version: {}", NVR::getDetailedVersionString());
         LOG_INFO("Built: {}", NVR::getBuildDateString());

@@ -1409,17 +1409,17 @@ void IPCRecorder::closeOutput() {
             // 生成新的文件名（包含结束时间和时长）
             std::string new_filename = generateFilenameFromTemplate(m_segment_start_pts, 0, duration_seconds);
 
-            // 如果文件名包含路径，创建最终目录
+            // 确保最终目录存在
             fs::path new_filepath(new_filename);
+            fs::path raw_dir = fs::path(m_output_dir) / "raw";
             if (new_filepath.has_parent_path()) {
-                // TODO: 两阶段录制重构 - 输出到 raw 子目录
-                fs::path full_final_dir = fs::path(m_output_dir) / "raw" / new_filepath.parent_path();
-#ifdef _WIN32
-                create_directories_recursive(full_final_dir.string());
-#else
-                fs::create_directories(full_final_dir);
-#endif
+                raw_dir /= new_filepath.parent_path();
             }
+#ifdef _WIN32
+            create_directories_recursive(raw_dir.string());
+#else
+            fs::create_directories(raw_dir);
+#endif
 
             fs::path temp_path = fs::path(m_temp_dir) / m_current_filename;
             // TODO: 两阶段录制重构 - 输出到 raw 子目录

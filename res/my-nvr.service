@@ -1,0 +1,22 @@
+[Unit]
+Description=My NVR Service
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/data/my-nvr
+ExecStart=/opt/weta/my-nvr/bin/nvr -c /opt/weta/my-nvr/config.yaml
+
+# ---------- 重启配置 ----------
+# 定义在什么情况下 systemd 会重启该服务
+# "on-failure" 包括：进程非正常退出（退出码非0）、被信号杀死、超时等
+Restart=on-failure
+# 异常退出后，等待 5 秒再重启
+RestartSec=5
+
+LimitNOFILE=65535
+LimitCORE=infinity
+
+[Install]
+# 表示该服务可以作为多用户模式下的一个基本服务被启用
+WantedBy=multi-user.target

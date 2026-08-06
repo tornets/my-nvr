@@ -62,8 +62,7 @@ std::string DetectionLogger::createLogFile(const fs::path& video_file_path) {
 }
 
 void DetectionLogger::log(const std::string& log_file_path,
-                         int64_t frame_pts,
-                         const std::chrono::system_clock::time_point& timestamp,
+                         double ss_seconds,
                          const nvr::detection::DetectionResult& result) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -78,12 +77,12 @@ void DetectionLogger::log(const std::string& log_file_path,
 
     // 写入 CSV 头（如果还没写入）
     if (!m_headers_written[log_file_path]) {
-        writer << "frame_pts,timestamp,has_player,player_count,npc_count,boxes_json\n";
+        writer << "ss,has_player,player_count,npc_count,boxes_json\n";
         m_headers_written[log_file_path] = true;
     }
 
-    // 格式化时间戳
-    std::string timestamp_str = formatTimestamp(timestamp);
+    // 格式化相对时间（相对原始分片开始）
+    std::string ss_str = formatRelativeTime(ss_seconds);
 
     // 统计玩家和 NPC 数量
     int player_count = 0;
@@ -100,8 +99,7 @@ void DetectionLogger::log(const std::string& log_file_path,
     std::string boxes_json = serializeBoxes(result.boxes);
 
     // 写入 CSV 行
-    writer << frame_pts << ","
-           << timestamp_str << ","
+    writer << ss_str << ","
            << (result.has_player ? "true" : "false") << ","
            << player_count << ","
            << npc_count << ","
@@ -145,20 +143,24 @@ std::string DetectionLogger::serializeBoxes(const std::vector<nvr::detection::Bo
     return json.str();
 }
 
-std::string DetectionLogger::formatTimestamp(const std::chrono::system_clock::time_point& timestamp) {
-    // 转换为 time_t
-    std::time_t time = std::chrono::system_clock::to_time_t(timestamp);
+std::string DetectionLogger::formatRelativeTime(double seconds) {
+    // 相对时间格式化为 HH:MM:SS.mmm
+    if (seconds < 0) {
+        seconds = 0;
+    }
+    int64_t total_ms = static_cast<int64_t>(seconds * 1000.0 + 0.5);
+    int ms = static_cast<int>(total_ms % 1000);
+    int64_t total_sec = total_ms / 1000;
+    int s = static_cast<int>(total_sec % 60);
+    int m = static_cast<int>((total_sec / 60) % 60);
+    int h = static_cast<int>(total_sec / 3600);
 
-    // 获取毫秒部分
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        timestamp.time_since_epoch()) % 1000;
-
-    // 格式化为 ISO 8601
     std::ostringstream ss;
-    ss << std::put_time(std::localtime(&time), "%Y-%m-%dT%H:%M:%S");
-    ss << "." << std::setfill('0') << std::setw(3) << ms.count();
-    ss << "Z";  // UTC 时区标记
-
+    ss << std::setfill('0')
+       << std::setw(2) << h << ":"
+       << std::setw(2) << m << ":"
+       << std::setw(2) << s << "."
+       << std::setw(3) << ms;
     return ss.str();
 }
 

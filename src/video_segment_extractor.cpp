@@ -24,27 +24,21 @@ VideoSegmentExtractor::~VideoSegmentExtractor() {
     LOG_DEBUG("VideoSegmentExtractor destroyed");
 }
 
-void VideoSegmentExtractor::processRawVideo(const fs::path& raw_video_path, const fs::path& csv_log_path) {
+std::vector<fs::path> VideoSegmentExtractor::processRawVideo(const fs::path& raw_video_path, const fs::path& csv_log_path) {
     LOG_INFO("Processing raw video: {}", raw_video_path.string());
+
+    std::vector<fs::path> extracted_files;  // 收集本次切出的最终路径
 
     // 1. 解析流 ID 和店铺 ID
     m_stream_id = extractStreamId(raw_video_path);
     LOG_INFO("Extracted stream ID: {}", m_stream_id);
 
-    // 2. 解析 CSV 检测日志
-    auto log_entries = parseDetectionLog(csv_log_path);
-    if (log_entries.empty()) {
-        LOG_WARN("No detection log entries found in {}", csv_log_path.string());
-        return;
-    }
-    LOG_INFO("Parsed {} detection log entries", log_entries.size());
-
-    // 3. 打开视频文件获取时间基准
+    // 2. 打开视频文件获取时间基准（先开视频：解析 CSV 时需要 m_video_time_base 把 ss 换算回 PTS）
     AVFormatContext* input_ctx = nullptr;
     int ret = avformat_open_input(&input_ctx, raw_video_path.string().c_str(), nullptr, nullptr);
     if (ret < 0) {
         LOG_ERROR("Failed to open video file {}: {}", raw_video_path.string(), ret);
-        return;
+        return extracted_files;
     }
 
     // 获取视频流信息
@@ -52,7 +46,7 @@ void VideoSegmentExtractor::processRawVideo(const fs::path& raw_video_path, cons
     if (ret < 0) {
         LOG_ERROR("Failed to get stream info: {}", ret);
         avformat_close_input(&input_ctx);
-        return;
+        return extracted_files;
     }
 
     // 找到视频流并获取时间基准
@@ -68,10 +62,19 @@ void VideoSegmentExtractor::processRawVideo(const fs::path& raw_video_path, cons
     if (video_stream_index < 0) {
         LOG_ERROR("No video stream found in {}", raw_video_path.string());
         avformat_close_input(&input_ctx);
-        return;
+        return extracted_files;
     }
 
     LOG_INFO("Video stream index: {}, time base: {}/{}", video_stream_index, m_video_time_base.num, m_video_time_base.den);
+
+    // 3. 解析 CSV 检测日志（ss → PTS）
+    auto log_entries = parseDetectionLog(csv_log_path);
+    if (log_entries.empty()) {
+        LOG_WARN("No detection log entries found in {}", csv_log_path.string());
+        avformat_close_input(&input_ctx);
+        return extracted_files;
+    }
+    LOG_INFO("Parsed {} detection log entries", log_entries.size());
 
     // 4. 提取玩家片段
     auto segments = extractPlayerSegments(log_entries, input_ctx);
@@ -88,15 +91,16 @@ void VideoSegmentExtractor::processRawVideo(const fs::path& raw_video_path, cons
     if (segments.empty()) {
         LOG_INFO("No valid player segments found, skipping extraction");
         avformat_close_input(&input_ctx);
-        return;
+        return extracted_files;
     }
 
     // 7. 提取每个片段到 filter 目录
     fs::path filter_dir = fs::path(m_config.record.output_dir) / m_config.record.filter_subdir;
     fs::create_directories(filter_dir);
 
-    // 使用 CSV 首条记录作为 PTS→墙钟映射参考
-    const DetectionLogEntry& pts_ref = log_entries.front();
+    // 解析原始 raw 分片的开始时间（文件名中的 start_datetime），作为 filter 时间锚点
+    auto raw_start_time = extractRawStartTime(raw_video_path);
+    double time_base_d = av_q2d(m_video_time_base);
 
     int extracted_count = 0;
     for (size_t i = 0; i < segments.size(); ++i) {
@@ -110,8 +114,10 @@ void VideoSegmentExtractor::processRawVideo(const fs::path& raw_video_path, cons
 
         ExtractTimingInfo timing_info;
         if (extractSegment(raw_video_path, segment, temp_path, i, timing_info)) {
-            // 基于实际视频首帧 PTS 计算墙钟时间
-            auto actual_start = ptsToWallclock(timing_info.first_frame_pts, pts_ref);
+            // filter 开始时间 = raw 开始时间 + 首帧相对 raw 的相对时间（first_frame_pts × time_base）
+            double first_ss = static_cast<double>(timing_info.first_frame_pts) * time_base_d;
+            auto actual_start = raw_start_time + std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                std::chrono::duration<double>(first_ss));
             auto actual_end = actual_start + std::chrono::duration_cast<std::chrono::system_clock::duration>(
                 std::chrono::duration<double>(timing_info.duration_seconds));
 
@@ -129,6 +135,7 @@ void VideoSegmentExtractor::processRawVideo(const fs::path& raw_video_path, cons
                 LOG_ERROR("Failed to rename: {} -> {}: {}", temp_path.string(), final_path.string(), ec.message());
             } else {
                 extracted_count++;
+                extracted_files.push_back(final_path);
                 LOG_INFO("Extracted segment: {} ({:.2f}s)", final_path.string(), timing_info.duration_seconds);
             }
         } else {
@@ -141,6 +148,7 @@ void VideoSegmentExtractor::processRawVideo(const fs::path& raw_video_path, cons
     LOG_INFO("Extraction complete: {}/{} segments extracted", extracted_count, segments.size());
 
     avformat_close_input(&input_ctx);
+    return extracted_files;
 }
 
 std::vector<DetectionLogEntry> VideoSegmentExtractor::parseDetectionLog(const fs::path& csv_log_path) {
@@ -178,25 +186,30 @@ std::vector<DetectionLogEntry> VideoSegmentExtractor::parseDetectionLog(const fs
             fields.push_back(field);
         }
 
-        if (fields.size() < 6) {
+        if (fields.size() < 5) {
             LOG_WARN("Invalid CSV line: {}", line);
             continue;
         }
 
         DetectionLogEntry entry;
         try {
-            entry.frame_pts = std::stoll(fields[0]);
+            // 解析 ss（HH:MM:SS.mmm，相对原始分片开始的秒数）并换算为 PTS
+            int hh = 0, mm = 0, ssv = 0, msv = 0;
+            char c1 = 0, c2 = 0, c3 = 0;
+            std::istringstream ss_stream(fields[0]);
+            if (!(ss_stream >> hh >> c1 >> mm >> c2 >> ssv >> c3 >> msv) ||
+                c1 != ':' || c2 != ':' || c3 != '.') {
+                LOG_WARN("Invalid ss format: {}", fields[0]);
+                continue;
+            }
+            double seconds = hh * 3600 + mm * 60 + ssv + msv / 1000.0;
+            double tb = av_q2d(m_video_time_base);
+            entry.frame_pts = (tb > 0) ? static_cast<int64_t>(seconds / tb + 0.5) : 0;
 
-            // 解析时间戳
-            std::tm tm = {};
-            std::istringstream ts_ss(fields[1]);
-            ts_ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
-            entry.timestamp = std::chrono::system_clock::from_time_t(std::mktime(&tm));
-
-            entry.has_player = (fields[2] == "true");
-            entry.player_count = std::stoi(fields[3]);
-            entry.npc_count = std::stoi(fields[4]);
-            // fields[5] 是 boxes_json，暂时不需要解析
+            entry.has_player = (fields[1] == "true");
+            entry.player_count = std::stoi(fields[2]);
+            entry.npc_count = std::stoi(fields[3]);
+            // fields[4] 是 boxes_json，暂时不需要解析
 
             entries.push_back(entry);
         } catch (const std::exception& e) {
@@ -222,7 +235,6 @@ std::vector<PlayerSegment> VideoSegmentExtractor::extractPlayerSegments(
                 // 开始新的玩家片段
                 in_player_segment = true;
                 current_segment.start_pts = entry.frame_pts;
-                current_segment.start_time = entry.timestamp;
                 current_segment.player_count = entry.player_count;
             }
         } else {
@@ -230,7 +242,6 @@ std::vector<PlayerSegment> VideoSegmentExtractor::extractPlayerSegments(
                 // 结束当前玩家片段
                 in_player_segment = false;
                 current_segment.end_pts = entry.frame_pts;
-                current_segment.end_time = entry.timestamp;  // 首个无玩家检测的时间
 
                 // 计算时长（秒）
                 double pts_diff = current_segment.end_pts - current_segment.start_pts;
@@ -246,7 +257,6 @@ std::vector<PlayerSegment> VideoSegmentExtractor::extractPlayerSegments(
     // 处理最后一个片段（如果视频结束时仍然有玩家）
     if (in_player_segment && !log_entries.empty()) {
         current_segment.end_pts = log_entries.back().frame_pts;
-        current_segment.end_time = log_entries.back().timestamp;
         double pts_diff = current_segment.end_pts - current_segment.start_pts;
         current_segment.duration_seconds = pts_diff * av_q2d(m_video_time_base);
 
@@ -597,12 +607,30 @@ std::string VideoSegmentExtractor::generateSegmentFilename(const PlayerSegment& 
     return result;
 }
 
-std::chrono::system_clock::time_point VideoSegmentExtractor::ptsToWallclock(
-    int64_t pts,
-    const DetectionLogEntry& ref_entry) const {
-    double pts_diff_seconds = (pts - ref_entry.frame_pts) * av_q2d(m_video_time_base);
-    auto duration = std::chrono::duration<double>(pts_diff_seconds);
-    return ref_entry.timestamp + std::chrono::duration_cast<std::chrono::system_clock::duration>(duration);
+std::chrono::system_clock::time_point VideoSegmentExtractor::extractRawStartTime(const fs::path& raw_video_path) const {
+    // 从 raw 文件名中提取 start_datetime（YYYYMMDD_HHMMSS）作为原始分片开始时间
+    std::string filename = raw_video_path.filename().string();
+    std::regex re(R"((\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2}))");
+    std::smatch match;
+    if (std::regex_search(filename, match, re) && match.size() >= 7) {
+        try {
+            std::tm tm = {};
+            tm.tm_year = std::stoi(match[1].str()) - 1900;
+            tm.tm_mon = std::stoi(match[2].str()) - 1;
+            tm.tm_mday = std::stoi(match[3].str());
+            tm.tm_hour = std::stoi(match[4].str());
+            tm.tm_min = std::stoi(match[5].str());
+            tm.tm_sec = std::stoi(match[6].str());
+            tm.tm_isdst = -1;
+            return std::chrono::system_clock::from_time_t(std::mktime(&tm));
+        } catch (const std::exception& e) {
+            LOG_WARN("Failed to parse raw start time from {}: {}", filename, e.what());
+        }
+    } else {
+        LOG_WARN("No start_datetime pattern in filename: {}", filename);
+    }
+    // 回退：使用当前时间
+    return std::chrono::system_clock::now();
 }
 
 std::string VideoSegmentExtractor::extractStreamId(const fs::path& video_path) {

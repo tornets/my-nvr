@@ -820,13 +820,16 @@ void NVRManager::scanAndExtractRawVideos() {
 
             // 创建视频片段提取器
             VideoSegmentExtractor extractor(m_config);
-            extractor.processRawVideo(entry.path(), csv_file);
+            auto extracted_files = extractor.processRawVideo(entry.path(), csv_file);
 
-            // 提取完成，删除占位符，创建完成标记
+            // 提取完成，删除占位符，创建完成标记（写入切出的文件名，每行一个；无片段则为空文件）
             fs::remove(placeholder);
             fs::path marker = entry.path();
             marker.replace_extension(".extracted");
-            std::ofstream(marker.string()) << "Done";
+            std::ofstream ofs(marker.string());
+            for (const auto& f : extracted_files) {
+                ofs << f.filename().string() << "\n";
+            }
 
             // 根据配置决定是否删除原始视频
             if (m_config.record.delete_raw_after_extraction) {

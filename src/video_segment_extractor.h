@@ -40,7 +40,6 @@ struct ExtractTimingInfo {
 // 检测日志记录
 struct DetectionLogEntry {
     int64_t frame_pts;
-    std::chrono::system_clock::time_point timestamp;
     bool has_player;
     int player_count;
     int npc_count;
@@ -54,7 +53,8 @@ public:
 
     // 处理 raw 视频文件，提取有人片段
     // 参数：raw_video_path - raw 视频文件路径，csv_log_path - 对应的 CSV 日志文件路径
-    void processRawVideo(const fs::path& raw_video_path, const fs::path& csv_log_path);
+    // 返回：本次切出的所有片段最终路径列表
+    std::vector<fs::path> processRawVideo(const fs::path& raw_video_path, const fs::path& csv_log_path);
 
 private:
     // 读取检测日志，解析玩家片段
@@ -87,10 +87,8 @@ private:
     // 过滤短片段
     void filterShortSegments(std::vector<PlayerSegment>& segments);
 
-    // 将 PTS 转换为墙钟时间（基于 CSV 条目的 PTS-时间戳对应关系）
-    std::chrono::system_clock::time_point ptsToWallclock(
-        int64_t pts,
-        const DetectionLogEntry& ref_entry) const;
+    // 从 raw 文件名解析原始分片的开始时间（start_datetime: YYYYMMDD_HHMMSS）
+    std::chrono::system_clock::time_point extractRawStartTime(const fs::path& raw_video_path) const;
 
     // 从文件名解析流 ID 和其他信息
     std::string extractStreamId(const fs::path& video_path);

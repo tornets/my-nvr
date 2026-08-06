@@ -308,15 +308,25 @@ void SmartRecordingManager::handleDetectionResult(const detection::DetectionResu
     if (detection_logger_ && !current_log_file_.empty()) {
         // 只记录属于当前视频分段的检测结果（frame_pts >= segment_start_pts_）
         // 忽略预缓存阶段的检测结果，因为它们不属于当前视频文件
+        int64_t relative_pts = 0;
+        bool should_log = false;
         if (segment_start_pts_ > 0 && result.frame_pts >= segment_start_pts_) {
             // 计算相对于当前视频分段的 PTS（确保与视频文件的 PTS 一致）
-            int64_t relative_frame_pts = result.frame_pts - segment_start_pts_;
-            detection_logger_->log(current_log_file_, relative_frame_pts, result.timestamp, result);
+            relative_pts = result.frame_pts - segment_start_pts_;
+            should_log = true;
         } else if (segment_start_pts_ == 0) {
             // segment_start_pts_ 还未设置（可能在预缓存阶段），暂时记录原始 frame_pts
-            detection_logger_->log(current_log_file_, result.frame_pts, result.timestamp, result);
+            relative_pts = result.frame_pts;
+            should_log = true;
         }
         // 否则：result.frame_pts < segment_start_pts_，忽略此检测结果
+
+        if (should_log) {
+            // ss = 帧相对原始分片开始的相对时间（秒）
+            double tb = (time_base_.den != 0) ? av_q2d(time_base_) : 0.0;
+            double ss_seconds = static_cast<double>(relative_pts) * tb;
+            detection_logger_->log(current_log_file_, ss_seconds, result);
+        }
     }
 
     // 添加到缓存（只缓存属于当前视频分段的检测结果）

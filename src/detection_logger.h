@@ -33,12 +33,10 @@ public:
     // 记录检测结果（线程安全）
     // 参数：
     //   log_file_path - 日志文件路径
-    //   frame_pts - 帧 PTS 时间戳
-    //   timestamp - 检测时间戳
+    //   ss_seconds - 帧相对原始分片开始的相对时间（秒）
     //   result - 检测结果
     void log(const std::string& log_file_path,
-             int64_t frame_pts,
-             const std::chrono::system_clock::time_point& timestamp,
+             double ss_seconds,
              const nvr::detection::DetectionResult& result);
 
     // 完成日志文件写入
@@ -48,8 +46,8 @@ private:
     // 将边界框序列化为 JSON 字符串
     std::string serializeBoxes(const std::vector<nvr::detection::BoundingBox>& boxes);
 
-    // 格式化时间戳为 ISO 8601 字符串
-    std::string formatTimestamp(const std::chrono::system_clock::time_point& timestamp);
+    // 格式化相对时间为 HH:MM:SS.mmm 字符串
+    std::string formatRelativeTime(double seconds);
 
     // 确保日志文件的父目录存在
     void ensureParentDirectory(const fs::path& file_path);

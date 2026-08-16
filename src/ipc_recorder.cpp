@@ -446,6 +446,12 @@ bool IPCRecorder::connectAndRecord() {
         closeOutput();
     }
 
+#ifdef ENABLE_RKNN_SMART_RECORDING
+    // 关闭上一次连接可能残留的硬件解码器（超时/连续错误重连路径不走正常清理，这里统一兜底，
+    // 避免每次重连泄漏一个 rkmpp 解码器上下文导致数天后 DRM/MPP 资源耗尽、检测永久失效）
+    closeHardwareDecoder();
+#endif
+
     // 重置状态
     m_video_stream_idx = -1;
     m_audio_stream_idx = -1;
@@ -786,6 +792,22 @@ bool IPCRecorder::connectAndRecord() {
 
                 std::string filename = "temp_" + random_str + ext;
 
+                // 先设置分段起始 PTS，再打开输出：openOutput 内部会切换检测 CSV（setCurrentLogFile），
+                // 必须让 segment_start_pts_ 先于其生效，旧分段晚到的检测结果（pts < 新起点）才会被
+                // 正确丢弃，而不是写入新分段 CSV 的开头（ss≈60s 的错误记录会导致下一段 filter 切割错位）
+                if (packet->pts > 0) {
+                    m_segment_start_pts = packet->pts;
+                    // 使用相同帧的 DTS 作为起始 DTS
+                    m_segment_start_dts = packet->dts >= 0 ? packet->dts : packet->pts;
+                    LOG_DEBUG("Segment start: pts={}, dts={}", m_segment_start_pts, m_segment_start_dts);
+
+#ifdef ENABLE_RKNN_SMART_RECORDING
+                    if (m_smart_recording_enabled && m_smart_recording) {
+                        m_smart_recording->setSegmentStartTime(m_segment_start_pts);
+                    }
+#endif
+                }
+
                 LOG_INFO("Opening temp file: {}", filename);
                 if (!openOutput(filename)) {
                     LOG_ERROR("Failed to open temp file: {}", filename);
@@ -810,19 +832,6 @@ bool IPCRecorder::connectAndRecord() {
                     m_smart_recording->setTimeBase(m_video_time_base);
                 }
 #endif
-
-                if (packet->pts > 0) {
-                    m_segment_start_pts = packet->pts;
-                    // 使用相同帧的 DTS 作为起始 DTS
-                    m_segment_start_dts = packet->dts >= 0 ? packet->dts : packet->pts;
-                    LOG_DEBUG("Segment start: pts={}, dts={}", m_segment_start_pts, m_segment_start_dts);
-
-#ifdef ENABLE_RKNN_SMART_RECORDING
-                    if (m_smart_recording_enabled && m_smart_recording) {
-                        m_smart_recording->setSegmentStartTime(m_segment_start_pts);
-                    }
-#endif
-                }
 
                 // 重置音频起始 PTS 和帧计数
                 m_audio_start_pts = 0;
@@ -1433,6 +1442,15 @@ void IPCRecorder::closeOutput() {
                          duration_seconds, m_min_segment_duration_seconds, m_current_filename);
                 std::error_code ec;
                 fs::remove(fs::path(m_temp_dir) / m_current_filename, ec);
+#ifdef ENABLE_RKNN_SMART_RECORDING
+                // 关闭并删除该分段临时 CSV 的 writer 与文件（writer 以临时路径为 key）
+                if (m_detection_logger) {
+                    fs::path temp_csv = fs::path(m_temp_dir) / m_current_filename;
+                    temp_csv.replace_extension(".csv");
+                    m_detection_logger->finalizeLogFile(temp_csv.string());
+                    fs::remove(temp_csv, ec);
+                }
+#endif
                 m_current_filename.clear();
                 return;
             }
@@ -1458,18 +1476,16 @@ void IPCRecorder::closeOutput() {
 
             // 移动文件（使用 UTF-8 兼容函数）
 #ifdef _WIN32
+#ifdef ENABLE_RKNN_SMART_RECORDING
+            // 先用临时路径关闭 CSV writer（writer 以临时路径为 key），确保数据落盘并释放 fd
+            if (m_detection_logger) {
+                fs::path temp_csv = fs::path(m_temp_dir) / m_current_filename;
+                temp_csv.replace_extension(".csv");
+                m_detection_logger->finalizeLogFile(temp_csv.string());
+            }
+#endif
             if (rename_file_utf8(temp_path.string(), final_path.string())) {
                 LOG_INFO("Moved recording: {} -> {}", m_current_filename, new_filename);
-
-                // TODO: 两阶段录制重构 - 创建 CSV 日志文件
-                #ifdef ENABLE_RKNN_SMART_RECORDING
-                if (m_detection_logger) {
-                    std::string csv_path = m_detection_logger->createLogFile(final_path);
-                    if (!csv_path.empty()) {
-                        LOG_INFO("Created detection log: {}", csv_path);
-                    }
-                }
-                #endif
             } else {
                 LOG_ERROR("Failed to move recording {} to {}: {}",
                                m_current_filename, new_filename, GetLastError());
@@ -1492,6 +1508,10 @@ void IPCRecorder::closeOutput() {
                         fs::path final_csv = fs::path(m_output_dir) / "raw" / new_filename;
                         final_csv.replace_extension(".csv");
 
+                        // 先用临时路径关闭 writer（writer 以临时路径为 key），确保数据落盘并释放 fd，
+                        // 否则 writer 永不关闭（每分段泄漏 1 个 fd）
+                        m_detection_logger->finalizeLogFile(temp_csv.string());
+
                         // 重命名临时CSV为最终CSV
                         if (fs::exists(temp_csv)) {
                             std::error_code ec;
@@ -1505,9 +1525,6 @@ void IPCRecorder::closeOutput() {
                         } else {
                             LOG_DEBUG("Temp CSV not found (may be empty): {}", temp_csv.string());
                         }
-
-                        // 完成最终CSV文件的写入
-                        m_detection_logger->finalizeLogFile(final_csv.string());
                     }
                     #endif
                 } else {

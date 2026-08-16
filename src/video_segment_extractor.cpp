@@ -256,7 +256,11 @@ std::vector<PlayerSegment> VideoSegmentExtractor::extractPlayerSegments(
 
     // 处理最后一个片段（如果视频结束时仍然有玩家）
     if (in_player_segment && !log_entries.empty()) {
-        current_segment.end_pts = log_entries.back().frame_pts;
+        // 延伸到视频实际末尾：最后一次检测到视频结束之间的末尾盲区内玩家可能仍存在，
+        // 若只取最后一条检测记录，跨分段边界的连续玩家会被切出带间隙的 filter 片段
+        int64_t video_end_pts = av_rescale_q(input_ctx->duration,
+                                             AVRational{1, AV_TIME_BASE}, m_video_time_base);
+        current_segment.end_pts = std::max(video_end_pts, log_entries.back().frame_pts);
         double pts_diff = current_segment.end_pts - current_segment.start_pts;
         current_segment.duration_seconds = pts_diff * av_q2d(m_video_time_base);
 

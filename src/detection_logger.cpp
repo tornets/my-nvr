@@ -116,6 +116,10 @@ void DetectionLogger::finalizeLogFile(const std::string& log_file_path) {
         it->second.close();
         LOG_DEBUG("Finalized detection log: {}", log_file_path);
     }
+
+    // 回收 map 条目，防止长期运行时 fd 与内存无限增长
+    m_writers.erase(log_file_path);
+    m_headers_written.erase(log_file_path);
 }
 
 std::string DetectionLogger::serializeBoxes(const std::vector<nvr::detection::BoundingBox>& boxes) {

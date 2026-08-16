@@ -26,6 +26,156 @@ parseRecordingTimeFromFilename(const fs::path& file_path);
 
 bool compareByRecordingTime(const fs::path& a, const fs::path& b);
 
+// ==================== 清理单元辅助 ====================
+namespace {
+
+// 清理单元：以一个 raw mp4 为锚点的关联文件集合，整体删除
+struct CleanupUnit {
+    std::chrono::system_clock::time_point time;  // raw 文件名解析的开始时间
+    std::uintmax_t size = 0;                      // 单元内文件总大小
+    std::vector<fs::path> files;                  // raw mp4 + .csv + .extracted + 关联的 filter mp4
+};
+
+// 判断路径是否位于临时目录下
+bool isUnderTemp(const fs::path& file_path, const fs::path& temp_dir) {
+    fs::path temp_dir_path;
+    try {
+        temp_dir_path = fs::canonical(temp_dir);
+    } catch (...) {
+        temp_dir_path = temp_dir;
+    }
+    fs::path file_parent = file_path.parent_path();
+    try {
+        fs::path file_parent_canonical = fs::canonical(file_parent);
+        return file_parent_canonical == temp_dir_path ||
+               file_parent_canonical.string().find(temp_dir_path.string()) == 0;
+    } catch (...) {
+        return file_parent.string().find(temp_dir.string()) != std::string::npos;
+    }
+}
+
+// 自下而上删除空目录，直到 root（不含 root）
+void pruneEmptyDirs(const fs::path& dir, const fs::path& root) {
+    std::error_code ec;
+    fs::path current = dir;
+    while (current != root && fs::is_empty(current, ec)) {
+        if (!fs::remove(current, ec)) {
+            LOG_ERROR("Failed to delete empty directory {}: {}", current.string(), ec.message());
+            break;
+        }
+        current = current.parent_path();
+    }
+}
+
+// 构建 raw 目录下所有清理单元（以 raw mp4 为锚点，关联其 csv/extracted 与 .extracted 中列出的 filter）
+std::vector<CleanupUnit> buildCleanupUnits(const Config& config) {
+    std::vector<CleanupUnit> units;
+    fs::path output_dir = config.record.output_dir;
+    fs::path raw_dir = output_dir / config.record.raw_subdir;
+    fs::path filter_dir = output_dir / config.record.filter_subdir;
+    std::error_code ec;
+
+    // 1. 扫描 filter 目录，建立 basename → 路径 索引（把 .extracted 里的 basename 定位到真实路径，跨日期鲁棒）
+    std::unordered_map<std::string, fs::path> filter_index;
+    if (fs::exists(filter_dir, ec)) {
+        try {
+            for (const auto& entry : fs::recursive_directory_iterator(filter_dir)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".mp4") {
+                    filter_index[entry.path().filename().string()] = entry.path();
+                }
+            }
+        } catch (const std::exception& e) {
+            LOG_WARN("Failed to index filter directory: {}", e.what());
+        }
+    }
+
+    // 2. 扫描 raw 目录，以每个 mp4 为锚点构建清理单元
+    if (!fs::exists(raw_dir, ec)) {
+        return units;
+    }
+    try {
+        for (const auto& entry : fs::recursive_directory_iterator(raw_dir)) {
+            if (!entry.is_regular_file() || entry.path().extension() != ".mp4") {
+                continue;
+            }
+            fs::path raw_mp4 = entry.path();
+            if (isUnderTemp(raw_mp4, config.record.temp_dir)) {
+                continue;
+            }
+
+            auto time_opt = parseRecordingTimeFromFilename(raw_mp4);
+            if (!time_opt) {
+                continue;
+            }
+
+            // 提取进行中（.extracting 占位符存在）跳过，避免与提取线程竞争
+            fs::path extracting = raw_mp4;
+            extracting.replace_extension(".extracting");
+            if (fs::exists(extracting, ec)) {
+                continue;
+            }
+
+            CleanupUnit unit;
+            unit.time = *time_opt;
+
+            auto addIfExists = [&](const fs::path& p) {
+                if (fs::exists(p, ec)) unit.files.push_back(p);
+            };
+            unit.files.push_back(raw_mp4);
+            fs::path csv = raw_mp4; csv.replace_extension(".csv");
+            fs::path extracted = raw_mp4; extracted.replace_extension(".extracted");
+            addIfExists(csv);
+            addIfExists(extracted);
+
+            // 读取 .extracted，关联对应的 filter mp4（每行一个 basename）
+            if (fs::exists(extracted, ec)) {
+                std::ifstream ifs(extracted);
+                std::string line;
+                while (std::getline(ifs, line)) {
+                    while (!line.empty() &&
+                           (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) {
+                        line.pop_back();
+                    }
+                    if (line.empty()) continue;
+                    auto it = filter_index.find(line);
+                    if (it != filter_index.end()) {
+                        unit.files.push_back(it->second);
+                    }
+                }
+            }
+
+            // 累加单元大小
+            for (const auto& f : unit.files) {
+                auto s = fs::file_size(f, ec);
+                if (!ec) unit.size += s;
+            }
+
+            units.push_back(std::move(unit));
+        }
+    } catch (const std::exception& e) {
+        LOG_WARN("Failed to scan raw directory for cleanup: {}", e.what());
+    }
+
+    return units;
+}
+
+// 删除整个清理单元，并修剪留下的空目录
+void deleteCleanupUnit(const CleanupUnit& unit, const fs::path& output_dir) {
+    for (const auto& f : unit.files) {
+        std::error_code ec;
+        if (fs::exists(f, ec)) {
+            if (fs::remove(f, ec)) {
+                LOG_INFO("Cleaned: {}", f.string());
+            } else {
+                LOG_ERROR("Failed to delete {}: {}", f.string(), ec.message());
+            }
+        }
+        pruneEmptyDirs(f.parent_path(), output_dir);
+    }
+}
+
+}  // namespace
+
 NVRManager::NVRManager(const Config& config)
     : m_config(config)
     , m_running(false)
@@ -390,95 +540,30 @@ void NVRManager::scanAndUploadNewFiles() {
 
 bool NVRManager::cleanOldFiles() {
     int max_age_seconds = m_config.autoclean.max_age_hours * 3600;
+    if (max_age_seconds <= 0) {
+        return true;  // 年龄限制 <= 0 视为禁用按年龄清理
+    }
     auto now = std::chrono::system_clock::now();
+
+    auto units = buildCleanupUnits(m_config);
+
+    // 按录制时间排序（最早在前），优先清理最早的数据
+    std::sort(units.begin(), units.end(),
+              [](const CleanupUnit& a, const CleanupUnit& b) { return a.time < b.time; });
+
     int deleted_count = 0;
-
-    // 获取临时目录的规范路径，用于比较
-    fs::path temp_dir_path;
-    try {
-        temp_dir_path = fs::canonical(m_config.record.temp_dir);
-    } catch (...) {
-        temp_dir_path = m_config.record.temp_dir;
-    }
-
-    // 收集文件并解析录制时间
-    std::vector<std::pair<fs::path, std::chrono::system_clock::time_point>> files_with_time;
-
-    for (const auto& entry : fs::recursive_directory_iterator(m_config.record.output_dir)) {
-        if (!entry.is_regular_file()) {
-            continue;
+    for (const auto& unit : units) {
+        auto age_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - unit.time).count();
+        if (age_seconds <= max_age_seconds) {
+            break;  // 已按时间升序，后续单元均未超龄
         }
-
-        // 跳过临时目录中的文件
-        fs::path file_path = entry.path();
-        fs::path file_parent = file_path.parent_path();
-        try {
-            fs::path file_parent_canonical = fs::canonical(file_parent);
-            if (file_parent_canonical == temp_dir_path ||
-                file_parent_canonical.string().find(temp_dir_path.string()) == 0) {
-                continue;  // 跳过临时文件
-            }
-        } catch (...) {
-            if (file_parent.string().find(m_config.record.temp_dir) != std::string::npos) {
-                continue;  // 跳过临时文件
-            }
-        }
-
-        // 只处理 MP4 和 CSV 文件
-        if (file_path.extension() != ".mp4" && file_path.extension() != ".csv") {
-            continue;
-        }
-
-        // 尝试从文件名解析录制时间
-        auto time_opt = parseRecordingTimeFromFilename(file_path);
-        if (time_opt) {
-            files_with_time.push_back(std::make_pair(file_path, *time_opt));
-        }
-    }
-
-    // 按录制时间排序（时间早的在前）
-    std::sort(files_with_time.begin(), files_with_time.end(),
-             [](const auto& a, const auto& b) {
-                 return a.second < b.second;  // 时间早的在前
-             });
-
-    // 删除最旧的文件，同时删除关联的 CSV 文件
-    std::unordered_set<std::string> deleted_files;
-    for (const auto& [file_path, recording_time] : files_with_time) {
-        // 计算文件年龄
-        auto age = std::chrono::duration_cast<std::chrono::seconds>(now - recording_time).count();
-
-        if (age > max_age_seconds) {
-            std::error_code ec;
-            if (fs::remove(file_path, ec)) {
-                deleted_files.insert(file_path.string());
-                LOG_INFO("Deleted old file: {} (age: {}h)", file_path.string(), age / 3600.0);
-                deleted_count++;
-
-                // 删除关联的 CSV 文件
-                fs::path csv_file = file_path;
-                csv_file.replace_extension(".csv");
-                if (fs::exists(csv_file) && fs::remove(csv_file, ec)) {
-                    LOG_INFO("Deleted associated detection log: {}", csv_file.filename().string());
-                }
-
-                // 清除空目录
-                auto parent_dir = file_path.parent_path();
-                while (parent_dir != m_config.record.output_dir && fs::is_empty(parent_dir)) {
-                    if (!fs::remove(parent_dir, ec)) {
-                        LOG_ERROR("Failed to delete empty directory {}: {}", parent_dir.string(), ec.message());
-                        break;
-                    }
-                    parent_dir = parent_dir.parent_path();
-                }
-            } else {
-                LOG_ERROR("Failed to delete {}: {}", file_path.string(), ec.message());
-            }
-        }
+        LOG_INFO("Cleaning old unit (age: {:.2f}h, {} file(s))", age_seconds / 3600.0, unit.files.size());
+        deleteCleanupUnit(unit, m_config.record.output_dir);
+        deleted_count++;
     }
 
     if (deleted_count > 0) {
-        LOG_INFO("Cleaned up {} old files", deleted_count);
+        LOG_INFO("Cleaned up {} old unit(s)", deleted_count);
     }
 
     return true;
@@ -489,93 +574,38 @@ bool NVRManager::checkDiskUsage() {
         return true;
     }
 
+    auto units = buildCleanupUnits(m_config);
+
     std::uintmax_t total_size = 0;
-
-    // 获取临时目录的规范路径，用于排除
-    fs::path temp_dir_path;
-    try {
-        temp_dir_path = fs::canonical(m_config.record.temp_dir);
-    } catch (...) {
-        temp_dir_path = m_config.record.temp_dir;
+    for (const auto& unit : units) {
+        total_size += unit.size;
     }
-
-    try {
-        // 递归遍历，但排除临时目录
-        for (const auto& entry : fs::recursive_directory_iterator(m_config.record.output_dir)) {
-            if (!entry.is_regular_file()) {
-                continue;
-            }
-
-            // 跳过临时目录中的文件
-            fs::path file_path = entry.path();
-            fs::path file_parent = file_path.parent_path();
-            try {
-                fs::path file_parent_canonical = fs::canonical(file_parent);
-                if (file_parent_canonical == temp_dir_path ||
-                    file_parent_canonical.string().find(temp_dir_path.string()) == 0) {
-                    continue;  // 跳过临时文件
-                }
-            } catch (...) {
-                if (file_parent.string().find(m_config.record.temp_dir) != std::string::npos) {
-                    continue;  // 跳过临时文件
-                }
-            }
-
-            total_size += entry.file_size();
-        }
-    } catch (const std::exception& e) {
-        LOG_ERROR("Error calculating disk usage: {}", e.what());
-        return false;
-    }
-
     double total_gb = static_cast<double>(total_size) / (1024.0 * 1024.0 * 1024.0);
 
-    if (total_gb > m_config.autoclean.max_disk_usage_gb) {
-        LOG_WARN("Disk usage {:.2f} GB exceeds limit {} GB", total_gb, m_config.autoclean.max_disk_usage_gb);
-
-        std::vector<fs::path> files;
-        // 递归遍历收集所有 MP4 文件（与计算总大小时保持一致）
-        for (const auto& entry : fs::recursive_directory_iterator(m_config.record.output_dir)) {
-            if (entry.is_regular_file() && entry.path().extension() == ".mp4") {
-                // 跳过临时目录中的文件
-                fs::path file_parent = entry.path().parent_path();
-                try {
-                    fs::path file_parent_canonical = fs::canonical(file_parent);
-                    if (file_parent_canonical == temp_dir_path ||
-                        file_parent_canonical.string().find(temp_dir_path.string()) == 0) {
-                        continue;
-                    }
-                } catch (...) {
-                    if (file_parent.string().find(m_config.record.temp_dir) != std::string::npos) {
-                        continue;
-                    }
-                }
-
-                files.push_back(entry.path());
-            }
-        }
-
-        std::sort(files.begin(), files.end(),
-                 [](const fs::path& a, const fs::path& b) {
-                     return fs::last_write_time(a) < fs::last_write_time(b);
-                 });
-
-        int deleted = 0;
-        while (total_gb > m_config.autoclean.max_disk_usage_gb * 0.9 && !files.empty()) {
-            std::error_code ec;
-            auto file_size = fs::file_size(files.front());
-            if (fs::remove(files.front(), ec)) {
-                total_size -= file_size;
-                total_gb = static_cast<double>(total_size) / (1024.0 * 1024.0 * 1024.0);
-                LOG_INFO("Deleted file to free space: {}", files.front().filename().string());
-                deleted++;
-            }
-            files.erase(files.begin());
-        }
-
-        LOG_INFO("Deleted {} files to reduce disk usage", deleted);
+    if (total_gb <= m_config.autoclean.max_disk_usage_gb) {
+        return true;
     }
 
+    LOG_WARN("Disk usage {:.2f} GB exceeds limit {} GB", total_gb, m_config.autoclean.max_disk_usage_gb);
+
+    // 按录制时间排序（最早在前），优先清理最早的数据
+    std::sort(units.begin(), units.end(),
+              [](const CleanupUnit& a, const CleanupUnit& b) { return a.time < b.time; });
+
+    double target_gb = m_config.autoclean.max_disk_usage_gb * 0.9;  // 滞后带：清到限额的 90%
+    int deleted = 0;
+    for (const auto& unit : units) {
+        if (total_gb <= target_gb) {
+            break;
+        }
+        LOG_INFO("Cleaning unit to free space ({} file(s))", unit.files.size());
+        deleteCleanupUnit(unit, m_config.record.output_dir);
+        total_size -= unit.size;
+        total_gb = static_cast<double>(total_size) / (1024.0 * 1024.0 * 1024.0);
+        deleted++;
+    }
+
+    LOG_INFO("Deleted {} unit(s) to reduce disk usage", deleted);
     return true;
 }
 

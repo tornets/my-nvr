@@ -170,6 +170,11 @@ private:
 
     // Letterbox 参数（CPU 模式）
     LetterboxParams last_letterbox_params_;
+    int last_src_width_ = 0;   // 最近一次 CPU 预处理的原始帧宽
+    int last_src_height_ = 0;  // 最近一次 CPU 预处理的原始帧高
+
+    // 全幅拉伸（各向异性）模式下的坐标映射（零拷贝 CPU fallback 路径）
+    void mapCoordinatesForStretch(DetectionResult& result, int src_width, int src_height);
 
     // 映射检测坐标到原始帧空间
     void mapCoordinatesToOriginalFrame(

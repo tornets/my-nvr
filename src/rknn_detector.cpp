@@ -344,6 +344,10 @@ bool RKNNDetector::detectFrame(AVFrame* frame, DetectionResult& result, int64_t 
         return false;
     }
 
+    // 把模型系坐标映射回原始帧像素坐标（letterbox 逆变换）
+    mapCoordinatesToOriginalFrame(result, last_letterbox_params_,
+                                  last_src_width_, last_src_height_);
+
     // 释放输出
     rknn_outputs_release(rknn_ctx_, outputs_.size(), outputs_.data());
 
@@ -404,10 +408,13 @@ bool RKNNDetector::detectFrameZeroCopy(const DMABufferInfo& dma_info, DetectionR
         return false;
     }
 
-    // 5. 如果使用了 RGA 预处理且成功，映射坐标回原始帧
+    // 5. 把模型系坐标映射回原始帧像素坐标
     if (rga_ok && rga_preprocessor_) {
         const auto& letterbox = rga_preprocessor_->getLetterboxParams();
         mapCoordinatesToOriginalFrame(result, letterbox, dma_info.width, dma_info.height);
+    } else {
+        // CPU fallback 是全幅拉伸（各向异性缩放，无 letterbox pad）
+        mapCoordinatesForStretch(result, dma_info.width, dma_info.height);
     }
 
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -467,6 +474,8 @@ bool RKNNDetector::preprocessFrame(AVFrame* frame, std::vector<uint8_t>& output_
     last_letterbox_params_.scale = scale;
     last_letterbox_params_.pad_x = pad_x;
     last_letterbox_params_.pad_y = pad_y;
+    last_src_width_ = src_width;
+    last_src_height_ = src_height;
 
     LOG_DEBUG("CPU Letterbox: src={}x{}, dst={}x{}, scale={}, pad_x={}, pad_y={}, resize={}x{}",
               src_width, src_height, dst_width, dst_height, scale, pad_x, pad_y, resize_w, resize_h);
@@ -988,14 +997,58 @@ void RKNNDetector::mapCoordinatesToOriginalFrame(
     int original_width,
     int original_height) {
 
+    if (letterbox.scale <= 0.0f) {
+        return;
+    }
+
     for (auto& box : result.boxes) {
-        // 将模型空间坐标 (640x640) 映射回原始帧空间
-        // Rockchip 参考：box.left = x1 / letter_box->scale
-        box.x = box.x / letterbox.scale;
-        box.y = box.y / letterbox.scale;
+        // 模型空间 (input_w × input_h) → 原始帧空间：先减 letterbox 填充偏移，再除以缩放比例
+        box.x = (box.x - letterbox.pad_x) / letterbox.scale;
+        box.y = (box.y - letterbox.pad_y) / letterbox.scale;
         box.width = box.width / letterbox.scale;
         box.height = box.height / letterbox.scale;
+
+        // clamp 到原始帧范围
+        if (original_width > 0 && original_height > 0) {
+            box.x = std::clamp(box.x, 0.0f, static_cast<float>(original_width));
+            box.y = std::clamp(box.y, 0.0f, static_cast<float>(original_height));
+            box.width = std::clamp(box.width, 0.0f, static_cast<float>(original_width) - box.x);
+            box.height = std::clamp(box.height, 0.0f, static_cast<float>(original_height) - box.y);
+        }
     }
+
+    // 记录坐标空间元信息（供消费方还原/再变换）
+    result.frame_width = original_width;
+    result.frame_height = original_height;
+    result.letterbox_scale = letterbox.scale;
+    result.letterbox_scale_y = letterbox.scale;  // letterbox 模式 x/y 同比例
+    result.letterbox_pad_x = letterbox.pad_x;
+    result.letterbox_pad_y = letterbox.pad_y;
+}
+
+void RKNNDetector::mapCoordinatesForStretch(DetectionResult& result, int src_width, int src_height) {
+    if (src_width <= 0 || src_height <= 0 ||
+        model_info_.input_width <= 0 || model_info_.input_height <= 0) {
+        return;
+    }
+
+    float scale_x = static_cast<float>(src_width) / model_info_.input_width;
+    float scale_y = static_cast<float>(src_height) / model_info_.input_height;
+
+    for (auto& box : result.boxes) {
+        box.x = std::clamp(box.x * scale_x, 0.0f, static_cast<float>(src_width));
+        box.y = std::clamp(box.y * scale_y, 0.0f, static_cast<float>(src_height));
+        box.width = std::clamp(box.width * scale_x, 0.0f, static_cast<float>(src_width) - box.x);
+        box.height = std::clamp(box.height * scale_y, 0.0f, static_cast<float>(src_height) - box.y);
+    }
+
+    // 全幅拉伸模式：各向异性，x/y 独立比例记录（pad 为 0）
+    result.frame_width = src_width;
+    result.frame_height = src_height;
+    result.letterbox_scale = scale_x;
+    result.letterbox_scale_y = scale_y;
+    result.letterbox_pad_x = 0;
+    result.letterbox_pad_y = 0;
 }
 #endif
 

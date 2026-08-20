@@ -91,6 +91,14 @@ struct DetectionResult {
     double processing_time_ms;          // 处理耗时（毫秒）
     std::chrono::system_clock::time_point timestamp; // 检测时间戳
 
+    // 坐标空间元信息：boxes 为原始帧像素坐标，记录映射参数供消费方还原/再变换
+    int frame_width = 0;                // 原始帧宽（0 表示未知，boxes 可能仍在模型系）
+    int frame_height = 0;               // 原始帧高
+    float letterbox_scale = 1.0f;       // 原始系→模型系 letterbox 缩放（letterbox 模式下 x/y 相同）
+    float letterbox_scale_y = 1.0f;     // y 方向缩放（全幅拉伸模式下与 x 不同）
+    int letterbox_pad_x = 0;            // 模型系下 letterbox 填充偏移
+    int letterbox_pad_y = 0;
+
     DetectionResult()
         : has_player(false)
         , has_npc(false)
@@ -108,6 +116,12 @@ struct DetectionResult {
         boxes.clear();
         frame_pts = 0;
         processing_time_ms = 0.0;
+        frame_width = 0;
+        frame_height = 0;
+        letterbox_scale = 1.0f;
+        letterbox_scale_y = 1.0f;
+        letterbox_pad_x = 0;
+        letterbox_pad_y = 0;
         timestamp = std::chrono::system_clock::now();
     }
 

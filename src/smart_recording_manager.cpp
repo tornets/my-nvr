@@ -906,11 +906,13 @@ void SmartRecordingManager::saveDetectionImage(const detection::PoolDetectionRes
     }
 
     // 画 box 和 label（坐标需要随旋转变换）
-    for (const auto& box : pool_result.detection.boxes) {
-        int bx = static_cast<int>(box.x);
-        int by = static_cast<int>(box.y);
-        int bw = static_cast<int>(box.width);
-        int bh = static_cast<int>(box.height);
+    // boxes 是原始帧坐标，debug 图是模型输入图：先正变换回模型系（letterbox 缩放+填充），再随图旋转
+    const auto& det = pool_result.detection;
+    for (const auto& box : det.boxes) {
+        int bx = static_cast<int>(box.x * det.letterbox_scale + det.letterbox_pad_x);
+        int by = static_cast<int>(box.y * det.letterbox_scale_y + det.letterbox_pad_y);
+        int bw = static_cast<int>(box.width * det.letterbox_scale);
+        int bh = static_cast<int>(box.height * det.letterbox_scale_y);
 
         // 旋转坐标：逆时针90度 (bx,by,bw,bh) → (by, W-1-bx-bw, bh, bw)
         if (kDebugImageRotation == 90) {

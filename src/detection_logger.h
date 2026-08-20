@@ -43,8 +43,8 @@ public:
     void finalizeLogFile(const std::string& log_file_path);
 
 private:
-    // 将边界框序列化为 JSON 字符串
-    std::string serializeBoxes(const std::vector<nvr::detection::BoundingBox>& boxes);
+    // 将边界框序列化为 JSON 字符串（坐标归一化到原始帧 [0,1]）
+    std::string serializeBoxes(const nvr::detection::DetectionResult& result);
 
     // 格式化相对时间为 HH:MM:SS.mmm 字符串
     std::string formatRelativeTime(double seconds);

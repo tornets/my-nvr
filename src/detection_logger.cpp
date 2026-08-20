@@ -95,8 +95,8 @@ void DetectionLogger::log(const std::string& log_file_path,
         }
     }
 
-    // 序列化边界框为 JSON
-    std::string boxes_json = serializeBoxes(result.boxes);
+    // 序列化边界框为 JSON（归一化坐标）
+    std::string boxes_json = serializeBoxes(result);
 
     // 写入 CSV 行
     writer << ss_str << ","
@@ -122,13 +122,20 @@ void DetectionLogger::finalizeLogFile(const std::string& log_file_path) {
     m_headers_written.erase(log_file_path);
 }
 
-std::string DetectionLogger::serializeBoxes(const std::vector<nvr::detection::BoundingBox>& boxes) {
+std::string DetectionLogger::serializeBoxes(const nvr::detection::DetectionResult& result) {
+    const auto& boxes = result.boxes;
     if (boxes.empty()) {
         return "[]";
     }
 
+    // 归一化：原始帧像素坐标 → [0,1]（frame 尺寸未知时退回像素值）
+    bool normalized = (result.frame_width > 0 && result.frame_height > 0);
+    float inv_w = normalized ? 1.0f / result.frame_width : 1.0f;
+    float inv_h = normalized ? 1.0f / result.frame_height : 1.0f;
+
     std::ostringstream json;
     json << "[";
+    json << std::fixed << std::setprecision(6);
 
     for (size_t i = 0; i < boxes.size(); ++i) {
         const auto& box = boxes[i];
@@ -137,10 +144,10 @@ std::string DetectionLogger::serializeBoxes(const std::vector<nvr::detection::Bo
         }
         json << "{\"class_id\":" << box.class_id
              << ",\"confidence\":" << box.confidence
-             << ",\"x\":" << box.x
-             << ",\"y\":" << box.y
-             << ",\"w\":" << box.width
-             << ",\"h\":" << box.height << "}";
+             << ",\"x\":" << box.x * inv_w
+             << ",\"y\":" << box.y * inv_h
+             << ",\"w\":" << box.width * inv_w
+             << ",\"h\":" << box.height * inv_h << "}";
     }
 
     json << "]";
